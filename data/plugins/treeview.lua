@@ -361,17 +361,87 @@ function TreeView:draw_tooltip()
 end
 
 
-function TreeView:get_item_icon(item, active, hovered)
-  local character = "f"
-  if item.type == "dir" then
-    character = item.expanded and "D" or "d"
+-- Nerd Font file icon mappings (unicode codepoints)
+-- https://www.nerdfonts.com/cheat-sheet
+local file_icons = {
+  -- dirs
+  dir_closed = "\u{e5ff}",  -- 
+  dir_open   = "\u{e5fe}",  -- 
+  -- by extension
+  lua    = "\u{e620}",  -- 
+  py     = "\u{e73c}",  -- 
+  js     = "\u{e74e}",  -- 
+  ts     = "\u{e628}",  -- 
+  html   = "\u{e736}",  -- 
+  css    = "\u{e749}",  -- 
+  json   = "\u{e60b}",  -- 
+  md     = "\u{e609}",  -- 
+  txt    = "\u{f099}",  -- 
+  xml    = "\u{e736}",  -- 
+  yaml   = "\u{e60b}",  -- 
+  yml    = "\u{e60b}",  -- 
+  toml   = "\u{e60b}",  -- 
+  sh     = "\u{e615}",  -- 
+  bash   = "\u{e615}",  -- 
+  zsh    = "\u{e615}",  -- 
+  fish   = "\u{e615}",  -- 
+  c      = "\u{e61e}",  -- 
+  h      = "\u{e61e}",  -- 
+  cpp    = "\u{e61d}",  -- 
+  hpp    = "\u{e61d}",  -- 
+  cc     = "\u{e61d}",  -- 
+  go     = "\u{e627}",  -- 
+  rs     = "\u{e7a8}",  -- 
+  java   = "\u{e738}",  -- 
+  rb     = "\u{e739}",  -- 
+  php    = "\u{e73d}",  -- 
+  swift  = "\u{e755}",  -- 
+  kt     = "\u{e634}",  -- 
+  sql    = "\u{e70e}",  -- 
+  git    = "\u{e702}",  -- 
+  docker = "\u{e650}",  -- 
+  lock   = "\u{f023}",  -- 
+  img    = "\u{e60d}",  -- 
+  png    = "\u{e60d}",  -- 
+  jpg    = "\u{e60d}",  -- 
+  svg    = "\u{e60d}",  -- 
+  gif    = "\u{e60d}",  -- 
+  conf   = "\u{e615}",  -- 
+  cfg    = "\u{e615}",  -- 
+  ini    = "\u{e615}",  -- 
+  log    = "\u{f099}",  -- 
+  -- by filename
+  Makefile      = "\u{e673}",  -- 
+  Dockerfile    = "\u{e650}",  -- 
+  README        = "\u{e609}",  -- 
+  LICENSE       = "\u{f023}",  -- 
+  [".gitignore"]  = "\u{e702}",  -- 
+  [".env"]        = "\u{e615}",  -- 
+  [".gitmodules"] = "\u{e702}",  -- 
+}
+local default_file_icon = "\u{f723}"  -- 
+
+local function get_file_icon(name, is_dir, expanded)
+  if is_dir then
+    return expanded and file_icons.dir_open or file_icons.dir_closed
   end
-  local font = style.icon_font
-  local color = style.text
+  -- exact filename match first
+  local basename = name:match("([^/]+)$") or name
+  if file_icons[basename] then return file_icons[basename] end
+  -- then extension
+  local ext = basename:match("%.([^.]+)$")
+  if ext and file_icons[ext] then return file_icons[ext] end
+  return default_file_icon
+end
+
+function TreeView:get_item_icon(item, active, hovered)
+  local character = get_file_icon(item.name, item.type == "dir", item.expanded)
+  local font = style.nerd_font or style.icon_font
+  local color = style.sidebar_text or style.text
   if active or hovered then
-    color = style.accent
+    color = style.sidebar_accent or style.accent
   elseif item.ignored then
-    color = style.dim
+    color = style.sidebar_dim or style.dim
   end
   return character, font, color
 end
