@@ -12,6 +12,17 @@ local CommandView = require "core.commandview"
 local DocView = require "core.docview"
 local Dirwatch = require "core.dirwatch"
 
+-- Load Nerd Font directly in treeview to ensure icons work
+-- regardless of init.lua configuration
+local nerd_font = style.nerd_font
+if not nerd_font then
+  local font_path = (MACOS_RESOURCES or DATADIR) .. "/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"
+  local ok, font = pcall(renderer.font.load, font_path, 15 * SCALE, {antialiasing="grayscale", hinting="full"})
+  if ok then
+    nerd_font = font
+  end
+end
+
 config.plugins.treeview = common.merge({
   -- Default treeview width
   size = 200 * SCALE,
@@ -364,9 +375,9 @@ end
 -- Nerd Font file icon mappings (unicode codepoints)
 -- https://www.nerdfonts.com/cheat-sheet
 local file_icons = {
-  -- dirs
-  dir_closed = "\u{e5ff}",  -- 
-  dir_open   = "\u{e5fe}",  -- 
+  -- dirs (using Font Awesome icons which are stable across Nerd Font versions)
+  dir_closed = "\u{f07b}",  -- 
+  dir_open   = "\u{f07c}",  -- 
   -- by extension
   lua    = "\u{e620}",  -- 
   py     = "\u{e73c}",  -- 
@@ -421,6 +432,85 @@ local file_icons = {
 }
 local default_file_icon = "\u{f723}"  -- 
 
+-- File icon colors for a Sublime-Text-like file icon experience
+-- Each entry is a color table {r, g, b, a}
+local file_icon_colors = {
+  -- dirs
+  dir_closed = { common.color "#555555" },
+  dir_open   = { common.color "#555555" },
+  -- Web / markup
+  html   = { common.color "#e44d26" },  -- orange
+  css    = { common.color "#264de4" },  -- blue
+  js     = { common.color "#f7df1e" },  -- yellow
+  ts     = { common.color "#3178c6" },  -- blue
+  json   = { common.color "#f7df1e" },  -- yellow
+  xml    = { common.color "#ff6600" },  -- orange
+  svg    = { common.color "#ff9900" },  -- orange
+  -- Python
+  py     = { common.color "#3776ab" },  -- python blue
+  -- Lua
+  lua    = { common.color "#000080" },  -- navy blue
+  -- C / C++
+  c      = { common.color "#555555" },  -- gray
+  h      = { common.color "#a8b9cc" },  -- light blue-gray
+  cpp    = { common.color "#659ad2" },  -- blue
+  hpp    = { common.color "#659ad2" },  -- blue
+  cc     = { common.color "#659ad2" },  -- blue
+  -- Go
+  go     = { common.color "#00add8" },  -- go blue
+  -- Rust
+  rs     = { common.color "#dea584" },  -- rust brown
+  -- Java
+  java   = { common.color "#b07219" },  -- java brown
+  -- Ruby
+  rb     = { common.color "#cc342d" },  -- ruby red
+  -- PHP
+  php    = { common.color "#4f5d95" },  -- php purple
+  -- Swift
+  swift  = { common.color "#ffac45" },  -- swift orange
+  -- Kotlin
+  kt     = { common.color "#a97bff" },  -- kotlin purple
+  -- SQL
+  sql    = { common.color "#555555" },  -- gray
+  -- Shell
+  sh     = { common.color "#89e051" },  -- green
+  bash   = { common.color "#89e051" },  -- green
+  zsh    = { common.color "#89e051" },  -- green
+  fish   = { common.color "#89e051" },  -- green
+  -- Git
+  git    = { common.color "#f05032" },  -- git orange
+  -- Docker
+  docker = { common.color "#2496ed" },  -- docker blue
+  -- Config / settings
+  conf   = { common.color "#555555" },  -- gray
+  cfg    = { common.color "#555555" },  -- gray
+  ini    = { common.color "#555555" },  -- gray
+  toml   = { common.color "#9c4221" },  -- toml brown
+  yml    = { common.color "#cb171e" },  -- yaml red
+  yaml   = { common.color "#cb171e" },  -- yaml red
+  env    = { common.color "#f7df1e" },  -- yellow
+  -- Markdown / text
+  md     = { common.color "#555555" },  -- gray
+  txt    = { common.color "#555555" },  -- gray
+  log    = { common.color "#555555" },  -- gray
+  -- Images
+  img    = { common.color "#a063eb" },  -- purple
+  png    = { common.color "#a063eb" },  -- purple
+  jpg    = { common.color "#a063eb" },  -- purple
+  gif    = { common.color "#a063eb" },  -- purple
+  -- Lock files
+  lock   = { common.color "#de5c38" },  -- red-orange
+  -- by filename
+  Makefile      = { common.color "#427819" },  -- green
+  Dockerfile    = { common.color "#2496ed" },  -- docker blue
+  README        = { common.color "#555555" },  -- gray
+  LICENSE       = { common.color "#cb171e" },  -- red
+  [".gitignore"]  = { common.color "#f05032" },  -- git orange
+  [".env"]        = { common.color "#f7df1e" },  -- yellow
+  [".gitmodules"] = { common.color "#f05032" },  -- git orange
+}
+local default_file_icon_color = { common.color "#555555" }
+
 local function get_file_icon(name, is_dir, expanded)
   if is_dir then
     return expanded and file_icons.dir_open or file_icons.dir_closed
@@ -434,14 +524,27 @@ local function get_file_icon(name, is_dir, expanded)
   return default_file_icon
 end
 
+local function get_file_icon_color(name, is_dir)
+  if is_dir then
+    return file_icon_colors.dir_closed
+  end
+  local basename = name:match("([^/]+)$") or name
+  if file_icon_colors[basename] then return file_icon_colors[basename] end
+  local ext = basename:match("%.([^.]+)$")
+  if ext and file_icon_colors[ext] then return file_icon_colors[ext] end
+  return default_file_icon_color
+end
+
 function TreeView:get_item_icon(item, active, hovered)
   local character = get_file_icon(item.name, item.type == "dir", item.expanded)
-  local font = style.nerd_font or style.icon_font
-  local color = style.sidebar_text or style.text
+  local font = nerd_font or style.nerd_font or style.icon_font
+  local color
   if active or hovered then
     color = style.sidebar_accent or style.accent
   elseif item.ignored then
     color = style.sidebar_dim or style.dim
+  else
+    color = get_file_icon_color(item.name, item.type == "dir")
   end
   return character, font, color
 end
@@ -449,11 +552,11 @@ end
 function TreeView:get_item_text(item, active, hovered)
   local text = item.name
   local font = style.font
-  local color = style.text
+  local color = style.sidebar_text or style.text
   if active or hovered then
-    color = style.accent
+    color = style.sidebar_accent or style.accent
   elseif item.ignored then
-    color = style.dim
+    color = style.sidebar_dim or style.dim
   end
   return text, font, color
 end
@@ -481,7 +584,7 @@ end
 function TreeView:draw_item_chevron(item, active, hovered, x, y, w, h)
   if item.type == "dir" then
     local chevron_icon = item.expanded and "-" or "+"
-    local chevron_color = hovered and style.accent or style.text
+    local chevron_color = hovered and (style.sidebar_accent or style.accent) or (style.sidebar_text or style.text)
     common.draw_text(style.icon_font, chevron_color, chevron_icon, nil, x, y, 0, h)
   end
   return style.padding.x
@@ -489,12 +592,13 @@ end
 
 
 function TreeView:draw_item_background(item, active, hovered, x, y, w, h)
+  local highlight = style.sidebar_line_highlight or style.line_highlight
   if hovered then
-    local hover_color = { table.unpack(style.line_highlight) }
+    local hover_color = { table.unpack(highlight) }
     hover_color[4] = 160
     renderer.draw_rect(x, y, w, h, hover_color)
   elseif active then
-    renderer.draw_rect(x, y, w, h, style.line_highlight)
+    renderer.draw_rect(x, y, w, h, highlight)
   end
 end
 

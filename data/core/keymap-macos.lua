@@ -18,7 +18,10 @@ local function keymap_macos(keymap)
     ["cmd+ctrl+k"] = "root:switch-to-down",
 
 
-    ["cmd+w"] = "root:close-or-quit",
+    ["cmd+w"] = "root:close",
+    ["alt+w"] = "root:close",
+    ["option+w"] = "root:close",
+    ["cmd+q"] = "core:quit",
     ["ctrl+tab"] = "root:switch-to-next-tab",
     ["ctrl+shift+tab"] = "root:switch-to-previous-tab",
     ["cmd+pageup"] = "root:move-tab-left",
@@ -70,6 +73,7 @@ local function keymap_macos(keymap)
     ["keypad enter"] = { "command:submit", "doc:newline", "dialog:select" },
     ["cmd+return"] = "doc:newline-below",
     ["cmd+shift+return"] = "doc:newline-above",
+    ["cmd+\\"] = "treeview:toggle",
     ["cmd+j"] = "doc:join-lines",
     ["cmd+a"] = "doc:select-all",
     ["cmd+d"] = { "find-replace:select-add-next", "doc:select-word" },

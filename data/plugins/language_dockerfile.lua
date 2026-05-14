@@ -1,0 +1,40 @@
+-- mod-version:4
+local syntax = require "core.syntax"
+
+syntax.add {
+  name = "Dockerfile",
+  files = { "Dockerfile", "%.dockerfile$" },
+  comment = "#",
+  patterns = {
+    { pattern = "#.-\n",                    type = "comment"  },
+    { pattern = { '"', '"' },               type = "string"   },
+    { pattern = { "'", "'" },               type = "string"   },
+    { pattern = "%f[%w]ONBUILD%s+",         type = "keyword"  },
+    { pattern = "%f[%w][A-Z]+%s+",          type = "keyword"  },
+    { pattern = "%.%.%.",                    type = "operator" },
+    { pattern = "%${[%w_]+}",               type = "keyword2" },
+    { pattern = "%$[%w_]+",                 type = "keyword2" },
+    { pattern = "[%a_][%w_%-.]*",           type = "symbol"   },
+  },
+  symbols = {
+    ["FROM"]      = "keyword",
+    ["RUN"]       = "keyword",
+    ["CMD"]       = "keyword",
+    ["LABEL"]     = "keyword",
+    ["EXPOSE"]    = "keyword",
+    ["ENV"]       = "keyword",
+    ["ADD"]       = "keyword",
+    ["COPY"]      = "keyword",
+    ["ENTRYPOINT"] = "keyword",
+    ["VOLUME"]    = "keyword",
+    ["USER"]      = "keyword",
+    ["WORKDIR"]   = "keyword",
+    ["ARG"]       = "keyword",
+    ["ONBUILD"]   = "keyword",
+    ["STOPSIGNAL"] = "keyword",
+    ["HEALTHCHECK"] = "keyword",
+    ["SHELL"]     = "keyword",
+    ["MAINTAINER"] = "keyword",
+    ["AS"]        = "keyword",
+  },
+}

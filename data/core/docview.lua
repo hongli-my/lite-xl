@@ -116,9 +116,9 @@ end
 function DocView:get_scrollable_size()
   if not config.scroll_past_end then
     local _, _, _, h_scroll = self.h_scrollbar:get_track_rect()
-    return self:get_line_height() * (#self.doc.lines) + style.padding.y * 2 + h_scroll
+    return self:get_line_height() * (#self.doc.lines + 5) + style.padding.y * 2 + h_scroll
   end
-  return self:get_line_height() * (#self.doc.lines - 1) + self.size.y
+  return self:get_line_height() * (#self.doc.lines - 1 + 5) + style.padding.y * 2
 end
 
 function DocView:get_h_scrollable_size()
