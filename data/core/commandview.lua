@@ -398,7 +398,7 @@ local function draw_suggestions_box(self)
   local last = math.min(self.suggestions_offset + config.max_visible_commands, #self.suggestions)
   for i=first, last do
     local item = self.suggestions[i]
-    local color = (i == self.suggestion_idx) and style.accent or style.text
+    local color = style.accent
     local y = self.position.y - (i - first + 1) * lh - dh
     common.draw_text(self:get_font(), color, item.text, nil, x, y, 0, lh)
 

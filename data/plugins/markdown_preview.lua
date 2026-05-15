@@ -14,7 +14,7 @@ local Doc = require "core.doc"
 
 config.plugins.markdown_preview = {
   preview_width_ratio = 0.45,
-  line_number_width = 40,
+  line_number_width = 48,
 }
 
 -- ============================================================
@@ -34,6 +34,8 @@ function MarkdownPreviewView:new(doc)
   self.hovered_heading = nil
   self.copy_buttons = {}  -- {elem_idx, x, y, w, h} for copy buttons
   self.hovered_copy_btn = nil
+  self.image_cache = {}  -- path -> image object (nil if load failed)
+  self.image_sizes = {}  -- path -> {w, h} original pixel size
   self:refresh()
 end
 
@@ -50,6 +52,29 @@ end
 
 function MarkdownPreviewView:refresh()
   self.elements = self:parse_markdown()
+  self:load_images()
+end
+
+function MarkdownPreviewView:load_images()
+  -- Load images that are referenced in elements
+  for _, elem in ipairs(self.elements) do
+    if elem.type == "image" and elem.path and not self.image_cache[elem.path] then
+      -- Resolve relative path
+      local abs_path = elem.path
+      if not abs_path:match("^/") then
+        local doc_dir = self.doc.abs_filename and self.doc.abs_filename:match("(.*)[/\\]") or "."
+        abs_path = doc_dir .. "/" .. elem.path
+      end
+      local ok, img = pcall(renderer.image.load, abs_path)
+      if ok and img then
+        self.image_cache[elem.path] = img
+        local iw, ih = img:get_size()
+        self.image_sizes[elem.path] = { w = iw, h = ih }
+      else
+        self.image_cache[elem.path] = false -- mark as failed
+      end
+    end
+  end
 end
 
 function MarkdownPreviewView:parse_markdown()
@@ -66,6 +91,14 @@ function MarkdownPreviewView:parse_markdown()
 
     if line:match("^%s*$") then
       table.insert(elements, {type = "empty", line = i})
+      i = i + 1
+      goto continue
+    end
+
+    -- Match image syntax: ![alt](path) or ![](path)
+    local img_alt, img_path = line:match("^%!%[([^%]]*)%]%(([^)]+)%)%s*$")
+    if img_alt or img_path then
+      table.insert(elements, {type = "image", alt = img_alt or "", path = img_path or "", line = i})
       i = i + 1
       goto continue
     end
@@ -252,11 +285,11 @@ end
 
 -- Find the heading element index that controls collapsing at a given y position
 function MarkdownPreviewView:get_heading_at_y(my)
-  local ln_w = config.plugins.markdown_preview.line_number_width
+  local gw = style.font:get_width(tostring(#self.doc.lines)) + style.padding.x * 2
   local ox, oy = self:get_content_offset()
-  local x = ox + ln_w + style.padding.x
+  local x = ox + gw + style.padding.x
   local y = oy + style.padding.y
-  local avail_w = self.size.x - ln_w - style.padding.x * 2
+  local avail_w = self.size.x - gw - style.padding.x * 2
 
   for idx, elem in ipairs(self.elements) do
     if self:is_hidden(idx) then goto skip end
@@ -303,6 +336,25 @@ function MarkdownPreviewView:get_heading_at_y(my)
       y = y + style.padding.y
     elseif elem.type == "hr" then
       y = y + style.padding.y * 2
+    elseif elem.type == "image" then
+      local img = self.image_cache[elem.path]
+      local img_size = self.image_sizes[elem.path]
+      if img and img_size then
+        local max_w = avail_w * 0.7
+        local max_h = 250
+        local scale_w = max_w / img_size.w
+        local scale_h = max_h / img_size.h
+        local scale = math.min(scale_w, scale_h, 1)
+        local draw_h = math.floor(img_size.h * scale)
+        if elem.alt and elem.alt ~= "" then
+          y = y + draw_h + style.font:get_height() + style.padding.y
+        else
+          y = y + draw_h + style.padding.y
+        end
+      else
+        local img_h = style.font:get_height() * 2 + style.padding.y * 2
+        y = y + img_h + style.padding.y
+      end
     end
 
     ::skip::
@@ -312,6 +364,30 @@ end
 
 function MarkdownPreviewView:on_mouse_pressed(button, x, y, clicks)
   if button == "left" then
+    -- Check image click areas first
+    for _, area in ipairs(self.image_click_areas or {}) do
+      if x >= area.x and x <= area.x + area.w and y >= area.y and y <= area.y + area.h then
+        local elem = self.elements[area.idx]
+        if elem and elem.path then
+          -- Resolve relative path against the markdown file's directory
+          local abs_path = elem.path
+          if not abs_path:match("^/") then
+            local doc_dir = self.doc.abs_filename and self.doc.abs_filename:match("(.*)[/\\]") or "."
+            abs_path = doc_dir .. "/" .. elem.path
+          end
+          -- Open with system default application
+          if PLATFORM == "macOS" or PLATFORM == "Mac OS X" then
+            os.execute(string.format('open %q 2>/dev/null', abs_path))
+          elseif PLATFORM == "Linux" then
+            os.execute(string.format('xdg-open %q 2>/dev/null', abs_path))
+          elseif PLATFORM == "Windows" then
+            os.execute(string.format('start "" %q', abs_path))
+          end
+          core.log("Opened image: %s", elem.path)
+        end
+        return true
+      end
+    end
     -- Check copy buttons first
     for _, btn in ipairs(self.copy_buttons) do
       if x >= btn.x and x <= btn.x + btn.w and y >= btn.y and y <= btn.y + btn.h then
@@ -349,19 +425,24 @@ function MarkdownPreviewView:draw()
   self:draw_background(style.background)
 
   self.copy_buttons = {}  -- reset each draw
-  local ln_w = config.plugins.markdown_preview.line_number_width
+  self.image_click_areas = self.image_click_areas or {}
+  self.image_click_areas = {}  -- reset each draw
+  -- Calculate gutter width the same way as DocView
+  local gw = style.font:get_width(tostring(#self.doc.lines)) + style.padding.x * 2
+  local gpad = style.padding.x * 2
   local ox, oy = self:get_content_offset()
   local ln_x = ox + style.padding.x
-  local x = ox + ln_w + style.padding.x
+  local ln_draw_w = gw - gpad
+  local x = ox + gw + style.padding.x
   local y = oy + style.padding.y
-  local avail_w = self.size.x - ln_w - style.padding.x * 2
+  local avail_w = self.size.x - gw - style.padding.x * 2
 
   -- Draw line number gutter background
   if oy + self.size.y > self.position.y then
     local gutter_top = math.max(oy, self.position.y)
     local gutter_bottom = math.min(oy + self.content_height, self.position.y + self.size.y)
     if gutter_bottom > gutter_top then
-      renderer.draw_rect(ox, gutter_top, ln_w, gutter_bottom - gutter_top, style.line_highlight)
+      renderer.draw_rect(ox, gutter_top, gw, gutter_bottom - gutter_top, style.line_highlight)
     end
   end
 
@@ -392,7 +473,7 @@ function MarkdownPreviewView:draw()
       local lines_out = self:wrap_text(text_to_wrap, avail_w)
 
       -- Draw line number
-      common.draw_text(font, style.dim, ln_text, "right", ln_x, y, ln_w - style.padding.x, style.font:get_height() * scale)
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height() * scale)
 
       -- Highlight on hover
       if is_hovered then
@@ -413,7 +494,7 @@ function MarkdownPreviewView:draw()
     elseif elem.type == "paragraph" then
       local lines_out = self:wrap_text(elem.text, avail_w)
       -- Draw line number for first line
-      common.draw_text(font, style.dim, ln_text, "right", ln_x, y, ln_w - style.padding.x, style.font:get_height())
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height())
       for _, line in ipairs(lines_out) do
         renderer.draw_text(style.font, line, x, y, style.text)
         y = y + style.font:get_height() + style.padding.y / 2
@@ -450,7 +531,7 @@ function MarkdownPreviewView:draw()
         local wrapped = self:wrap_code_line(line, code_w)
         for wi, wline in ipairs(wrapped) do
           if wi == 1 then
-            common.draw_text(font, style.dim, tostring(line_num), "right", ln_x, y, ln_w - style.padding.x, code_h)
+            common.draw_text(font, style.line_number, tostring(line_num), "right", ln_x, y, ln_draw_w, code_h)
           end
           local text_x = x + style.padding.x
           if wi > 1 then
@@ -463,14 +544,14 @@ function MarkdownPreviewView:draw()
       y = y + style.padding.y
 
     elseif elem.type == "empty" then
-      common.draw_text(font, style.dim, ln_text, "right", ln_x, y, ln_w - style.padding.x, style.font:get_height())
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height())
       y = y + style.font:get_height() + style.padding.y / 2
 
     elseif elem.type == "blockquote" then
       local lines_out = self:wrap_text(elem.text, avail_w - style.padding.x * 2)
       local block_h = #lines_out * style.font:get_height() + style.padding.y
       -- Draw line number
-      common.draw_text(font, style.dim, ln_text, "right", ln_x, y, ln_w - style.padding.x, style.font:get_height())
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height())
       renderer.draw_rect(x, y, 3 * SCALE, block_h, style.syntax["comment"] or style.dim)
       for _, line in ipairs(lines_out) do
         renderer.draw_text(style.font, line, x + style.padding.x * 2, y + style.padding.y / 2, style.dim)
@@ -480,7 +561,7 @@ function MarkdownPreviewView:draw()
 
     elseif elem.type == "ul" then
       -- Draw line number
-      common.draw_text(font, style.dim, ln_text, "right", ln_x, y, ln_w - style.padding.x, style.font:get_height())
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height())
       for _, item_text in ipairs(elem.items) do
         local text_x = x + style.padding.x * 3
         local lines_out = self:wrap_text(item_text, avail_w - style.padding.x * 3)
@@ -494,7 +575,7 @@ function MarkdownPreviewView:draw()
 
     elseif elem.type == "ol" then
       -- Draw line number
-      common.draw_text(font, style.dim, ln_text, "right", ln_x, y, ln_w - style.padding.x, style.font:get_height())
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height())
       for idx2, item_text in ipairs(elem.items) do
         local text_x = x + style.padding.x * 3
         local lines_out = self:wrap_text(item_text, avail_w - style.padding.x * 3)
@@ -506,9 +587,44 @@ function MarkdownPreviewView:draw()
       end
       y = y + style.padding.y
 
+    elseif elem.type == "image" then
+      -- Draw line number
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height())
+      local img = self.image_cache[elem.path]
+      local img_size = self.image_sizes[elem.path]
+      if img and img_size then
+        -- Calculate display size: fit within available width, preserve aspect ratio
+        local max_w = avail_w * 0.7
+        local max_h = 250 -- max display height
+        local scale_w = max_w / img_size.w
+        local scale_h = max_h / img_size.h
+        local scale = math.min(scale_w, scale_h, 1) -- don't upscale
+        local draw_w = math.floor(img_size.w * scale)
+        local draw_h = math.floor(img_size.h * scale)
+        -- Draw the image
+        renderer.draw_image(img, x, y, draw_w, draw_h)
+        -- Draw alt text below if present
+        if elem.alt and elem.alt ~= "" then
+          common.draw_text(style.font, style.dim, elem.alt, "left", x, y + draw_h + 2, avail_w, style.font:get_height())
+          y = y + draw_h + style.font:get_height() + style.padding.y
+        else
+          y = y + draw_h + style.padding.y
+        end
+      else
+        -- Fallback: draw placeholder if image failed to load
+        local img_h = style.font:get_height() * 2 + style.padding.y * 2
+        renderer.draw_rect(x, y, avail_w, img_h, style.line_highlight)
+        local icon_text = "[IMG]"
+        renderer.draw_text(style.font, icon_text, x + style.padding.x, y + style.padding.y, style.syntax["string"] or style.text)
+        local alt_label = elem.alt ~= "" and elem.alt or "(image)"
+        renderer.draw_text(style.font, alt_label, x + style.padding.x * 2 + style.font:get_width(icon_text), y + style.padding.y, style.syntax["keyword"] or style.text)
+        renderer.draw_text(style.code_font, elem.path, x + style.padding.x * 2 + style.font:get_width(icon_text), y + style.padding.y + style.font:get_height(), style.dim)
+        y = y + img_h + style.padding.y
+      end
+
     elseif elem.type == "hr" then
       -- Draw line number
-      common.draw_text(font, style.dim, ln_text, "right", ln_x, y, ln_w - style.padding.x, style.font:get_height())
+      common.draw_text(font, style.line_number, ln_text, "right", ln_x, y, ln_draw_w, style.font:get_height())
       local cy = y + style.padding.y
       renderer.draw_rect(x, cy, avail_w, 1 * SCALE, style.divider)
       y = y + style.padding.y * 2

@@ -9,6 +9,10 @@
 #endif
 #include "lua.h"
 
+// stb_image for loading PNG/JPG/BMP/etc
+#define STB_IMAGE_IMPLEMENTATION
+#include "../stb_image.h"
+
 // a reference index to a table that stores the fonts
 static int RENDERER_FONT_REF = LUA_NOREF;
 
@@ -394,6 +398,80 @@ static int f_draw_text(lua_State *L) {
   return 1;
 }
 
+
+// ============================================================
+// Image support
+// ============================================================
+
+static int f_image_load(lua_State *L) {
+  const char *filename = luaL_checkstring(L, 1);
+  int w, h, channels;
+  unsigned char *data = stbi_load(filename, &w, &h, &channels, 4); // force RGBA
+  if (!data) {
+    return luaL_error(L, "failed to load image '%s': %s", filename, stbi_failure_reason());
+  }
+  // Create SDL surface from stb_image data
+  SDL_PixelFormat format = SDL_GetPixelFormatForMasks(32, 0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000);
+  SDL_Surface *surface = SDL_CreateSurfaceFrom(w, h, format, data, w * 4);
+  if (!surface) {
+    stbi_image_free(data);
+    return luaL_error(L, "failed to create surface: %s", SDL_GetError());
+  }
+  // Store the stb data pointer so we can free it later
+  // We need to copy the data because stbi_image_free and SDL_DestroySurface need separate handling
+  // Actually, SDL_CreateSurfaceFrom doesn't copy the data, so we need to keep it alive
+  // We'll store the stb_data pointer in the surface properties for cleanup
+  SDL_PropertiesID props = SDL_GetSurfaceProperties(surface);
+  SDL_SetPointerProperty(props, "stb_data", data);
+
+  SDL_Surface **img = lua_newuserdata(L, sizeof(SDL_Surface*));
+  *img = surface;
+  luaL_setmetatable(L, API_TYPE_IMAGE);
+  return 1;
+}
+
+static int f_image_gc(lua_State *L) {
+  SDL_Surface **self = luaL_checkudata(L, 1, API_TYPE_IMAGE);
+  if (*self) {
+    // Free the stb_image data stored in surface properties
+    SDL_PropertiesID props = SDL_GetSurfaceProperties(*self);
+    void *stb_data = SDL_GetPointerProperty(props, "stb_data", NULL);
+    if (stb_data) {
+      stbi_image_free(stb_data);
+    }
+    SDL_DestroySurface(*self);
+    *self = NULL;
+  }
+  return 0;
+}
+
+static int f_image_get_size(lua_State *L) {
+  SDL_Surface **self = luaL_checkudata(L, 1, API_TYPE_IMAGE);
+  if (!*self) return luaL_error(L, "invalid image");
+  lua_pushnumber(L, (*self)->w);
+  lua_pushnumber(L, (*self)->h);
+  return 2;
+}
+
+static int f_draw_image(lua_State *L) {
+  SDL_Surface **img = luaL_checkudata(L, 1, API_TYPE_IMAGE);
+  if (!*img) return luaL_error(L, "invalid image");
+  double x = luaL_checknumber(L, 2);
+  double y = luaL_checknumber(L, 3);
+  double w = luaL_optnumber(L, 4, 0);
+  double h = luaL_optnumber(L, 5, 0);
+
+  RenWindow *window = ren_get_target_window();
+  if (!window) return 0;
+
+  if (w <= 0) w = (*img)->w;
+  if (h <= 0) h = (*img)->h;
+
+  rencache_draw_image(window, *img, x, y, w, h);
+
+  return 0;
+}
+
 static const luaL_Reg lib[] = {
   { "show_debug",         f_show_debug         },
   { "get_size",           f_get_size           },
@@ -402,6 +480,7 @@ static const luaL_Reg lib[] = {
   { "set_clip_rect",      f_set_clip_rect      },
   { "draw_rect",          f_draw_rect          },
   { "draw_text",          f_draw_text          },
+  { "draw_image",         f_draw_image         },
   { NULL,                 NULL                 }
 };
 
@@ -419,6 +498,13 @@ static const luaL_Reg fontLib[] = {
   { NULL, NULL }
 };
 
+static const luaL_Reg imageLib[] = {
+  { "__gc",               f_image_gc           },
+  { "load",               f_image_load         },
+  { "get_size",           f_image_get_size     },
+  { NULL, NULL }
+};
+
 int luaopen_renderer(lua_State *L) {
   // gets a reference on the registry to store font data
   lua_newtable(L);
@@ -430,5 +516,10 @@ int luaopen_renderer(lua_State *L) {
   lua_pushvalue(L, -1);
   lua_setfield(L, -2, "__index");
   lua_setfield(L, -2, "font");
+  luaL_newmetatable(L, API_TYPE_IMAGE);
+  luaL_setfuncs(L, imageLib, 0);
+  lua_pushvalue(L, -1);
+  lua_setfield(L, -2, "__index");
+  lua_setfield(L, -2, "image");
   return 1;
 }

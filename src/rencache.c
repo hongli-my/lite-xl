@@ -33,7 +33,7 @@
 #define CMD_BUF_INIT_SIZE (1024 * 512)
 #define COMMAND_BARE_SIZE offsetof(Command, command)
 
-enum CommandType { SET_CLIP, DRAW_TEXT, DRAW_RECT };
+enum CommandType { SET_CLIP, DRAW_TEXT, DRAW_RECT, DRAW_IMAGE };
 
 typedef struct {
   enum CommandType type;
@@ -62,6 +62,12 @@ typedef struct {
   RenRect rect;
   RenColor color;
 } DrawRectCommand;
+
+typedef struct {
+  RenRect rect;
+  SDL_Surface *surface;
+  int img_w, img_h;
+} DrawImageCommand;
 
 static unsigned cells_buf1[CELLS_X * CELLS_Y];
 static unsigned cells_buf2[CELLS_X * CELLS_Y];
@@ -216,6 +222,22 @@ double rencache_draw_text(RenWindow *window_renderer, RenFont **fonts, const cha
 }
 
 
+void rencache_draw_image(RenWindow *window_renderer, SDL_Surface *surface, double x, double y, double w, double h)
+{
+  RenRect rect = { (int)(x + 0.5), (int)(y + 0.5), (int)(w + 0.5), (int)(h + 0.5) };
+  if (rect.width == 0 || rect.height == 0 || !rects_overlap(last_clip_rect, rect)) {
+    return;
+  }
+  DrawImageCommand *cmd = push_command(window_renderer, DRAW_IMAGE, sizeof(DrawImageCommand));
+  if (cmd) {
+    cmd->rect = rect;
+    cmd->surface = surface;
+    cmd->img_w = surface ? surface->w : 0;
+    cmd->img_h = surface ? surface->h : 0;
+  }
+}
+
+
 void rencache_invalidate(void) {
   memset(cells_prev, 0xff, sizeof(cells_buf1));
 }
@@ -326,6 +348,11 @@ void rencache_end_frame(RenWindow *window_renderer) {
           ren_font_group_set_tab_size(tcmd->fonts, tcmd->tab_size);
           ren_draw_text(&rs, tcmd->fonts, tcmd->text, tcmd->len, tcmd->text_x, tcmd->rect.y, tcmd->color, tcmd->tab);
           break;
+        case DRAW_IMAGE: {
+          DrawImageCommand *icmd = (DrawImageCommand*)&cmd->command;
+          ren_draw_image(&rs, icmd->surface, icmd->rect);
+          break;
+        }
       }
     }
 

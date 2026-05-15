@@ -751,6 +751,30 @@ void ren_draw_rect(RenSurface *rs, RenRect rect, RenColor color) {
   }
 }
 
+
+void ren_draw_image(RenSurface *rs, SDL_Surface *img, RenRect rect) {
+  if (!img) return;
+
+  SDL_Surface *surface = rs->surface;
+  const int surface_scale = rs->scale;
+
+  SDL_Rect dst_rect = { rect.x * surface_scale,
+                        rect.y * surface_scale,
+                        rect.width * surface_scale,
+                        rect.height * surface_scale };
+
+  if ((unsigned)dst_rect.w != (unsigned)img->w || (unsigned)dst_rect.h != (unsigned)img->h) {
+    SDL_Surface *scaled = SDL_CreateSurface(dst_rect.w, dst_rect.h, img->format);
+    if (scaled) {
+      SDL_BlitSurfaceScaled(img, NULL, scaled, NULL, SDL_SCALEMODE_LINEAR);
+      SDL_BlitSurface(scaled, NULL, surface, &dst_rect);
+      SDL_DestroySurface(scaled);
+    }
+  } else {
+    SDL_BlitSurface(img, NULL, surface, &dst_rect);
+  }
+}
+
 /*************** Window Management ****************/
 static void ren_add_window(RenWindow *window_renderer) {
   window_count += 1;
