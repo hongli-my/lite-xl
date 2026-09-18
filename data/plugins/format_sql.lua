@@ -4,7 +4,6 @@
 local core = require "core"
 local command = require "core.command"
 local DocView = require "core.docview"
-local ContextMenu = require "core.contextmenu"
 
 --------------------------------------------------------------------------------
 -- Tokenizer
@@ -590,36 +589,24 @@ end, {
   ["sql:format"] = function()
     local dv = core.active_view
     local doc = dv.doc
-    local text = doc:get_text(1, 1, #doc.lines, math.huge)
+    -- `inclusive` is needed, otherwise the newline terminating the last line
+    -- is dropped and "already formatted" documents never compare equal
+    local text = doc:get_text(1, 1, #doc.lines, math.huge, true)
     local formatted = format_sql(text)
-    if formatted ~= text then
-      doc:remove(1, 1, #doc.lines, math.huge)
-      doc:insert(1, 1, formatted:gsub("\n$", "") .. "\n")
-      core.log("SQL formatted")
-    else
+    if formatted == text then
       core.log("SQL already formatted")
+      return
     end
+    local line, col = doc:get_selection()
+    -- `Doc:remove` keeps the newline terminating the last line, so the
+    -- formatted text is inserted without its own trailing newline.
+    doc:remove(1, 1, #doc.lines, math.huge)
+    doc:insert(1, 1, formatted:sub(-1) == "\n" and formatted:sub(1, -2) or formatted)
+    line = math.min(line, #doc.lines)
+    col = math.min(col, #doc.lines[line])
+    doc:set_selection(line, col)
+    core.log("SQL formatted")
   end
 })
 
---------------------------------------------------------------------------------
--- Hook ContextMenu:show to add "Format SQL" for SQL files
---------------------------------------------------------------------------------
-local old_ContextMenu_show = ContextMenu.show
-function ContextMenu:show(x, y, items, ...)
-  local dv = core.active_view
-  if dv and dv:is(DocView) and dv.doc and dv.doc.syntax and dv.doc.syntax.name == "SQL" then
-    local has_format = false
-    for _, item in ipairs(items) do
-      if item ~= ContextMenu.DIVIDER and item.text == "Format SQL" then
-        has_format = true
-        break
-      end
-    end
-    if not has_format then
-      table.insert(items, ContextMenu.DIVIDER)
-      table.insert(items, { text = "Format SQL", command = "sql:format" })
-    end
-  end
-  return old_ContextMenu_show(self, x, y, items, ...)
-end
+return { format = format_sql }
