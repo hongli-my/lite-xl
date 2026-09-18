@@ -43,17 +43,16 @@ local function save(filename)
     core.log("Saved \"%s\"", saved_filename)
   else
     core.error(err)
-    core.nag_view:show("Saving failed", string.format("Couldn't save file \"%s\". Do you want to save to another location?", doc().filename), {
-      { text = "Yes", default_yes = true },
-      { text = "No", default_no = true }
-    }, function(item)
-      if item.text == "Yes" then
-        core.add_thread(function()
-          -- we need to run this in a thread because of the odd way the nagview is.
+    core.dialog_view:show("Saving failed",
+      string.format("Couldn't save file \"%s\".", doc().filename),
+      {
+        { text = "Save As...", default_yes = true },
+        { text = "Cancel", default_no = true }
+      }, function(item)
+        if item.text == "Save As..." then
           command.perform("doc:save-as")
-        end)
-      end
-    end)
+        end
+      end)
   end
 end
 

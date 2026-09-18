@@ -796,10 +796,10 @@ end, {
     local file_type = file_info.type == "dir" and "Directory" or "File"
     -- Ask before deleting
     local opt = {
-      { text = "Yes", default_yes = true },
-      { text = "No", default_no = true }
+      { text = "Delete" },
+      { text = "Cancel", default_no = true }
     }
-    core.nag_view:show(
+    core.dialog_view:show(
       string.format("Delete %s", file_type),
       string.format(
         "Are you sure you want to delete the %s?\n%s: %s",
@@ -807,7 +807,7 @@ end, {
       ),
       opt,
       function(item)
-        if item.text == "Yes" then
+        if item.text == "Delete" then
           if file_info.type == "dir" then
             local deleted, error, path = common.rm(filename, true)
             if not deleted then

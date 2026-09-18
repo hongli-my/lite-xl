@@ -396,7 +396,7 @@ function RootView:on_file_dropped(filename, x, y)
     local abspath = system.absolute_path(filename) --[[@as string]]
     if self.first_update_done then
       -- ask the user if they want to open it here or somewhere else
-      core.nag_view:show(
+      core.dialog_view:show(
         "Open directory",
         string.format('You are trying to open "%s"\n', common.home_encode(abspath))
         .. "Do you want to open this directory here, or in a new window?",
@@ -438,7 +438,7 @@ function RootView:on_file_dropped(filename, x, y)
 end
 
 function RootView:process_defer_open_docs()
-  if core.active_view == core.nag_view then return end
+  if core.active_view == core.nag_view or core.active_view == core.dialog_view then return end
   for _, drop in ipairs(self.defer_open_docs) do
     -- file dragged into lite-xl, try to open it
     local filename, x, y = table.unpack(drop)
@@ -475,7 +475,7 @@ end
 
 function RootView:on_touch_moved(x, y, dx, dy, ...)
   if not self.touched_view then return end
-  if core.active_view == core.nag_view then
+  if core.active_view == core.nag_view or core.active_view == core.dialog_view then
     core.active_view:on_touch_moved(x, y, dx, dy, ...)
     return
   end

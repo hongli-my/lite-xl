@@ -12,6 +12,7 @@ local StatusView
 local TitleView
 local CommandView
 local NagView
+local DialogView
 local DocView
 local Doc
 local Project
@@ -276,6 +277,7 @@ function core.init()
   TitleView = require "core.titleview"
   CommandView = require "core.commandview"
   NagView = require "core.nagview"
+  DialogView = require "core.dialog"
   Project = require "core.project"
   DocView = require "core.docview"
   Doc = require "core.doc"
@@ -341,6 +343,8 @@ function core.init()
   core.status_view = StatusView()
   ---@type core.nagview
   core.nag_view = NagView()
+  ---@type core.dialogview
+  core.dialog_view = DialogView()
   ---@type core.titleview
   core.title_view = TitleView()
 
@@ -417,7 +421,7 @@ function core.init()
         msg[#msg + 1] = string.format("Plugins from directory \"%s\":\n%s", common.home_encode(entry.dir), table.concat(msg_list, "\n"))
       end
     end
-    core.nag_view:show(
+    core.dialog_view:show(
       "Refused Plugins",
       string.format(
         "Some plugins are not loaded due to version mismatch. Expected version %s.\n\n%s.\n\n" ..
@@ -431,32 +435,56 @@ end
 
 
 function core.confirm_close_docs(docs, close_fn, ...)
-  local dirty_count = 0
-  local dirty_name
+  local dirty_docs, dirty_name = {}, nil
   for _, doc in ipairs(docs or core.docs) do
     if doc:is_dirty() then
-      dirty_count = dirty_count + 1
+      table.insert(dirty_docs, doc)
       dirty_name = doc:get_name()
     end
   end
-  if dirty_count > 0 then
-    local text
-    if dirty_count == 1 then
-      text = string.format("\"%s\" has unsaved changes. Quit anyway?", dirty_name)
-    else
-      text = string.format("%d docs have unsaved changes. Quit anyway?", dirty_count)
-    end
-    local args = {...}
-    local opt = {
-      { text = "Yes", default_yes = true },
-      { text = "No", default_no = true }
-    }
-    core.nag_view:show("Unsaved Changes", text, opt, function(item)
-      if item.text == "Yes" then close_fn(table.unpack(args)) end
-    end)
-  else
+
+  if #dirty_docs == 0 then
     close_fn(...)
+    return
   end
+
+  local text
+  if #dirty_docs == 1 then
+    text = string.format("\"%s\" has unsaved changes.", dirty_name)
+  else
+    text = string.format("%d documents have unsaved changes.", #dirty_docs)
+  end
+
+  -- saving is only offered when every modified document has a filename
+  local can_save = true
+  for _, doc in ipairs(dirty_docs) do
+    if not doc.filename then
+      can_save = false
+      break
+    end
+  end
+
+  local options = {}
+  if can_save then
+    table.insert(options, { text = #dirty_docs == 1 and "Save" or "Save All", default_yes = true })
+  end
+  table.insert(options, { text = "Discard Changes", default_yes = not can_save })
+  table.insert(options, { text = "Cancel", default_no = true })
+
+  local args = {...}
+  core.dialog_view:show("Unsaved Changes", text, options, function(item)
+    if item.text == "Cancel" then return end
+    if item.text == "Discard Changes" then
+      close_fn(table.unpack(args))
+      return
+    end
+    -- save everything first, and only continue if it worked
+    for _, doc in ipairs(dirty_docs) do
+      core.try(doc.save, doc)
+      if doc:is_dirty() then return end
+    end
+    close_fn(table.unpack(args))
+  end)
 end
 
 local temp_uid = math.floor(system.get_time() * 1000) % 0xffffffff

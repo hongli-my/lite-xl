@@ -1,5 +1,6 @@
 local core = require "core"
 local common = require "core.common"
+local command = require "core.command"
 local config = require "core.config"
 local style = require "core.style"
 local keymap = require "core.keymap"
@@ -75,22 +76,28 @@ end
 function DocView:try_close(do_close)
   if self.doc:is_dirty()
   and #core.get_views_referencing_doc(self.doc) == 1 then
-    core.command_view:enter("Unsaved Changes; Confirm Close", {
-      submit = function(_, item)
-        if item.text:match("^[cC]") then
+    local doc = self.doc
+    -- an unnamed document cannot be saved in place: ask for a name first
+    local unnamed = not doc.filename
+    core.dialog_view:show("Unsaved Changes",
+      string.format("\"%s\" has unsaved changes.", doc:get_name()),
+      {
+        { text = unnamed and "Save As..." or "Save And Close", default_yes = true },
+        { text = "Close Without Saving" },
+        { text = "Cancel", default_no = true },
+      },
+      function(item)
+        if item.text == "Cancel" then
+          return
+        elseif item.text == "Close Without Saving" then
           do_close()
-        elseif item.text:match("^[sS]") then
-          self.doc:save()
-          do_close()
+        elseif item.text == "Save As..." then
+          command.perform("doc:save-as")
+        else
+          core.try(doc.save, doc)
+          if not doc:is_dirty() then do_close() end
         end
-      end,
-      suggest = function(text)
-        local items = {}
-        if not text:find("^[^cC]") then table.insert(items, "Close Without Saving") end
-        if not text:find("^[^sS]") then table.insert(items, "Save And Close") end
-        return items
-      end
-    })
+      end)
   else
     do_close()
   end
