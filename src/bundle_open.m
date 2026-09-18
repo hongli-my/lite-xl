@@ -7,6 +7,9 @@
 
 #ifdef MACOS_USE_BUNDLE
 
+/* 前向声明 */
+@class MenuActionTarget;
+
 /* 保存 lua_State，菜单点击时用它执行 lite-xl 命令 */
 static lua_State *g_lua_state = NULL;
 static MenuActionTarget *g_menu_target = nil;
@@ -101,7 +104,7 @@ static void install_main_menu(void) {
 /* SDL 事件观察器：等窗口首次显示后（SDL 已完成 NSApp 初始化）再设菜单。
  * 过早设菜单会被 SDL3 的 finishLaunching 覆盖；过晚则用户看到空菜单栏。
  * 窗口 EXPOSED 事件意味着 SDL 已建好窗口、NSApp 已 run 起来。 */
-static SDL_AppResult SDLCALL menu_event_watch(void *userdata, SDL_Event *event) {
+static bool SDLCALL menu_event_watch(void *userdata, SDL_Event *event) {
   if (!g_menu_installed && event->type == SDL_EVENT_WINDOW_EXPOSED) {
     g_menu_installed = true;
     dispatch_async(dispatch_get_main_queue(), ^{
