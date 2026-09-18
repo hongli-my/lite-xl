@@ -712,18 +712,8 @@ view.node = node:split("left", view, {x = true}, true)
 -- plugin module that plug itself in the active node but it is plugged here
 -- in the treeview node.
 local toolbar_view = nil
-local toolbar_plugin, ToolbarView = pcall(require, "plugins.toolbarview")
-if config.plugins.toolbarview ~= false and toolbar_plugin then
-  toolbar_view = ToolbarView()
-  view.node:split("down", toolbar_view, {y = true})
-  local min_toolbar_width = toolbar_view:get_min_width()
-  view:set_target_size("x", math.max(config.plugins.treeview.size, min_toolbar_width))
-  command.add(nil, {
-    ["toolbar:toggle"] = function()
-      toolbar_view:toggle_visible()
-    end,
-  })
-end
+-- 底部 toolbar 已移到 macOS 系统菜单栏，这里不再加载 toolbarview 插件。
+-- toolbar_view 保持 nil，下方所有引用均用 `toolbar_view and ...` 保护。
 
 
 local old_remove_project = core.remove_project
