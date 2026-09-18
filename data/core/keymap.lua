@@ -4,6 +4,13 @@ local config = require "core.config"
 local ime = require "core.ime"
 local keymap = {}
 
+-- Trackpads report a small horizontal delta together with mostly vertical
+-- gestures. Scrolling on those deltas would make the document drift
+-- sideways, so a horizontal delta is only used when it is the dominant axis
+-- and above a small dead zone.
+local horizontal_wheel_dead_zone = 0.05
+local horizontal_wheel_dominant_ratio = 0.5
+
 ---@alias keymap.shortcut string
 ---@alias keymap.command string
 ---@alias keymap.modkey string
@@ -252,7 +259,12 @@ function keymap.on_mouse_wheel(delta_y, delta_x, ...)
   if delta_x ~= 0 then
     x_result = keymap.on_key_pressed("wheel" .. x_direction, delta_x, ...)
     if not x_result then
-      x_result = keymap.on_key_pressed("hwheel", delta_x, ...)
+      local ax, ay = math.abs(delta_x), math.abs(delta_y)
+      -- ignore the horizontal noise that comes with vertical gestures
+      if ay == 0
+      or (ax >= ay * horizontal_wheel_dominant_ratio and ax >= horizontal_wheel_dead_zone) then
+        x_result = keymap.on_key_pressed("hwheel", delta_x, ...)
+      end
     end
   end
   return y_result or x_result

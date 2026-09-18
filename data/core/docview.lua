@@ -126,6 +126,92 @@ function DocView:get_h_scrollable_size()
 end
 
 
+-- Lines longer than this are never measured (see `get_visible_content_width`).
+local MAX_MEASURED_COLUMNS = 4096
+
+
+---Returns the pixel width of the widest line among the currently visible
+---ones, gutter included.
+---This is used to bound horizontal scrolling, because
+---`DocView:get_h_scrollable_size` returns `math.huge` (which keeps the
+---horizontal scrollbar hidden), so `View:clamp_scroll_position` cannot
+---limit `scroll.x` by itself.
+---
+---Measuring a line costs time proportional to its length, so ordinary lines
+---are only measured over a window of `size.x * 2` pixels around the current
+---position (`columns` below): a line reaching beyond the window is reported as
+---"at least that wide", and scrolling to the right just moves the window
+---further into the line until its end is measured exactly. Lines too long to
+---be measured at all are estimated from their length instead, so that files
+---with enormous (minified) lines stay cheap.
+---@return number
+function DocView:get_visible_content_width()
+  local minline, maxline = self:get_visible_line_range()
+  local _, indent_size = self.doc:get_indent_info()
+  -- Quantize the window so that small scroll movements reuse the cached value.
+  local limit = math.ceil((self.scroll.x + self.size.x * 2) / 128) * 128
+  local key = string.format("%d:%d:%d:%d:%d:%s:%d",
+    self.doc:get_change_id(), minline, maxline, SCALE, indent_size, self.font, limit)
+  if self.visible_content_width_key == key then
+    return self.visible_content_width
+  end
+
+  local width = 0
+  local gutter_width = self:get_gutter_width()
+  local padding = style.padding.x
+  -- A conservative lower bound of a glyph's advance, used both to derive the
+  -- number of columns to measure and to estimate very long lines.
+  local min_char_width = math.max(math.min(
+    self:get_font():get_width("i"),
+    self:get_font():get_width("l"),
+    self:get_font():get_width("."),
+    self:get_font():get_width(" ")), SCALE)
+  local max_columns = math.ceil(math.max(limit - gutter_width, 0) / min_char_width) + 1
+  for i = minline, maxline do
+    local line = self.doc.lines[i]
+    local n = line and #line or 0
+    -- don't measure the trailing newline, it is not drawn
+    if n > 0 and line:sub(-1) == "\n" then n = n - 1 end
+    if n > 0 and line:sub(-1) == "\r" then n = n - 1 end
+    local line_width
+    if n > MAX_MEASURED_COLUMNS then
+      -- Too long to be measured from its start every frame (a minified line,
+      -- a huge string...): estimating from the character count is cheap, and
+      -- with a monospaced font it is accurate.
+      line_width = gutter_width + padding + n * min_char_width
+    elseif n > 0 then
+      local columns = math.min(n, max_columns)
+      line_width = gutter_width + self:get_col_x_offset(i, columns) + padding
+      if columns < n then
+        -- The line goes on beyond the measured window: all we need to know is
+        -- that it is at least `limit` wide. Nothing wider can be measured
+        -- cheaply, so we can stop here.
+        if line_width < limit then line_width = limit end
+        if line_width > width then width = line_width end
+        break
+      end
+    end
+    if line_width and line_width > width then width = line_width end
+  end
+
+  self.visible_content_width_key = key
+  self.visible_content_width = width
+  return width
+end
+
+
+function DocView:clamp_scroll_position()
+  DocView.super.clamp_scroll_position(self)
+  -- The horizontal scrollable size is infinite, so restrict the horizontal
+  -- scroll to the widest visible line: scrolling must stop at the end of the
+  -- text instead of running off into empty space.
+  if self.size.x <= 0 or self.size.y <= 0 or self:get_h_scrollable_size() ~= math.huge then return end
+  local max = math.max(self:get_visible_content_width() - self.size.x, 0)
+  self.scroll.to.x = common.clamp(self.scroll.to.x, 0, max)
+  self.scroll.x = common.clamp(self.scroll.x, 0, max)
+end
+
+
 function DocView:get_font()
   return style[self.font]
 end
