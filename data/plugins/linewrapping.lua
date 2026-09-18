@@ -348,7 +348,11 @@ function DocView:update()
   end
 end
 
+local old_get_scrollable_size = DocView.get_scrollable_size
 function DocView:get_scrollable_size()
+  -- without wrapping the number of rows is the number of lines, so other
+  -- overrides (folding for example) must still be honored
+  if not self.wrapped_settings then return old_get_scrollable_size(self) end
   if not config.scroll_past_end then
     return self:get_line_height() * get_total_wrapped_lines(self) + style.padding.y * 2
   end
