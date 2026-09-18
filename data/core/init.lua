@@ -65,7 +65,11 @@ end
 
 
 function core.remove_project(project, force)
-  for i = (force and 1 or 2), #core.projects do
+  -- At least one project must remain in the treeview, unless `force` is used
+  -- (internal cleanup when switching/restarting). The primary project is
+  -- removable too: the remaining directories shift up to take its place.
+  if not force and #core.projects <= 1 then return false end
+  for i = 1, #core.projects do
     if project == core.projects[i] or project == core.projects[i].path then
       local project = core.projects[i]
       table.remove(core.projects, i)

@@ -134,21 +134,41 @@ local function change_project_directory(use_dialog)
   end)
 end
 
-local function open_project_directory(use_dialog)
-  open_directory("Open Project", use_dialog, false, function(abs_path)
-    if abs_path[1] == core.root_project().path then
-      core.error("Directory %q is currently opened", abs_path[1])
+-- Adds a directory to the current window's treeview (the sidebar can hold
+-- several directories at once). It never spawns a new window and it never
+-- touches the directory content on disk.
+local function add_directory_to_sidebar(dir)
+  local abs_path = system.absolute_path(dir)
+  local info = abs_path and system.get_file_info(abs_path)
+  if not info or info.type ~= "dir" then
+    core.error("Cannot open directory %q", dir)
+    return
+  end
+  abs_path = common.normalize_volume(common.normalize_path(abs_path))
+  for _, project in ipairs(core.projects) do
+    if project.path == abs_path then
+      core.error("Directory %q is currently opened", abs_path)
       return
     end
-    system.exec(string.format("%q %q", EXEFILE, abs_path[1]))
+  end
+  core.add_project(abs_path)
+  core.log("Opened directory %s", common.home_encode(abs_path))
+end
+
+-- Open a directory in the current window: the directory is added to the
+-- sidebar so that several directories can be browsed side by side.
+local function open_project_directory(use_dialog)
+  open_directory("Open Directory", use_dialog, false, function(abs_path)
+    for _, dir in ipairs(abs_path) do
+      add_directory_to_sidebar(dir)
+    end
   end)
 end
 
 local function add_project_directory(use_dialog)
   open_directory("Add Directory", use_dialog, true, function(abs_path)
     for _, dir in ipairs(abs_path) do
-      print(dir)
-      core.add_project(system.absolute_path(dir))
+      add_directory_to_sidebar(dir)
     end
   end)
 end
@@ -272,8 +292,11 @@ command.add(nil, {
     change_project_directory(false)
   end,
 
+  -- "Open directory…" always uses the native directory picker dialog, so it
+  -- works without rebuilding the bundled binary. Use
+  -- `core:open-project-folder-commandview` for the text input variant.
   ["core:open-project-folder"] = function()
-    open_project_directory(config.use_system_file_picker)
+    open_project_directory(true)
   end,
 
   ["core:open-project-folder-picker"] = function()
@@ -297,21 +320,24 @@ command.add(nil, {
   end,
 
   ["core:remove-directory"] = function()
+    if #core.projects <= 1 then
+      core.error("No directory to be removed")
+      return
+    end
     local dir_list = {}
-    local n = #core.projects
-    for i = n, 2, -1 do
-      dir_list[n - i + 1] = core.projects[i].name
+    for i = 1, #core.projects do
+      dir_list[i] = core.projects[i].path
     end
     core.command_view:enter("Remove Directory", {
       submit = function(text, item)
-        text = common.home_expand(item and item.text or text)
+        text = common.normalize_volume(common.normalize_path(common.home_expand(item and item.text or text)))
         if not core.remove_project(text) then
           core.error("No directory %q to be removed", text)
         end
       end,
       suggest = function(text)
         text = common.home_expand(text)
-        return common.home_encode_list(common.dir_list_suggest(text, dir_list))
+        return common.dir_list_suggest(text, dir_list)
       end
     })
   end,

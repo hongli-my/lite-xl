@@ -718,9 +718,19 @@ local toolbar_view = nil
 
 local old_remove_project = core.remove_project
 function core.remove_project(project, force)
-  local project = old_remove_project(project, force)
-  view.cache = {}
-  view.watches[project] = nil
+  local removed = old_remove_project(project, force)
+  if removed then
+    view.cache = {}
+    view.watches[removed] = nil
+    view.expanded[removed.path] = nil
+    if view.selected_item and view.selected_item.project == removed then
+      view.selected_item = nil
+    end
+    if view.hovered_item and view.hovered_item.project == removed then
+      view.hovered_item = nil
+    end
+  end
+  return removed
 end
 
 core.add_thread(function()
@@ -742,10 +752,6 @@ end
 
 local function is_project_folder(item)
   return item.abs_filename == item.project.path
-end
-
-local function is_primary_project_folder(path)
-  return core.root_project().path == path
 end
 
 
@@ -1030,14 +1036,20 @@ command.add(
   end
 })
 
+-- Any directory root in the sidebar can be removed (including the primary
+-- one, as long as another directory remains). This only detaches the
+-- directory from the treeview, it never deletes anything on disk.
 command.add(function()
     local item = treeitem()
-    return item
-      and not is_primary_project_folder(item.abs_filename)
-      and is_project_folder(item), item
+    return item and is_project_folder(item) and #core.projects > 1, item
   end, {
   ["treeview:remove-project-directory"] = function(item)
-    core.remove_project(item.project)
+    local removed = core.remove_project(item.project)
+    if not removed then
+      core.error("Cannot remove directory %q", item.abs_filename)
+    else
+      core.log("Removed directory %s", common.home_encode(removed.path))
+    end
   end,
 })
 
