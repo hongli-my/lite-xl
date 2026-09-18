@@ -70,6 +70,7 @@ static const char *const get_ft_error(FT_Error err) {
 typedef enum {
   EGlyphFormatGrayscale, // 8bit graysclae
   EGlyphFormatSubpixel,  // 24bit subpixel
+  EGlyphFormatColor,     // 32bit BGRA color (e.g. Apple Color Emoji sbix)
   EGlyphFormatSize
 } ERenGlyphFormat;
 
@@ -161,7 +162,9 @@ static int font_set_load_options(RenFont* font) {
   int load_target = font->antialiasing == FONT_ANTIALIASING_NONE ? FT_LOAD_TARGET_MONO
     : (font->hinting == FONT_HINTING_SLIGHT ? FT_LOAD_TARGET_LIGHT : FT_LOAD_TARGET_NORMAL);
   int hinting = font->hinting == FONT_HINTING_NONE ? FT_LOAD_NO_HINTING : FT_LOAD_FORCE_AUTOHINT;
-  return load_target | hinting;
+  // FT_LOAD_COLOR: load color bitmap glyphs (Apple Color Emoji sbix / CBDT / COLR).
+  // FreeType ignores this flag for fonts without color glyphs, so it's safe globally.
+  return load_target | hinting | FT_LOAD_COLOR;
 }
 
 static int font_set_render_options(RenFont* font) {
@@ -214,12 +217,13 @@ static unsigned int font_get_glyph_id(RenFont *font, unsigned int codepoint) {
 
 #define FONT_IS_SUBPIXEL(F) ((F)->antialiasing == FONT_ANTIALIASING_SUBPIXEL)
 #define FONT_BITMAP_COUNT(F) ((F)->antialiasing == FONT_ANTIALIASING_SUBPIXEL ? SUBPIXEL_BITMAPS_CACHED : 1)
-#define SLOT_BITMAP_TYPE(B) ((B).pixel_mode == FT_PIXEL_MODE_LCD ? EGlyphFormatSubpixel : EGlyphFormatGrayscale)
+#define SLOT_BITMAP_TYPE(B) ((B).pixel_mode == FT_PIXEL_MODE_LCD ? EGlyphFormatSubpixel : (B).pixel_mode == FT_PIXEL_MODE_BGRA ? EGlyphFormatColor : EGlyphFormatGrayscale)
 
 static inline SDL_PixelFormat glyphformat_to_pixelformat(ERenGlyphFormat format, int *depth) {
   switch (format) {
     case EGlyphFormatSubpixel:  *depth = 24; return SDL_PIXELFORMAT_RGB24;
     case EGlyphFormatGrayscale: *depth = 8;  return SDL_PIXELFORMAT_INDEX8;
+    case EGlyphFormatColor:     *depth = 32; return SDL_PIXELFORMAT_BGRA32;
     default: return SDL_PIXELFORMAT_UNKNOWN;
   }
 }
@@ -273,7 +277,7 @@ static SDL_Surface *font_allocate_glyph_surface(RenFont *font, FT_GlyphSlot slot
     userdata = SDL_GetSurfaceProperties(atlas->surfaces[atlas->nsurface]);
     SDL_SetPointerProperty(userdata, "metric", NULL);
     surface_idx = atlas->nsurface++;
-    font->glyphs.bytesize += (sizeof(SDL_Surface *) + sizeof(SDL_Surface) + atlas->width * GLYPHS_PER_ATLAS * h * glyph_format);
+    font->glyphs.bytesize += (sizeof(SDL_Surface *) + sizeof(SDL_Surface) + atlas->width * GLYPHS_PER_ATLAS * h * depth);
   }
   metric->surface_idx = surface_idx;
   userdata = SDL_GetSurfaceProperties(atlas->surfaces[surface_idx]);
@@ -295,7 +299,8 @@ static GlyphMetric *font_load_glyph_metric(RenFont *font, unsigned int glyph_id,
     // load the font without hinting to fix an issue with monospaced fonts,
     // because freetype doesn't report the correct LSB and RSB delta. Transformation & subpixel positioning don't affect
     // the xadvance, so we can save some time by not doing this step multiple times
-    if (FT_Load_Glyph(font->face, glyph_id, (load_option | FT_LOAD_BITMAP_METRICS_ONLY | FT_LOAD_NO_HINTING) & ~FT_LOAD_FORCE_AUTOHINT) != 0)
+    FT_Error gerr = FT_Load_Glyph(font->face, glyph_id, (load_option | FT_LOAD_BITMAP_METRICS_ONLY | FT_LOAD_NO_HINTING) & ~FT_LOAD_FORCE_AUTOHINT);
+    if (gerr != 0)
       return NULL;
     for (int i = 0; i < bitmaps; i++) {
       // save the metrics for all subpixel indexes
@@ -315,25 +320,46 @@ static SDL_Surface *font_load_glyph_bitmap(RenFont *font, unsigned int glyph_id,
   GlyphMetric *metric = font_load_glyph_metric(font, glyph_id, bitmap_idx);
   if (!metric) return NULL;
   if (metric->flags & EGlyphBitmap) return font->glyphs.atlas[metric->format][metric->atlas_idx].surfaces[metric->surface_idx];
-
   // render the glyph for a bitmap_idx
   unsigned int load_option = font_set_load_options(font), render_option = font_set_render_options(font);
   FT_GlyphSlot slot = font->face->glyph;
-  if (FT_Load_Glyph(font->face, glyph_id, load_option | FT_LOAD_BITMAP_METRICS_ONLY) != 0
-      || font_set_style(&slot->outline, bitmap_idx * (64 / SUBPIXEL_BITMAPS_CACHED), font->style) != 0
-      || FT_Render_Glyph(slot, render_option) != 0)
+  // FT_LOAD_BITMAP_METRICS_ONLY only fetches metrics, not the bitmap buffer.
+  // For bitmap fonts (e.g. Apple Color Emoji sbix) this leaves slot->bitmap.buffer NULL
+  // even though pixel_mode/width/rows are set, and FT_Render_Glyph won't fill it
+  // (the glyph is already a bitmap). So for color bitmap glyphs we load with FT_LOAD_COLOR
+  // (already in load_option) without BITMAP_METRICS_ONLY, which loads the bitmap data directly,
+  // and skip FT_Render_Glyph.
+  FT_Error e1 = FT_Load_Glyph(font->face, glyph_id, load_option | FT_LOAD_BITMAP_METRICS_ONLY);
+  FT_Error e3 = (e1 == 0) ? font_set_style(&slot->outline, bitmap_idx * (64 / SUBPIXEL_BITMAPS_CACHED), font->style) : 0;
+  FT_Error e2 = 0;
+  if (e1 == 0 && e3 == 0 && slot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA && !slot->bitmap.buffer) {
+    // color bitmap glyph: reload with full bitmap data (no BITMAP_METRICS_ONLY), no render needed
+    e1 = FT_Load_Glyph(font->face, glyph_id, load_option);
+  } else if (e1 == 0 && e3 == 0) {
+    e2 = FT_Render_Glyph(slot, render_option);
+  }
+  if (e1 != 0 || e3 != 0 || e2 != 0)
     return NULL;
 
   // if this bitmap is empty, or has a format we don't support, just store the xadvance
   if (!slot->bitmap.width || !slot->bitmap.rows || !slot->bitmap.buffer ||
       (slot->bitmap.pixel_mode != FT_PIXEL_MODE_MONO
         && slot->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY
-        && slot->bitmap.pixel_mode != FT_PIXEL_MODE_LCD))
+        && slot->bitmap.pixel_mode != FT_PIXEL_MODE_LCD
+        && slot->bitmap.pixel_mode != FT_PIXEL_MODE_BGRA))
     return NULL;
 
-  unsigned int glyph_width = slot->bitmap.width / FONT_BITMAP_COUNT(font);
+  // For LCD subpixel, FreeType returns bitmap.width as 3x the pixel width (RGB channels laid out
+  // horizontally), so we divide by FONT_BITMAP_COUNT(=3). But BGRA color bitmaps (Apple Color
+  // Emoji sbix) are 1 pixel = 4 bytes with width already in pixels — must NOT divide.
+  unsigned int glyph_width = (slot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA)
+    ? slot->bitmap.width
+    : slot->bitmap.width / FONT_BITMAP_COUNT(font);
   // FT_PIXEL_MODE_MONO uses 1 bit per pixel packed bitmap
   if (slot->bitmap.pixel_mode == FT_PIXEL_MODE_MONO) glyph_width *= 8;
+  // BGRA uses 4 bytes/pixel; memcpy below copies glyph_width * bytes_per_pixel bytes.
+  // For grayscale/LCD glyph_width already equals byte count (1 byte/px after FONT_BITMAP_COUNT division).
+  int bytes_per_pixel = (slot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA) ? 4 : 1;
 
   metric->x1 = glyph_width;
   metric->y1 = slot->bitmap.rows;
@@ -355,7 +381,7 @@ static SDL_Surface *font_load_glyph_bitmap(RenFont *font, unsigned int glyph_id,
         pixels[++target_offset] = ((source_pixel >> (7 - (column % 8))) & 0x1) * 0xFF;
       }
     } else {
-      memcpy(&pixels[target_offset], &slot->bitmap.buffer[source_offset], slot->bitmap.width);
+      memcpy(&pixels[target_offset], &slot->bitmap.buffer[source_offset], slot->bitmap.width * bytes_per_pixel);
     }
   }
   return surface;
@@ -385,7 +411,8 @@ static RenFont *font_group_get_glyph(RenFont **fonts, unsigned int codepoint, in
   if ((!m || !m->flags) && codepoint != 0x25A1 && !is_whitespace(codepoint))
     return font_group_get_glyph(fonts, 0x25A1, subpixel_idx, surface, metric);
   if (metric && m) *metric = m;
-  if (surface && m) *surface = font_load_glyph_bitmap(font, glyph_id, subpixel_idx);
+  if (surface && m)
+    *surface = font_load_glyph_bitmap(font, glyph_id, subpixel_idx);
   return font;
 }
 
@@ -437,8 +464,25 @@ static int font_set_face_metrics(RenFont *font, FT_Face face) {
   #ifdef LITE_USE_SDL_RENDERER
   pixel_size *= font->scale;
   #endif
-  if ((err = FT_Set_Pixel_Sizes(face, 0, (int) pixel_size)) != 0)
+  // FT_Set_Pixel_Sizes fails for bitmap-only fonts (e.g. Apple Color Emoji) when the
+  // requested size doesn't match a strike. Even when it returns success for sbix/CBDT
+  // fonts, FT_Load_Glyph(FT_LOAD_COLOR) may pick the wrong strike later. So for
+  // non-scalable (bitmap) fonts, always use FT_Select_Size with the closest strike.
+  // FT_Bitmap_Size fields are in 26.6 fixed point (1/64 px); x_ppem is the actual pixel
+  // size, which is what FT_Load_Glyph uses to pick the sbix strike (NOT .height).
+  err = FT_Set_Pixel_Sizes(face, 0, (int) pixel_size);
+  if (!FT_IS_SCALABLE(face) && face->num_fixed_sizes > 0) {
+    long target_ppem = (long)(pixel_size * 64);
+    int best_idx = 0;
+    long best_diff = labs((long)face->available_sizes[0].x_ppem - target_ppem);
+    for (int i = 1; i < face->num_fixed_sizes; i++) {
+      long diff = labs((long)face->available_sizes[i].x_ppem - target_ppem);
+      if (diff < best_diff) { best_diff = diff; best_idx = i; }
+    }
+    err = FT_Select_Size(face, best_idx);
+  } else if (err != 0) {
     return err;
+  }
 
   font->face = face;
   if(FT_IS_SCALABLE(face)) {
@@ -677,7 +721,19 @@ double ren_draw_text(RenSurface *rs, RenFont **fonts, const char *text, size_t l
             (destination_color & surface_format->Amask) >> surface_format->Ashift};
           SDL_Color src;
 
-          if (metric->format == EGlyphFormatSubpixel) {
+          if (metric->format == EGlyphFormatColor) {
+            // Color bitmap glyph (Apple Color Emoji sbix): BGRA, 4 bytes/px.
+            // Use the glyph's own color, only blend by its alpha — do NOT tint with foreground color.
+            src.b = *(source_pixel++);
+            src.g = *(source_pixel++);
+            src.r = *(source_pixel++);
+            src.a = *(source_pixel++);
+            // src over dst, using src.a
+            int ia = 0xFF - src.a;
+            r = (src.r * src.a + dst.r * ia) / 0xFF;
+            g = (src.g * src.a + dst.g * ia) / 0xFF;
+            b = (src.b * src.a + dst.b * ia) / 0xFF;
+          } else if (metric->format == EGlyphFormatSubpixel) {
             src.r = *(source_pixel++);
             src.g = *(source_pixel++);
           } else {
@@ -685,12 +741,14 @@ double ren_draw_text(RenSurface *rs, RenFont **fonts, const char *text, size_t l
             src.g = *(source_pixel);
           }
 
-          src.b = *(source_pixel++);
-          src.a = 0xFF;
+          if (metric->format != EGlyphFormatColor) {
+            src.b = *(source_pixel++);
+            src.a = 0xFF;
 
-          r = (color.r * src.r * color.a + dst.r * (65025 - src.r * color.a) + 32767) / 65025;
-          g = (color.g * src.g * color.a + dst.g * (65025 - src.g * color.a) + 32767) / 65025;
-          b = (color.b * src.b * color.a + dst.b * (65025 - src.b * color.a) + 32767) / 65025;
+            r = (color.r * src.r * color.a + dst.r * (65025 - src.r * color.a) + 32767) / 65025;
+            g = (color.g * src.g * color.a + dst.g * (65025 - src.g * color.a) + 32767) / 65025;
+            b = (color.b * src.b * color.a + dst.b * (65025 - src.b * color.a) + 32767) / 65025;
+          }
           // the standard way of doing this would be SDL_GetRGBA, but that introduces a performance regression. needs to be investigated
           *destination_pixel++ = (unsigned int) dst.a << surface_format->Ashift | r << surface_format->Rshift | g << surface_format->Gshift | b << surface_format->Bshift;
         }
