@@ -63,7 +63,7 @@ lite_cargs += '-DLITE_ARCH_TUPLE="@0@"'.format(arch_tuple)
 #===============================================================================
 lite_link_args = []
 if host_machine.system() == 'darwin'
-    lite_link_args += ['-framework', 'CoreServices', '-framework', 'Foundation']
+    lite_link_args += ['-framework', 'CoreServices', '-framework', 'Foundation', '-framework', 'AppKit']
 endif
 #===============================================================================
 # Install Configuration
