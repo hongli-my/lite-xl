@@ -4,7 +4,13 @@ project('lite-xl',
     license : 'MIT',
     meson_version : '>= 0.63',
     default_options : [
-        'c_std=gnu11'
+        'c_std=gnu11',
+        # Asserts must not fire in shipped builds: without NDEBUG the
+        # renderer/utf8 assertions abort the whole editor on an internal
+        # inconsistency.  'if-release' keeps them for debug/plain builds.
+        'b_ndebug=if-release',
+        # strip installed binaries (packages are built with `meson install`)
+        'strip=true'
     ]
 )
 
