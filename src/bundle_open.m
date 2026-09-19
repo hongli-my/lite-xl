@@ -2,39 +2,54 @@
 #import <AppKit/AppKit.h>
 #import <SDL3/SDL.h>
 #include <lua.h>
-#include <lauxlib.h>
-#include <stdio.h>
+#include "custom_events.h"
 
 #ifdef MACOS_USE_BUNDLE
 
 /* 前向声明 */
 @class MenuActionTarget;
 
-/* 保存 lua_State，菜单点击时用它执行 lite-xl 命令 */
-static lua_State *g_lua_state = NULL;
 static MenuActionTarget *g_menu_target = nil;
 static bool g_menu_installed = false;
 
-/* 在主线程安全地执行 lite-xl 命令 */
-static void run_lite_command(const char *cmd) {
-  if (!g_lua_state || !cmd) return;
-  NSString *ns_cmd = [NSString stringWithUTF8String:cmd];
-  dispatch_async(dispatch_get_main_queue(), ^{
-    if (!g_lua_state) return;
-    NSString *escaped = [ns_cmd stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
-    NSString *lua = [NSString stringWithFormat:
-      @"pcall(function() require('core.command').perform('%@') end)", escaped];
-    luaL_dostring(g_lua_state, [lua UTF8String]);
-    lua_pop(g_lua_state, lua_gettop(g_lua_state));
-  });
+/* 菜单命令事件：菜单点击只把命令投递到编辑器自己的事件队列，
+ * 由 core.on_event 在正常的一帧里执行。
+ * 不要在这里直接调 luaL_dostring：AppKit 的动作是在 SDL 抽事件
+ * （也就是 Lua 正停在某个 C 调用里）的时候被触发的，那时再进
+ * 解释器属于重入，lua_pop(L, lua_gettop(L)) 还会把调用方的栈
+ * 一起清掉。 */
+static const char *MENU_COMMAND_EVENT = "menucmd";
+static char *g_pending_command = NULL;
+
+/* 由事件循环调用：把待执行的命令交给 Lua */
+static int menu_command_callback(lua_State *L, SDL_Event *event) {
+  if (g_pending_command == NULL) return 0;
+  lua_pushstring(L, MENU_COMMAND_EVENT);
+  lua_pushstring(L, g_pending_command);
+  SDL_free(g_pending_command);
+  g_pending_command = NULL;
+  return 2;
+}
+
+static void push_menu_command(NSString *cmd) {
+  if (cmd == nil) return;
+  char *dup = SDL_strdup([cmd UTF8String]);
+  if (dup == NULL) return;
+  /* 后点的菜单项覆盖前一个尚未处理的 */
+  SDL_free(g_pending_command);
+  g_pending_command = dup;
+  CustomEvent event = {0};
+  if (!push_custom_event(MENU_COMMAND_EVENT, &event)) {
+    SDL_free(g_pending_command);
+    g_pending_command = NULL;
+  }
 }
 
 @interface MenuActionTarget : NSObject
 @end
 @implementation MenuActionTarget
 - (void)menuClicked:(NSMenuItem *)sender {
-  NSString *cmd = [sender representedObject];
-  if (cmd) run_lite_command([cmd UTF8String]);
+  push_menu_command([sender representedObject]);
 }
 @end
 
@@ -47,13 +62,18 @@ static void add_menu_item(NSMenu *menu, NSString *title, NSString *cmd, NSString
 }
 
 static void install_main_menu(void) {
+  /* The key equivalents below intentionally repeat bindings that already exist
+   * in data/core/keymap-macos.lua: out of a bundle there is no native menu, so
+   * the keymap is the only way to reach those commands.  When the bundle is
+   * present AppKit handles the key equivalent before SDL sees the event, so the
+   * command runs once.  Keep both in sync. */
   NSMenu *main_menu = [[NSMenu alloc] init];
 
   {
     NSMenuItem *g = [main_menu addItemWithTitle:@"文件" action:NULL keyEquivalent:@""];
     NSMenu *m = [[NSMenu alloc] initWithTitle:@"文件"];
     [g setSubmenu:m];
-    add_menu_item(m, @"新建文件",   @"doc:new-file",           @"n");
+    add_menu_item(m, @"新建文件",   @"core:new-doc",          @"n");
     add_menu_item(m, @"打开文件…",  @"core:open-file",         @"o");
     add_menu_item(m, @"打开目录…",  @"core:open-project-folder",@"O");
     add_menu_item(m, @"保存",       @"doc:save",               @"s");
@@ -97,8 +117,6 @@ static void install_main_menu(void) {
   }
 
   [NSApp setMainMenu:main_menu];
-  fprintf(stderr, "[menu] install_main_menu done, NSApp=%p mainMenu=%p\n",
-          (void*)NSApp, (void*)[NSApp mainMenu]); fflush(stderr);
 }
 
 /* SDL 事件观察器：等窗口首次显示后（SDL 已完成 NSApp 初始化）再设菜单。
@@ -110,8 +128,9 @@ static bool SDLCALL menu_event_watch(void *userdata, SDL_Event *event) {
     dispatch_async(dispatch_get_main_queue(), ^{
       install_main_menu();
       [NSApp activateIgnoringOtherApps:YES];
+      /* 不在观察器回调里改观察器列表，放到主队列里摘 */
+      SDL_RemoveEventWatch(menu_event_watch, NULL);
     });
-    SDL_RemoveEventWatch(menu_event_watch, NULL);
   }
   return SDL_APP_CONTINUE;
 }
@@ -123,13 +142,20 @@ void set_macos_bundle_resources(lua_State *L)
     lua_pushstring(L, [resource_path UTF8String]);
     lua_setglobal(L, "MACOS_RESOURCES");
 
-    g_lua_state = L;
-    g_menu_target = [[MenuActionTarget alloc] init];
-
-    /* 不提前创建 NSApp——让 SDL3 自己创建并管理生命周期。
-     * 挂事件观察器，等 SDL 创建窗口后再设菜单。 */
-    SDL_AddEventWatch(menu_event_watch, NULL);
-    fprintf(stderr, "[menu] event watch added\n"); fflush(stderr);
+    /* 菜单项对 target 是弱引用，而 Lite XL 可以原地重启 Lua 状态
+     * （autorestart 保存 init.lua 就会触发），所以 target 只创建一次、
+     * 与进程同生命周期，重启后老菜单项不会指到已经被释放的对象上。 */
+    if (g_menu_target == nil) {
+      g_menu_target = [[MenuActionTarget alloc] init];
+      register_custom_event(MENU_COMMAND_EVENT, menu_command_callback);
+      /* 不提前创建 NSApp——让 SDL3 自己创建并管理生命周期。
+       * 挂事件观察器，等 SDL 创建窗口后再设菜单。 */
+      SDL_AddEventWatch(menu_event_watch, NULL);
+    } else if (g_menu_installed) {
+      /* 原地重启：窗口已经存在，不会再有 EXPOSED 事件，直接同步重装菜单
+       * （此时 SDL 的启动流程已经结束，不会再被覆盖）。 */
+      install_main_menu();
+    }
 }}
 #endif
 

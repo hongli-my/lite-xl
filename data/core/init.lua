@@ -934,6 +934,14 @@ function core.on_event(type, ...)
       core.active_file_dialogs[id] = nil
       callback(status, result)
     end
+  elseif type == "menucmd" then
+    -- Command triggered by the native menu bar (macOS). bundle_open.m pushes
+    -- it through the event queue instead of calling into Lua from AppKit, so
+    -- it is performed here, at a safe point of the frame.
+    local cmd = ...
+    if cmd and cmd ~= "" then
+      command.perform(cmd)
+    end
   elseif type == "focuslost" then
     core.root_view:on_focus_lost(...)
   elseif type == "quit" then
