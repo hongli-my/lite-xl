@@ -3,6 +3,9 @@ require "core.regex"
 local common = require "core.common"
 local config = require "core.config"
 local style = require "colors.default"
+-- Fork defaults (theme, fonts, a few config values).  They live in their own
+-- file so that merging upstream only ever conflicts on this one line.
+require "core.fork_defaults"
 local command
 local keymap
 local dirwatch
@@ -182,6 +185,24 @@ local style = require "core.style"
 
 -- disable plugin detectindent, otherwise it is enabled by default:
 -- config.plugins.detectindent = false
+
+---------------------------- Fork defaults -------------------------------------
+
+-- These are set by the fork (data/core/fork_defaults.lua and
+-- data/colors/slate.lua) and only listed here so you know what to override:
+--
+-- theme: Monokai with a light sidebar
+--   core.reload_module("colors.default")   -- back to the upstream colours
+--   core.reload_module("colors.monokai")   -- another scheme
+--
+-- fonts: the UI and code fonts are groups of (bundled font + Apple Color Emoji
+-- on macOS + a system CJK font), style.nerd_font is the file icon font used by
+-- the treeview.  To replace them, e.g.:
+--   style.code_font = renderer.font.load(DATADIR .. "/fonts/JetBrainsMono-Regular.ttf", 15 * SCALE)
+--
+-- config.scroll_past_end = false
+--
+-- alt+w and cmd+w close the current tab, cmd+q quits
 
 ---------------------------- Miscellaneous -------------------------------------
 
