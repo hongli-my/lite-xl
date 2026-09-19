@@ -23,7 +23,8 @@ local ime = require "core.ime"
 config.plugins.aichat = common.merge({
   system_prompt = "You are a helpful assistant. Answer concisely and clearly.",
   panel_size = 380 * SCALE,
-  visible = true,
+  -- collapsed by default: the panel is one click away on the floating button
+  visible = false,
   -- backend: "pibridge" | "mock" | "openai"
   backend = "pibridge",
   -- pi-bridge endpoint (slate piweb-bridge)
@@ -623,44 +624,71 @@ function AIView:update()
   if self.ime_status then self:update_ime_location() end
 end
 
+-- Wrapped render lines of a single message.
+-- Assistant messages go through the markdown layout, everything else is
+-- plain wrapped text rendered as single-segment lines.
+local function message_rlines(msg, font, lh, text_w)
+  if msg.role == "assistant" then
+    return layout_md(msg.content, text_w)
+  end
+  local lines = wrap_text(msg.content, font, text_w)
+  local rlines = {}
+  for _, line in ipairs(lines) do
+    rlines[#rlines + 1] = {
+      segments = { { text = line, font = font, color = style.text } },
+      h = lh, is_code_block = false, is_header = false,
+      indent = 0, bg = nil, is_quote = false,
+    }
+  end
+  return rlines
+end
+
+
 function AIView:layout_messages()
   local msg_x, msg_y, msg_w, msg_h = self:message_area()
   local text_w = msg_w - style.padding.x * 2
   if text_w <= 0 then return end
   if self._layout_key == text_w and not self._dirty then return end
+  -- While a reply streams in, _dirty is set for every token.  Re-wrapping the
+  -- whole conversation every time made long chats quadratic, so the wrapped
+  -- lines of each message are cached and only the changed ones are rebuilt.
+  local cache = self._layout_cache
+  if cache == nil or self._layout_key ~= text_w then
+    cache = {}
+    self._layout_cache = cache
+  end
   self._layout_key = text_w
   self._dirty = false
-  self._wrapped = {}
+
+  local wrapped = {}
   local y = 0
   local font = ai_font
   local lh = font:get_height()
   local role_h = lh + style.padding.y * 0.5
   for i, msg in ipairs(self.messages) do
+    local entry = cache[i]
     local rlines
-    if msg.role == "assistant" then
-      rlines = layout_md(msg.content, text_w)
+    if entry and entry.content == msg.content and entry.role == msg.role then
+      rlines = entry.rlines
     else
-      -- Non-assistant: plain text wrapped into single-segment render lines.
-      local lines = wrap_text(msg.content, font, text_w)
-      rlines = {}
-      for _, line in ipairs(lines) do
-        rlines[#rlines + 1] = {
-          segments = { { text = line, font = font, color = style.text } },
-          h = lh, is_code_block = false, is_header = false,
-          indent = 0, bg = nil, is_quote = false,
-        }
-      end
+      rlines = message_rlines(msg, font, lh, text_w)
+      cache[i] = { content = msg.content, role = msg.role, rlines = rlines }
     end
     local content_h = 0
     for _, rl in ipairs(rlines) do content_h = content_h + rl.h end
     local block_h = role_h + content_h + style.padding.y
-    self._wrapped[i] = {
+    wrapped[i] = {
       role = msg.role, rlines = rlines, y = y, h = block_h,
       is_empty = not msg.content:match("%S"),
     }
     y = y + block_h
   end
+  self._wrapped = wrapped
   self.content_height = y
+  -- forget the cached layouts of messages that are gone
+  if #self.messages < #cache then
+    for i = #self.messages + 1, #cache do cache[i] = nil end
+  end
 end
 
 function AIView:scroll_to_bottom()
@@ -1008,6 +1036,7 @@ end
 
 function AIView:clear()
   self.messages = {}
+  self._layout_cache = nil
   self.input = ""
   self.caret = 1
   self._dirty = true
@@ -1124,13 +1153,6 @@ end
 
 -- Create (and cache) a pi-bridge session for the current working directory.
 -- Returns session_id or nil, errmsg.
---
--- Workaround for process.stream:read EOF bug (process.lua:41-94):
--- The C g_read returns "" for BOTH EOF (read==0) and EAGAIN (read==-1).
--- read("all") loops until target (1TB) is reached; on EOF it yields forever
--- → timeout error → data in stream.buf is lost.  Fix: wait for process exit
--- via proc:wait(), then read with a short timeout and recover buffered data
--- from the stream's internal buf/len fields (preserved across the error).
 function AIView:_ensure_session()
   local cfg = config.plugins.aichat
   local working_dir = core.project_dir or os.getenv("HOME") or "."
@@ -1148,18 +1170,10 @@ function AIView:_ensure_session()
   end
   -- Wait for curl to finish (yields in coroutine; curl -m 10 ≤ 12s wait).
   proc:wait(12)
-  -- Read all output. read("all") will hit EOF and throw a timeout error,
-  -- but all data is preserved in the stream's internal buffer.
-  local out
-  pcall(function() out = proc.stdout:read("all", { timeout = 1 }) end)
-  if not out or out == "" then
-    -- Recover data from stream internals (set by g_read, not returned due to
-    -- the timeout error thrown at EOF).
-    local stream = proc.stdout
-    if stream and stream.len and stream.len > 0 then
-      out = table.concat(stream.buf)
-    end
-  end
+  -- read("all") returns as soon as the child exited: EOF is reported as nil
+  -- instead of an empty string, so there is nothing to recover here.
+  local pok, out = pcall(proc.stdout.read, proc.stdout, "all", { timeout = 2 })
+  if not pok then out = nil end
   if not out or out == "" then
     return nil, "无法连接 AI 引擎 (" .. cfg.api_base .. ")，请确认 pi-bridge 已启动"
   end
@@ -1261,13 +1275,8 @@ function AIView:_send_pibridge(assistant_idx, user_text)
 
     -- 3. parse SSE stream line by line.
     --    A frame is: one or more "data: ..." lines followed by a blank line.
-    --
-    --    Workaround for process.stream:read EOF bug: read("line") returns
-    --    complete lines immediately from the internal buffer.  But on EOF
-    --    (no more data) it yields forever → timeout error.  We catch the
-    --    error with pcall and use proc:returncode() to distinguish EOF
-    --    (process exited) from EAGAIN (still running, no data yet).
-    --    On EOF, remaining buffered data is recovered from stream internals.
+    --    read("line") yields until a line is available, returns nil once the
+    --    process exited and the stream is drained, and raises on timeout.
     local data_buf = ""
     local function handle_line(raw)
       local line = raw:gsub("\r\n", "\n"):gsub("[\r\n]", "")
@@ -1289,27 +1298,14 @@ function AIView:_send_pibridge(assistant_idx, user_text)
       local pok = pcall(function()
         line = proc.stdout:read("line", { timeout = 2 })
       end)
-      if pok and line then
-        handle_line(line)
-      elseif not pok then
-        -- timeout: EOF (process exited) or EAGAIN (still running)
-        local rc = proc:returncode()
-        if rc ~= nil then
-          -- process exited = EOF.  Drain any remaining buffered data.
-          local stream = proc.stdout
-          if stream and stream.len and stream.len > 0 then
-            local remaining = table.concat(stream.buf)
-            stream.buf = {}; stream.len = 0
-            for l in (remaining .. "\n"):gmatch("([^\r\n]*)\r?\n") do
-              handle_line(l)
-            end
-          end
-          break
-        end
-        -- else: still running, no data yet — continue loop
+      if not pok then
+        -- timeout: the server sent nothing for 2s.  Keep waiting while curl
+        -- is still alive, stop once it exited (the stream is over).
+        if proc:returncode() ~= nil then break end
+      elseif line == nil then
+        break -- end of stream
       else
-        -- pok=true, line=nil: shouldn't happen in coroutine, but break safely
-        break
+        handle_line(line)
       end
       coroutine.yield()
     end
