@@ -15,6 +15,7 @@ local core = require "core"
 local common = require "core.common"
 local config = require "core.config"
 local style = require "core.style"
+local keymap = require "core.keymap"
 local View = require "core.view"
 local RootView = require "core.rootview"
 
@@ -412,6 +413,27 @@ function RootView:on_mouse_wheel(...)
   local dialog = core.dialog_view
   if dialog and dialog.visible then return true end
   return old_root_mouse_wheel(self, ...)
+end
+
+
+-- The dialog is modal for the keyboard too. The old nag bar was a locked node
+-- in the tree, so `root:close`'s predicate (which checks the active node's
+-- locked size) failed while it was shown, naturally swallowing key repeat.
+-- The dialog is not in the node tree, so without this a held cmd+w would
+-- close one tab per key-repeat, because every stroke still reaches
+-- `root:close`. Only the navigation keys (bound to dialog:* commands) are
+-- forwarded; everything else is swallowed.
+local old_on_key_pressed = keymap.on_key_pressed
+keymap.on_key_pressed = function(key, ...)
+  local dialog = core.dialog_view
+  if dialog and dialog.visible then
+    local nav = key == "escape" or key == "return" or key == "keypad enter"
+             or key == "left" or key == "right"
+    if not nav then
+      return true
+    end
+  end
+  return old_on_key_pressed(key, ...)
 end
 
 

@@ -9,11 +9,26 @@ local Node = require "core.node"
 
 local t = {
   ["root:close"] = function(node)
+    -- macOS sends several keypressed events for a single physical cmd+w
+    -- (key repeat, ~20-50ms apart), and every one of them fires this
+    -- command, closing one tab per repeat. Debounce: ignore a close that
+    -- happens within 300ms of the previous one. A deliberate rapid double
+    -- press is slower than that, so it is not affected.
+    local now = system.get_time()
+    if core._last_root_close and now - core._last_root_close < 0.3 then
+      return
+    end
+    core._last_root_close = now
     node:close_active_view(core.root_view.root_node)
   end,
 
   ["root:close-or-quit"] = function(node)
+    local now = system.get_time()
+    if core._last_root_close and now - core._last_root_close < 0.3 then
+      return
+    end
     if node and (not node:is_empty() or not node.is_primary_node) then
+      core._last_root_close = now
       node:close_active_view(core.root_view.root_node)
     else
       core.quit()
@@ -97,6 +112,13 @@ for _, dir in ipairs { "left", "right", "up", "down" } do
 end
 
 command.add(function()
+  -- the modal dialog is not in the node tree, so unlike the old nag bar
+  -- (a locked node) it does not make get_locked_size() return a value.
+  -- Without this check, a held cmd+w keeps firing root:close while the
+  -- "unsaved changes" dialog is up, closing one tab per key-repeat.
+  if core.dialog_view and core.dialog_view.visible then
+    return false
+  end
   local node = core.root_view:get_active_node()
   local sx, sy = node:get_locked_size()
   return not sx and not sy, node
