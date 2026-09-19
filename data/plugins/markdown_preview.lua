@@ -12,10 +12,16 @@ local DocView = require "core.docview"
 local common = require "core.common"
 local Doc = require "core.doc"
 
-config.plugins.markdown_preview = {
+config.plugins.markdown_preview = common.merge({
   preview_width_ratio = 0.45,
   line_number_width = 48,
-}
+  -- Images are decoded to raw RGBA and kept in memory until they are dropped
+  -- from the cache, so how many of them are kept and how large a single one
+  -- may be are both bounded.
+  max_cached_images = 32,
+  max_image_pixels = 4096 * 4096,
+  max_image_file_size = 8 * 1024 * 1024,
+}, config.plugins.markdown_preview)
 
 -- ============================================================
 -- MarkdownPreviewView
@@ -34,8 +40,9 @@ function MarkdownPreviewView:new(doc)
   self.hovered_heading = nil
   self.copy_buttons = {}  -- {elem_idx, x, y, w, h} for copy buttons
   self.hovered_copy_btn = nil
-  self.image_cache = {}  -- path -> image object (nil if load failed)
+  self.image_cache = {}  -- path -> image object (false if load failed)
   self.image_sizes = {}  -- path -> {w, h} original pixel size
+  self._needs_refresh = false
   self:refresh()
 end
 
@@ -55,24 +62,66 @@ function MarkdownPreviewView:refresh()
   self:load_images()
 end
 
+-- Re-parsing the document on every keystroke is wasted work: mark the view
+-- dirty instead and refresh once per frame, in update().
+function MarkdownPreviewView:update()
+  View.update(self)
+  if self._needs_refresh then
+    self._needs_refresh = false
+    self:refresh()
+  end
+end
+
+-- Decode one image, honoring the size limits.
+-- Returns the image object plus its size, or nil when it is rejected.
+function MarkdownPreviewView:load_image(path)
+  local cfg = config.plugins.markdown_preview
+  local abs_path = path
+  if not abs_path:match("^/") then
+    local doc_dir = self.doc.abs_filename and self.doc.abs_filename:match("(.*)[/\\]") or "."
+    abs_path = doc_dir .. "/" .. path
+  end
+  -- reject anything too large to decode before touching it
+  local info = system.get_file_info(abs_path)
+  if info and cfg.max_image_file_size and info.size and info.size > cfg.max_image_file_size then
+    return nil
+  end
+  local ok, img = pcall(renderer.image.load, abs_path)
+  if not ok or not img then return nil end
+  local iw, ih = img:get_size()
+  if cfg.max_image_pixels and iw * ih > cfg.max_image_pixels then
+    -- decoded, but too large to keep: let it be collected
+    return nil
+  end
+  return img, { w = iw, h = ih }
+end
+
+-- Keep the images the current document references, at most `max_cached_images`
+-- of them (documents with more images than that keep the first ones). Cached
+-- images that are no longer referenced are released here, which is only safe
+-- outside of the draw pass: the renderer holds raw surface pointers while a
+-- frame is being built.
 function MarkdownPreviewView:load_images()
-  -- Load images that are referenced in elements
+  local cfg = config.plugins.markdown_preview
+  local limit = math.max(1, cfg.max_cached_images or 32)
+  local kept, kept_set = {}, {}
   for _, elem in ipairs(self.elements) do
-    if elem.type == "image" and elem.path and not self.image_cache[elem.path] then
-      -- Resolve relative path
-      local abs_path = elem.path
-      if not abs_path:match("^/") then
-        local doc_dir = self.doc.abs_filename and self.doc.abs_filename:match("(.*)[/\\]") or "."
-        abs_path = doc_dir .. "/" .. elem.path
+    local path = elem.type == "image" and elem.path or nil
+    if path and not kept_set[path] and #kept < limit then
+      kept_set[path] = true
+      kept[#kept + 1] = path
+      if self.image_cache[path] == nil then
+        -- nil: not loaded yet, false: rejected or failed (never retried)
+        local img, size = self:load_image(path)
+        self.image_cache[path] = img or false
+        if img then self.image_sizes[path] = size end
       end
-      local ok, img = pcall(renderer.image.load, abs_path)
-      if ok and img then
-        self.image_cache[elem.path] = img
-        local iw, ih = img:get_size()
-        self.image_sizes[elem.path] = { w = iw, h = ih }
-      else
-        self.image_cache[elem.path] = false -- mark as failed
-      end
+    end
+  end
+  for path in pairs(self.image_cache) do
+    if not kept_set[path] then
+      self.image_cache[path] = nil
+      self.image_sizes[path] = nil
     end
   end
 end
@@ -703,7 +752,9 @@ local orig_doc_on_text_change = Doc.on_text_change
 function Doc:on_text_change(type)
   orig_doc_on_text_change(self, type)
   if preview_view and preview_doc_ref == self then
-    preview_view:refresh()
+    -- Defer the re-parse to the next frame: doing it on every keystroke
+    -- re-parses and re-wraps the whole document for nothing.
+    preview_view._needs_refresh = true
   end
 end
 
