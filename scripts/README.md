@@ -12,6 +12,15 @@ Various scripts and configurations used to configure, build, and package Lite XL
 - **package-appimage.sh**:  [AppImage][2] builder.
 - **package-innosetup.sh**: Creates a 32/64 bit [InnoSetup][3] installer package.
 
+### Deploy
+
+- **deploy-macos.sh**:      Refresh the macOS app bundle from the current source
+                            and copy it to the app you actually launch
+                            (`~/Desktop/LiteXL.app` by default). For Lua-only
+                            changes: no recompilation, but it still runs the
+                            `--destdir` install and `macos-bundle-dylibs.sh`
+                            steps without which the copied app cannot start.
+
 ### Utility
 
 - **common.sh**:                 Common functions used by other scripts.
