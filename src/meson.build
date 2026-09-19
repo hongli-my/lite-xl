@@ -56,8 +56,12 @@ pcre2_dep = dependency('libpcre2-8', fallback: ['pcre2', 'libpcre2_8'],
     default_options: default_fallback_options + ['default_library=static', 'grep=false', 'test=false']
 )
 
+# `png` must stay enabled: the sbix bitmaps of colour emoji fonts (Apple Color
+# Emoji) are PNG compressed, and without PNG support FreeType fails to load
+# every colour glyph, so the font group falls back to the box drawing
+# character and emoji render as tofu boxes.
 freetype_dep = dependency('freetype2', fallback: ['freetype2', 'freetype_dep'],
-    default_options: default_fallback_options + ['default_library=static', 'zlib=disabled', 'bzip2=disabled', 'png=disabled', 'harfbuzz=disabled', 'brotli=disabled']
+    default_options: default_fallback_options + ['default_library=static', 'zlib=disabled', 'bzip2=disabled', 'png=enabled', 'harfbuzz=disabled', 'brotli=disabled']
 )
 
 

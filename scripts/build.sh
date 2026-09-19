@@ -284,8 +284,17 @@ main() {
     rm -fr "${build_dir}/src/data"
   fi
 
+  # png/zlib are pulled in by FreeType when colour emoji support is enabled
+  # (see src/meson.build): they are linked into the binary, not installed.
   meson install -C "${build_dir}" --destdir "$destdir" \
-    --skip-subprojects=freetype2,lua,pcre2 --no-rebuild
+    --skip-subprojects=freetype2,lua,pcre2,libpng,zlib --no-rebuild
+
+  # Make the bundle self contained: non-system libraries that ended up in the
+  # link (libpng, for FreeType's colour emoji bitmaps) are copied into
+  # Contents/Frameworks instead of being expected at their build time path.
+  if [[ $platform == "macos" && -d "${build_dir}/${destdir}" ]]; then
+    "$(dirname "$0")/macos-bundle-dylibs.sh" "${build_dir}/${destdir}" "${build_dir}"
+  fi
 }
 
 main "$@"
