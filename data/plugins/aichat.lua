@@ -291,6 +291,49 @@ end
 -- line is broken: wrapping first split "[the docs](url)", `code` or **bold**
 -- across two lines, and the markers then rendered as literal text.
 -- Returns a list of lines, each a list of { text = ..., seg = <style table> }.
+-- Truncate to a pixel width, appending an ellipsis (UTF-8 aware).
+local function truncate_to_width(text, font, max_w)
+  if font:get_width(text) <= max_w then return text end
+  local ell_w = font:get_width("…")
+  local out, cur = "", 0
+  local p = 1
+  while p <= #text do
+    local nxt = utf8_next(text, p)
+    local ch = text:sub(p, nxt - 1)
+    local cw = font:get_width(ch)
+    if cur + cw + ell_w > max_w then break end
+    out = out .. ch
+    cur = cur + cw
+    p = nxt
+  end
+  return out .. "…"
+end
+
+-- GFM table helpers (a row of | cells, a ---|:--: delimiter row, body rows).
+local function split_table_row(row)
+  local cells = {}
+  local r = row:gsub("^%s*|", ""):gsub("|%s*$", "")
+  for cell in (r .. "|"):gmatch("([^|]*)|") do
+    cells[#cells + 1] = cell:gsub("^%s+", ""):gsub("%s+$", "")
+  end
+  return cells
+end
+
+-- `|---|:--:|` style delimiter row (an <hr> has no pipe, so it is excluded)
+local function is_table_sep(line)
+  return line ~= nil and line:find("|", 1, true) ~= nil
+    and line:match("^%s*|?[%s:%-|]*%-[%s:%-|]*$") ~= nil
+end
+
+local function parse_table_aligns(sep_row)
+  local aligns = {}
+  for _, c in ipairs(split_table_row(sep_row)) do
+    local l, r = c:sub(1, 1) == ":", c:sub(-1) == ":"
+    aligns[#aligns + 1] = (l and r) and "center" or (r and "right" or "left")
+  end
+  return aligns
+end
+
 local function wrap_segments(segs, max_width)
   -- tokenise on whitespace, keeping the trailing space attached to its token;
   -- a token continues into the next segment when it did not end on a space
@@ -395,9 +438,18 @@ local function open_url(url)
   end
 end
 
--- Advance width of a segment, including any inline-chip padding.
+-- Advance width of a segment.  Segments may carry an explicit advance instead
+-- of deriving it from the font: table cells use it so columns line up exactly
+-- even when glyph advances are not uniform (CJK in a monospace font is not a
+-- whole multiple of the space width, so space padding always drifted).
 local function seg_advance(seg)
+  if seg.pad_to then return seg.pad_to end
   return seg.font:get_width(seg.text) + (seg.pad or 0) * 2
+end
+
+-- Left edge of a segment's text (skipping chip padding and cell alignment).
+local function seg_text_x(seg, sx)
+  return sx + (seg.off or 0) + (seg.pad or 0)
 end
 
 -- Vertical bookkeeping shared by layout, hit-testing and drawing.  A render
@@ -579,8 +631,8 @@ local function parse_md_inline(text, base_color, base_font)
 end
 
 -- Layout markdown text into render lines.  Each render line is:
---   { segments, h, sp, mt, mb, is_code_block, is_code_bar, is_header, indent,
---     bg, is_quote }
+--   { segments, h, sp, mt, mb, is_code_block, is_code_bar, is_header,
+--     is_table_rule, table_w, indent, bg, is_quote }
 -- See rline_outer()/rline_text_top() for how the vertical fields add up.
 local function layout_md(text, max_width)
   local rlines = {}
@@ -589,6 +641,7 @@ local function layout_md(text, max_width)
   local code_lh = math.floor(md_code_font:get_height() * 1.3)
   local code_bg = with_alpha(style.text, 26)
   local code_bar_bg = with_alpha(style.text, 44)
+  local table_head_bg = with_alpha(style.text, 34)
   local quote_color = blend(style.text, style.dim or style.text, 0.45)
   -- Whitespace scale: paragraphs and blocks breathe, lines inside one stay tight.
   local para_gap = math.ceil(lh * 0.5)
@@ -620,6 +673,8 @@ local function layout_md(text, max_width)
       is_code_block = opts.is_code_block or false,
       is_code_bar = opts.is_code_bar or false,
       is_header = opts.is_header or false,
+      is_table_rule = opts.is_table_rule or false,
+      table_w = opts.table_w,
       indent = opts.indent or 0,
       bg = opts.bg, is_quote = opts.is_quote or false,
     }
@@ -664,6 +719,97 @@ local function layout_md(text, max_width)
     end
   end
 
+  -- GFM table.  Column widths come from the widest cell and are shrunk
+  -- proportionally (then trimmed) to fit the panel.  Each cell carries an
+  -- explicit advance (pad_to) plus an alignment offset (off) instead of being
+  -- padded with spaces: glyph advances are not uniform — CJK in a monospace
+  -- font is not a whole multiple of the space width — so space padding always
+  -- drifted and the columns never lined up.
+  local function emit_table(header, aligns, rows)
+    local tfont = md_code_font
+    local unit = tfont:get_width(" ")
+    local pad_c = 1                -- cell padding, in space widths
+    local sep_text = " │ "         -- between columns
+    local ncols = #header
+    local row_lh = math.floor(tfont:get_height() * 1.35)
+
+    local min_col = math.max(24 * SCALE, pad_c * 4 * unit)
+    local sep_w = tfont:get_width(sep_text)
+    local avail = max_width - pad_x
+
+    -- natural column width in pixels (content + padding)
+    local col_w = {}
+    for ci = 1, ncols do
+      local w = tfont:get_width(header[ci] or "")
+      for _, row in ipairs(rows) do
+        w = math.max(w, tfont:get_width(row[ci] or ""))
+      end
+      col_w[ci] = w + pad_c * 2 * unit
+    end
+
+    local fixed = (ncols - 1) * sep_w
+    local function total_w()
+      local t = fixed
+      for ci = 1, ncols do t = t + col_w[ci] end
+      return t
+    end
+    if total_w() > avail then
+      local scale = math.max(0, avail - fixed) / math.max(1, total_w() - fixed)
+      for ci = 1, ncols do
+        col_w[ci] = math.max(min_col, math.floor(col_w[ci] * scale))
+      end
+      -- proportional scaling can overshoot: shave the widest column until it fits
+      while total_w() > avail do
+        local widest, wi = min_col, 1
+        for ci = 1, ncols do
+          if col_w[ci] > widest then widest, wi = col_w[ci], ci end
+        end
+        if widest <= min_col then break end
+        col_w[wi] = col_w[wi] - 1
+      end
+    end
+    local table_w = total_w()
+
+    local function cell_text(cells, ci)
+      local w = col_w[ci]
+      local text = truncate_to_width(cells[ci] or "", tfont, w - pad_c * 2 * unit)
+      local slack = math.max(0, w - tfont:get_width(text))
+      local off = pad_c * unit
+      local align = aligns[ci] or "left"
+      if align == "right" then
+        off = slack - pad_c * unit
+      elseif align == "center" then
+        off = math.floor(slack / 2)
+      end
+      return text, math.max(0, off), w
+    end
+
+    local function row_segments(cells)
+      local segs = {}
+      for ci = 1, ncols do
+        local text, off, col_w_ci = cell_text(cells, ci)
+        segs[#segs + 1] = {
+          text = text, font = tfont, color = style.text,
+          off = off, pad_to = col_w_ci,
+        }
+        if ci < ncols then
+          segs[#segs + 1] = { text = sep_text, font = tfont, color = style.dim }
+        end
+      end
+      return segs
+    end
+
+    add_rline(row_segments(header), row_lh, { bg = table_head_bg, table_w = table_w })
+    add_rline({}, math.max(1, math.floor(1 * SCALE)), {
+      is_table_rule = true, table_w = table_w,
+      mb = math.floor(row_lh * 0.45),
+    })
+    for _, r in ipairs(rows) do
+      add_rline(row_segments(r), row_lh, { table_w = table_w })
+    end
+    pending_gap = math.max(pending_gap, para_gap)
+  end
+
   local in_code_block = false
   local code_lang
   local code_bar_idx
@@ -685,10 +831,14 @@ local function layout_md(text, max_width)
     code_lines[#code_lines + 1] = code_line
   end
 
-  for _, line in ipairs(raw_lines) do
-    -- Fenced code block toggle; the part after ``` is the language tag
+  -- rows already consumed by a table above (delimiter row + body rows)
+  local table_row_used = {}
+
+  for li, line in ipairs(raw_lines) do
     local info = line:match("^%s*```%s*(.-)%s*$")
-    if info then
+    if table_row_used[li] then
+      -- already emitted as part of the table above
+    elseif info then
       if in_code_block then
         if #code_lines == 0 then
           -- empty block: drop the bar again, nothing to show or copy
@@ -722,6 +872,18 @@ local function layout_md(text, max_width)
       emit_code_line(line)
     elseif line:match("^%s*$") then
       pending_gap = math.max(pending_gap, para_gap)
+    -- GFM table: a pipe row followed by a delimiter row
+    elseif line:find("|", 1, true) and is_table_sep(raw_lines[li + 1]) then
+      local rows = {}
+      local r = li + 2
+      while r <= #raw_lines and raw_lines[r]:find("|", 1, true)
+        and not raw_lines[r]:match("^%s*$") do
+        rows[#rows + 1] = split_table_row(raw_lines[r])
+        table_row_used[r] = true
+        r = r + 1
+      end
+      table_row_used[li + 1] = true -- the delimiter row
+      emit_table(split_table_row(line), parse_table_aligns(raw_lines[li + 1]), rows)
     else
       -- Headers: # ## ###
       local h_marks, h_text = line:match("^(%#+)%s+(.*)$")
@@ -1052,7 +1214,7 @@ function AIView:_hit_test_msg(x, y)
           -- the chip's left edge, so drop its padding before measuring.
           local best_pos = 1
           local best_dist = math.huge
-          local rel_x = x - seg_x - (seg.pad or 0)
+          local rel_x = x - seg_text_x(seg, seg_x)
           local p = 1
           while p <= #seg.text + 1 do
             local w = seg.font:get_width(seg.text:sub(1, p - 1))
@@ -2118,9 +2280,17 @@ function AIView:draw()
           -- is not flush with the edge) but not the gap in front of the block;
           -- +1 merges with the neighbouring line's rect
           if rline.bg then
-            renderer.draw_rect(msg_x + math.floor(pad.x * 0.5), cum_y + (rline.sp or 0),
-              msg_w - pad.x, math.max(1, (rline.mt or 0) + rline.h + (rline.mb or 0) + 1),
+            local bg_x, bg_w = msg_x + math.floor(pad.x * 0.5), msg_w - pad.x
+            if rline.table_w then bg_x, bg_w = msg_x + pad.x, rline.table_w end
+            renderer.draw_rect(bg_x, cum_y + (rline.sp or 0), bg_w,
+              math.max(1, (rline.mt or 0) + rline.h + (rline.mb or 0) + 1),
               rline.bg)
+          end
+          -- table header rule
+          if rline.is_table_rule then
+            renderer.draw_rect(msg_x + pad.x, ly,
+              rline.table_w or (msg_w - pad.x * 2),
+              math.max(1, math.floor(1 * SCALE)), style.divider)
           end
           -- blockquote left bar
           if rline.is_quote then
@@ -2133,18 +2303,19 @@ function AIView:draw()
             if seg_pad > 0 and seg.bg then
               local chip_h = math.min(rline.h,
                 seg.font:get_height() + math.floor(4 * SCALE))
-              renderer.draw_rect(sx, ly + math.floor((rline.h - chip_h) / 2),
+              renderer.draw_rect(sx + (seg.off or 0), ly + math.floor((rline.h - chip_h) / 2),
                 seg_advance(seg), chip_h, seg.bg)
             end
             -- selection highlight (drawn before text so text sits on top)
             if ns then
               local sel = self:_seg_in_selection(blk_idx, rl_idx, sg_idx, seg, ns, ne)
               if sel then
+                local text_x = seg_text_x(seg, sx)
                 local sel_x, sel_w
                 if sel == "all" then
-                  sel_x, sel_w = sx, seg_advance(seg)
+                  sel_x, sel_w = text_x, seg.font:get_width(seg.text)
                 else
-                  sel_x = sx + seg_pad + seg.font:get_width(seg.text:sub(1, sel[1] - 1))
+                  sel_x = text_x + seg.font:get_width(seg.text:sub(1, sel[1] - 1))
                   sel_w = seg.font:get_width(seg.text:sub(sel[1], sel[2] - 1))
                 end
                 if sel_w > 0 then
@@ -2153,11 +2324,11 @@ function AIView:draw()
                 end
               end
             end
-            renderer.draw_text(seg.font, seg.text, sx + seg_pad, ly, seg.color)
+            renderer.draw_text(seg.font, seg.text, seg_text_x(seg, sx), ly, seg.color)
             -- link underline
             if seg.underline then
               local uw = seg.font:get_width(seg.text)
-              renderer.draw_rect(sx + seg_pad,
+              renderer.draw_rect(seg_text_x(seg, sx),
                 ly + math.min(rline.h, seg.font:get_height()) - 1,
                 uw, math.max(1, math.floor(1 * SCALE)), with_alpha(seg.color, 150))
             end
