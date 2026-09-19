@@ -1046,6 +1046,16 @@ function AIView:clear()
   core.redraw = true
 end
 
+-- Working directory handed to the pi-bridge session (the agent's cwd).
+-- NOTE: core.project_dir no longer exists in this fork (upstream removed it in
+-- favour of core.projects / core.root_project()), so reading it silently fell
+-- back to $HOME and pointed the agent at the home directory.  Use the root
+-- project path, falling back to the old behaviour when there is no project.
+local function project_working_dir()
+  local project = core.root_project and core.root_project()
+  return (project and project.path) or os.getenv("HOME") or "."
+end
+
 -- Start a fresh session: abort any active stream, clear messages, and
 -- invalidate the cached pi-bridge session for the current working dir so the
 -- next submit creates a brand-new conversation.
@@ -1054,7 +1064,7 @@ function AIView:new_session()
     self:abort_stream()
   end
   -- drop the cached session so _ensure_session creates a new one next time
-  local working_dir = core.project_dir or os.getenv("HOME") or "."
+  local working_dir = project_working_dir()
   self._sessions[working_dir] = nil
   self:clear()
   table.insert(self.messages, {
@@ -1088,23 +1098,61 @@ function AIView:ensure_mounted()
   return true
 end
 
--- Build the message to send: user text + optional editor context.
--- If the last active DocView has a selection, append it as context (mirrors slate).
-function AIView:build_message(user_text)
-  local msg = user_text
-  -- core.last_active_view is the view that was active before the AI panel got
-  -- focus — typically the DocView the user was editing.  Wrapped in pcall so a
-  -- stale/closed view never breaks the submit.
+-- Locate the DocView the user was editing when the AI panel took focus.
+-- core.last_active_view is whatever view had focus before the panel did, so it
+-- normally points at the editor; when it is nil or stale (file closed, panel
+-- focused first) fall back to scanning the root view for a DocView.  Wrapped in
+-- pcall and duck-typed on .doc, so a stale view or a build without DocView can
+-- never break the submit.
+local function find_active_doc_view()
   local ok, av = pcall(function() return core.last_active_view end)
-  if ok and av and av.doc then
-    local sel_ok, sel_text = pcall(function()
-      return av.doc:get_text(av.doc:get_selection())
-    end)
-    if sel_ok and sel_text and #sel_text > 0 and #sel_text < 30000 then
-      msg = msg .. "\n\n<选中的代码>\n" .. sel_text .. "\n</选中的代码>"
+  if ok and av and av.doc then return av end
+  local found
+  local function scan(node)
+    if not node or found then return end
+    for _, v in ipairs(node.views or {}) do
+      if v.doc then found = v end
     end
+    scan(node.a)
+    scan(node.b)
   end
-  return msg
+  pcall(function() scan(core.root_view and core.root_view.root_node) end)
+  return found
+end
+
+-- Path of a document the way the user sees it in the treeview: relative to the
+-- project root when it lives inside it, home-encoded absolute path otherwise.
+-- Returns nil for unsaved buffers.
+local function doc_display_path(doc)
+  local path = doc.filename
+  if not path or path == "" then return nil end
+  local ok, project = pcall(function() return core.projects and core.projects[1] end)
+  if ok and project and common.path_belongs_to(path, project.path) then
+    local rok, rel = pcall(function() return project:normalize_path(path) end)
+    if rok and rel and rel ~= "" then return rel end
+  end
+  return common.home_encode(path)
+end
+
+-- Build the message to send: the user text, prefixed with the name of the file
+-- the editor is showing, so "分析下这个 sql" has a target to look at.  Only the
+-- NAME is sent — the backend session's cwd is the project root, so the agent
+-- reads the file itself when it needs the content.  A real selection is the one
+-- exception: that is explicit user intent, so the snippet rides along.
+function AIView:build_message(user_text)
+  local av = find_active_doc_view()
+  if not av then return user_text end
+  local doc = av.doc
+  local header = "[当前文件] " .. (doc_display_path(doc) or "未保存的缓冲区")
+
+  local sel_ok, sel = pcall(function() return doc:get_selection_text() end)
+  if not (sel_ok and sel and #sel > 0 and #sel < 30000) then
+    return header .. "\n\n" .. user_text
+  end
+
+  local l1, _, l2 = doc:get_selection()
+  if l2 and l2 > l1 then header = header .. string.format("（选中 L%d-%d）", l1, l2) end
+  return header .. "\n\n<选中的代码>\n" .. sel .. "\n</选中的代码>\n\n" .. user_text
 end
 
 function AIView:submit()
@@ -1155,7 +1203,7 @@ end
 -- Returns session_id or nil, errmsg.
 function AIView:_ensure_session()
   local cfg = config.plugins.aichat
-  local working_dir = core.project_dir or os.getenv("HOME") or "."
+  local working_dir = project_working_dir()
   if self._sessions[working_dir] then
     return self._sessions[working_dir]
   end
