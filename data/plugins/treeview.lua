@@ -16,7 +16,11 @@ local Dirwatch = require "core.dirwatch"
 -- regardless of init.lua configuration
 local nerd_font = style.nerd_font
 if not nerd_font then
-  local font_path = (MACOS_RESOURCES or DATADIR) .. "/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"
+  -- MACOS_RESOURCES only exists in macOS bundle builds; reading it directly
+  -- (rather than through rawget) aborts the whole plugin outside of them,
+  -- because the core enables strict globals.
+  local resources = rawget(_G, "MACOS_RESOURCES") or DATADIR
+  local font_path = resources .. "/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"
   local ok, font = pcall(renderer.font.load, font_path, 15 * SCALE, {antialiasing="grayscale", hinting="full"})
   if ok then
     nerd_font = font
@@ -387,7 +391,7 @@ local file_icons = {
   css    = "\u{e749}",  -- 
   json   = "\u{e60b}",  -- 
   md     = "\u{e609}",  -- 
-  txt    = "\u{f099}",  -- 
+  txt    = "\u{f15c}",  --  (fa-file_text)
   xml    = "\u{e736}",  -- 
   yaml   = "\u{e60b}",  -- 
   yml    = "\u{e60b}",  -- 
@@ -420,7 +424,7 @@ local file_icons = {
   conf   = "\u{e615}",  -- 
   cfg    = "\u{e615}",  -- 
   ini    = "\u{e615}",  -- 
-  log    = "\u{f099}",  -- 
+  log    = "\u{f15c}",  --  (fa-file_text)
   -- by filename
   Makefile      = "\u{e673}",  -- 
   Dockerfile    = "\u{e650}",  -- 
@@ -430,7 +434,7 @@ local file_icons = {
   [".env"]        = "\u{e615}",  -- 
   [".gitmodules"] = "\u{e702}",  -- 
 }
-local default_file_icon = "\u{f723}"  -- 
+local default_file_icon = "\u{f15b}"  --  (fa-file)
 
 -- File icon colors for a Sublime-Text-like file icon experience
 -- Each entry is a color table {r, g, b, a}
