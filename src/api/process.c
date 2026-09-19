@@ -624,16 +624,32 @@ static int g_read(lua_State* L, int stream, lua_Integer read_size) {
       length = self->overlapped[writable_stream_idx].InternalHigh;
       memset(&self->overlapped[writable_stream_idx], 0, sizeof(self->overlapped[writable_stream_idx]));
     }
-    lua_pushlstring(L, self->buffer[writable_stream_idx], length);
+    if (length == 0 && !poll_process(self, WAIT_NONE)) {
+      // Real end-of-file (the child exited and nothing is left to read).
+      // It must be distinguishable from "no data available right now",
+      // otherwise process.stream:read() keeps polling until its timeout
+      // instead of seeing the end of the stream. See the POSIX branch below.
+      lua_pushnil(L);
+    } else {
+      lua_pushlstring(L, self->buffer[writable_stream_idx], length);
+    }
   #else
     luaL_Buffer b;
     luaL_buffinit(L, &b);
+    size_t total = 0;
+    bool eof = false;
     do {
       uint8_t* buffer = (uint8_t*)luaL_prepbuffer(&b);
       length = read(self->child_pipes[stream][0], buffer, read_size < LUAL_BUFFERSIZE ? read_size : LUAL_BUFFERSIZE);
-      if (length == 0 && !poll_process(self, WAIT_NONE))
+      if (length == 0 && !poll_process(self, WAIT_NONE)) {
+        // The child exited and there is nothing left to read: a real EOF.
+        // Returning an empty string for both EOF and EAGAIN (no data right
+        // now) made the Lua side unable to tell the two apart, so
+        // read("all") spun until its timeout and the end of the stream was
+        // never reported.
+        eof = true;
         break;
-      else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+      } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         length = 0;
       if (length < 0) {
         signal_process(self, SIGNAL_TERM);
@@ -642,9 +658,16 @@ static int g_read(lua_State* L, int stream, lua_Integer read_size) {
       if (length) {
         luaL_addsize(&b, length);
         read_size -= length;
+        total += length;
       }
     } while (read_size > 0 && length > 0);
     luaL_pushresult(&b);
+    if (eof && total == 0) {
+      // no data left and the stream is closed: report EOF the same way a
+      // POSIX read() does, as nil instead of an empty string
+      lua_pop(L, 1);
+      lua_pushnil(L);
+    }
   #endif
   return 1;
 }
