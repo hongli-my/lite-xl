@@ -278,6 +278,27 @@ local function with_alpha(c, a)
   return { c[1] or 0, c[2] or 0, c[3] or 0, a }
 end
 
+-- Advance width of a segment, including any inline-chip padding.
+local function seg_advance(seg)
+  return seg.font:get_width(seg.text) + (seg.pad or 0) * 2
+end
+
+-- Vertical bookkeeping shared by layout, hit-testing and drawing.  A render
+-- line has a text height `h`, plus two kinds of extra space:
+--   sp        space above the line, outside any background (paragraph gaps,
+--             heading breathing room, the gap before a code block)
+--   mt / mb   padding above/below the text that belongs to the line itself
+--             (top/bottom padding inside a fenced code block)
+-- Keeping them separate is what lets the code-block background cover its own
+-- padding without swallowing the gap that precedes the block.
+local function rline_outer(rl)
+  return (rl.sp or 0) + (rl.mt or 0) + rl.h + (rl.mb or 0)
+end
+
+local function rline_text_top(rl, y)
+  return y + (rl.sp or 0) + (rl.mt or 0)
+end
+
 -- Markdown fonts (synthetic bold/italic from the single regular TTF).
 -- Rebuild the font groups at the text font's size so emoji (which the user may
 -- have loaded at a larger size e.g. 32*SCALE for the editor) is scaled down to
@@ -289,6 +310,14 @@ local ai_code_font   = style.code_font:copy(style.code_font:get_size())
 local md_bold_font   = ai_font:copy(ai_font:get_size(), { bold = true })
 local md_italic_font = ai_font:copy(ai_font:get_size(), { italic = true })
 local md_code_font   = ai_code_font
+-- Heading type scale.  Without this, # / ## / ### rendered at the same size and
+-- were told apart only by color, which read as three identical paragraphs.
+local md_h1_font     = ai_font:copy(math.floor(ai_font:get_size() * 1.34), { bold = true })
+local md_h2_font     = ai_font:copy(math.floor(ai_font:get_size() * 1.16), { bold = true })
+local md_h3_font     = ai_font:copy(ai_font:get_size(), { bold = true })
+
+-- Horizontal padding around inline `code` chips.
+local CODE_CHIP_PAD = math.floor(3 * SCALE)
 
 -------------------------------------------------------------------------------
 -- Markdown rendering for assistant messages
@@ -336,7 +365,7 @@ local function parse_md_inline(text, base_color, base_font)
       else
         pending = pending .. "~"; i = i + 1
       end
-    -- `code`
+    -- `code` — inline chip: padded, tinted background, monospace
     elseif c == 96 then
       local close = text:find("`", i + 1, true)
       if close then
@@ -344,6 +373,7 @@ local function parse_md_inline(text, base_color, base_font)
         segments[#segments + 1] = {
           text = text:sub(i + 1, close - 1),
           font = md_code_font, color = style.accent or base_color,
+          pad = CODE_CHIP_PAD, bg = with_alpha(style.text, 30),
         }
         i = close + 1
       else
@@ -387,14 +417,22 @@ local function parse_md_inline(text, base_color, base_font)
 end
 
 -- Layout markdown text into render lines.  Each render line is:
---   { segments, h, is_code_block, is_header, indent, bg, is_quote }
+--   { segments, h, sp, mt, mb, is_code_block, is_code_bar, is_header, indent,
+--     bg, is_quote }
+-- See rline_outer()/rline_text_top() for how the vertical fields add up.
 local function layout_md(text, max_width)
   local rlines = {}
-  local in_code_block = false
   local pad_x = style.padding.x
-  local lh = math.floor(ai_font:get_height() * 1.35)
+  local lh = math.floor(ai_font:get_height() * 1.32)
   local code_lh = math.floor(md_code_font:get_height() * 1.3)
-  local code_bg = with_alpha(style.text, 16)
+  local code_bg = with_alpha(style.text, 26)
+  local code_bar_bg = with_alpha(style.text, 44)
+  local quote_color = blend(style.text, style.dim or style.text, 0.45)
+  -- Whitespace scale: paragraphs and blocks breathe, lines inside one stay tight.
+  local para_gap = math.ceil(lh * 0.5)
+  local head_gap = math.ceil(lh * 0.6)
+  local code_indent = math.floor(pad_x * 1.5)
+  local code_pad_y = math.ceil(lh * 0.34)
 
   -- Split into raw lines
   local raw_lines = {}
@@ -406,51 +444,99 @@ local function layout_md(text, max_width)
     i = j + 1
   end
 
+  -- Space asked for by a blank line / before a block, consumed by the next
+  -- emitted render line so trailing blanks never add height.
+  local pending_gap = 0
+
   local function add_rline(segs, h, opts)
     opts = opts or {}
     rlines[#rlines + 1] = {
       segments = segs, h = h,
+      sp = math.max(opts.sp or 0, pending_gap),
+      mt = opts.mt or 0,
+      mb = opts.mb or 0,
       is_code_block = opts.is_code_block or false,
+      is_code_bar = opts.is_code_bar or false,
       is_header = opts.is_header or false,
       indent = opts.indent or 0,
       bg = opts.bg, is_quote = opts.is_quote or false,
     }
+    pending_gap = 0
+  end
+
+  local in_code_block = false
+  local code_lang
+  local code_bar_pending = false
+  local last_code_idx
+
+  -- Emit one line of a fenced block.  The language bar is emitted lazily (only
+  -- for the first body line) so an empty block never renders a lone bar.
+  local function emit_code_line(code_line)
+    if code_bar_pending then
+      code_bar_pending = false
+      if code_lang then
+        add_rline({ { text = code_lang, font = ai_font, color = style.dim } },
+          math.floor(lh * 0.9),
+          { is_code_block = true, is_code_bar = true, bg = code_bar_bg,
+            indent = code_indent })
+      end
+    end
+    local avail_w = max_width - code_indent - pad_x
+    for _, wline in ipairs(wrap_text(code_line, md_code_font, avail_w)) do
+      add_rline({ { text = wline, font = md_code_font, color = style.text } },
+        code_lh,
+        { is_code_block = true, bg = code_bg, indent = code_indent,
+          mt = (last_code_idx == nil) and code_pad_y or 0 })
+      last_code_idx = #rlines
+    end
   end
 
   for _, line in ipairs(raw_lines) do
-    -- Fenced code block toggle
-    local fence = line:match("^%s*```")
-    if fence then
-      in_code_block = not in_code_block
-    elseif in_code_block then
-      local avail_w = max_width - pad_x * 2
-      local wrapped = wrap_text(line, md_code_font, avail_w)
-      for _, wline in ipairs(wrapped) do
-        add_rline(
-          { { text = wline, font = md_code_font, color = style.text } },
-          code_lh, { is_code_block = true, bg = code_bg, indent = pad_x }
-        )
+    -- Fenced code block toggle; the part after ``` is the language tag
+    local info = line:match("^%s*```%s*(.-)%s*$")
+    if info then
+      if in_code_block then
+        -- bottom padding belongs to the last line of the block, so the tinted
+        -- background covers it instead of leaving the text flush with the edge
+        if last_code_idx then rlines[last_code_idx].mb = code_pad_y end
+        in_code_block = false
+        code_lang, code_bar_pending, last_code_idx = nil, false, nil
+      else
+        in_code_block = true
+        code_lang = (info ~= "") and info or nil
+        code_bar_pending, last_code_idx = true, nil
       end
+      pending_gap = math.max(pending_gap, para_gap)
+    elseif in_code_block then
+      emit_code_line(line)
+    elseif line:match("^%s*$") then
+      pending_gap = math.max(pending_gap, para_gap)
     else
       -- Headers: # ## ###
       local h_marks, h_text = line:match("^(%#+)%s+(.*)$")
       if h_marks and h_text and #h_marks <= 3 then
-        add_rline(
-          parse_md_inline(h_text, style.accent or style.text, ai_font),
-          lh, { is_header = true }
-        )
+        local hfont = (#h_marks == 1 and md_h1_font)
+          or (#h_marks == 2 and md_h2_font) or md_h3_font
+        local h_lh = math.floor(hfont:get_height() * 1.22)
+        for wi, wline in ipairs(wrap_text(h_text, hfont, max_width)) do
+          local segs = parse_md_inline(wline, style.accent or style.text, hfont)
+          -- inline markers keep their color, but must not fall back to body size
+          for _, s in ipairs(segs) do s.font = hfont end
+          add_rline(segs, h_lh, { is_header = true, sp = (wi == 1) and head_gap or 0 })
+        end
       -- Blockquotes: >
       elseif line:match("^>%s?") then
         local content = line:gsub("^>%s?", "")
-        for _, wline in ipairs(wrap_text(content, ai_font, max_width - pad_x)) do
-          add_rline(
-            parse_md_inline(wline, style.text, ai_font),
-            lh, { indent = pad_x, is_quote = true }
-          )
+        local q_indent = math.floor(pad_x * 1.4)
+        for wi, wline in ipairs(wrap_text(content, ai_font, max_width - q_indent - pad_x)) do
+          local segs = parse_md_inline(wline, quote_color, ai_font)
+          for _, s in ipairs(segs) do s.color = quote_color end
+          add_rline(segs, lh, { indent = q_indent, is_quote = true,
+            sp = (wi == 1) and math.ceil(lh * 0.25) or 0 })
         end
       else
-        -- List items: - * digit.
-        local bullet, content = line:match("^%s*([-*])%s+(.*)$")
+        -- List items: - * + or "1."
+        local bullet, content = line:match("^%s*([-*+])%s+(.*)$")
         if not bullet then
           local num = line:match("^%s*(%d+)%.")
           if num then
@@ -458,23 +544,26 @@ local function layout_md(text, max_width)
             bullet = num .. "."
           end
         end
-        if bullet then
-          local bullet_str = (bullet == "-" or bullet == "*") and "•" or bullet
-          local indent = pad_x
-          local avail_w = max_width - indent - pad_x
-          local wrapped = wrap_text(content, ai_font, avail_w)
+        if bullet and content then
+          local bullet_str = (bullet == "-" or bullet == "*" or bullet == "+")
+            and "•" or bullet
+          local bullet_w = ai_font:get_width(bullet_str .. " ")
+          -- Hanging indent: wrapped lines line up under the item text, not
+          -- under the bullet (they used to shift left by the bullet width).
+          local cont_indent = pad_x + bullet_w
+          local wrapped = wrap_text(content, ai_font, max_width - cont_indent - pad_x)
           for wi, wline in ipairs(wrapped) do
             local segs = {}
             if wi == 1 then
               segs[#segs + 1] = {
-                text = bullet_str .. " ",
-                font = ai_font, color = style.accent or style.text,
+                text = bullet_str .. " ", font = ai_font,
+                color = style.accent or style.text,
               }
             end
             for _, s in ipairs(parse_md_inline(wline, style.text, ai_font)) do
               segs[#segs + 1] = s
             end
-            add_rline(segs, lh, { indent = indent })
+            add_rline(segs, lh, { indent = (wi == 1) and pad_x or cont_indent })
           end
         else
           -- Normal paragraph
@@ -624,23 +713,32 @@ function AIView:update()
   if self.ime_status then self:update_ime_location() end
 end
 
--- Wrapped render lines of a single message.
--- Assistant messages go through the markdown layout, everything else is
--- plain wrapped text rendered as single-segment lines.
+-- Compact role label drawn above a message.  Assistant is the default voice in
+-- a chat panel, so it gets none: an all-caps "ASSISTANT" line on top of every
+-- reply was pure noise and cost a full line of height each time.
+local ROLE_LABEL = { user = "你", system = "系统", error = "错误" }
+
+local function role_label_height(role, lh)
+  if not ROLE_LABEL[role] then return 0 end
+  return lh + math.floor(style.padding.y * 0.5)
+end
+
+-- Wrapped render lines of a single message.  Markdown for everything the user
+-- or the agent writes — user messages carry the "[当前文件] …" header and the
+-- selected-code fence injected by build_message, so they need it too.  Only
+-- system notices stay plain.
 local function message_rlines(msg, font, lh, text_w)
-  if msg.role == "assistant" then
-    return layout_md(msg.content, text_w)
+  if msg.role == "system" then
+    local rlines = {}
+    for _, line in ipairs(wrap_text(msg.content, font, text_w)) do
+      rlines[#rlines + 1] = {
+        segments = { { text = line, font = font, color = style.text } },
+        h = lh, indent = 0,
+      }
+    end
+    return rlines
   end
-  local lines = wrap_text(msg.content, font, text_w)
-  local rlines = {}
-  for _, line in ipairs(lines) do
-    rlines[#rlines + 1] = {
-      segments = { { text = line, font = font, color = style.text } },
-      h = lh, is_code_block = false, is_header = false,
-      indent = 0, bg = nil, is_quote = false,
-    }
-  end
-  return rlines
+  return layout_md(msg.content, text_w)
 end
 
 
@@ -664,7 +762,9 @@ function AIView:layout_messages()
   local y = 0
   local font = ai_font
   local lh = font:get_height()
-  local role_h = lh + style.padding.y * 0.5
+  -- gap between messages: without it consecutive blocks ran together and the
+  -- only cue for "a new turn started" was the 3px role strip
+  local msg_gap = math.ceil(lh * 0.85)
   for i, msg in ipairs(self.messages) do
     local entry = cache[i]
     local rlines
@@ -675,13 +775,16 @@ function AIView:layout_messages()
       cache[i] = { content = msg.content, role = msg.role, rlines = rlines }
     end
     local content_h = 0
-    for _, rl in ipairs(rlines) do content_h = content_h + rl.h end
-    local block_h = role_h + content_h + style.padding.y
+    for _, rl in ipairs(rlines) do content_h = content_h + rline_outer(rl) end
+    local label_h = role_label_height(msg.role, lh)
+    local gap = (i > 1) and msg_gap or 0
     wrapped[i] = {
-      role = msg.role, rlines = rlines, y = y, h = block_h,
+      role = msg.role, rlines = rlines, y = y + gap,
+      h = label_h + content_h + style.padding.y,
+      label_h = label_h, gap = gap,
       is_empty = not msg.content:match("%S"),
     }
-    y = y + block_h
+    y = y + gap + wrapped[i].h
   end
   self._wrapped = wrapped
   self.content_height = y
@@ -719,19 +822,20 @@ function AIView:_hit_test_msg(x, y)
   end
   local pad = style.padding
   local offset_y = msg_y - self.scroll.y
-  local role_h = style.font:get_height() + pad.y * 0.5
   for blk_idx, blk in ipairs(self._wrapped) do
     local block_y = offset_y + blk.y
-    -- Role-label line is not selectable; skip to content.
-    if y >= block_y + role_h and y < block_y + blk.h then
-      local cum_y = block_y + role_h
+    -- Role-label line is not selectable; skip to content.  The block's own
+    -- leading gap is dead space as well.
+    if y >= block_y + blk.label_h and y < block_y + blk.h then
+      local cum_y = block_y + blk.label_h
       for rl_idx, rline in ipairs(blk.rlines) do
-        if y < cum_y + rline.h then
+        local text_top = rline_text_top(rline, cum_y)
+        if y < text_top + rline.h then
           local sx = msg_x + pad.x + (rline.indent or 0)
           local seg_idx, seg, seg_x
           -- Find which segment x falls into (or clamp to last).
           for si, s in ipairs(rline.segments) do
-            local sw = s.font:get_width(s.text)
+            local sw = seg_advance(s)
             if x < sx + sw then
               seg_idx, seg, seg_x = si, s, sx
               break
@@ -743,13 +847,13 @@ function AIView:_hit_test_msg(x, y)
             if #rline.segments == 0 then return nil end
             seg_idx = #rline.segments
             seg = rline.segments[seg_idx]
-            seg_x = sx - seg.font:get_width(seg.text)
+            seg_x = sx - seg_advance(seg)
           end
-          -- Linear-scan char position within seg.text (UTF-8 aware).
+          -- Linear-scan char position within seg.text (UTF-8 aware).  seg_x is
+          -- the chip's left edge, so drop its padding before measuring.
           local best_pos = 1
           local best_dist = math.huge
-          local seg_w = seg.font:get_width(seg.text)
-          local rel_x = x - seg_x
+          local rel_x = x - seg_x - (seg.pad or 0)
           local p = 1
           while p <= #seg.text + 1 do
             local w = seg.font:get_width(seg.text:sub(1, p - 1))
@@ -766,7 +870,7 @@ function AIView:_hit_test_msg(x, y)
             seg_idx = seg_idx, char_pos = best_pos,
           }
         end
-        cum_y = cum_y + rline.h
+        cum_y = cum_y + rline_outer(rline)
       end
       return nil
     end
@@ -1678,8 +1782,7 @@ function AIView:draw()
   local msg_x, msg_y, msg_w, msg_h = self:message_area()
   core.push_clip_rect(msg_x, msg_y, msg_w, msg_h)
   local offset_y = msg_y - self.scroll.y
-  local strip_w = 3
-  local role_h = lh + pad.y * 0.5
+  local strip_w = math.max(2, math.floor(3 * SCALE))
   -- Normalize selection range for highlight drawing.
   local ns, ne
   if self._sel_start and self._sel_end
@@ -1690,11 +1793,18 @@ function AIView:draw()
   for blk_idx, blk in ipairs(self._wrapped) do
     local block_y = offset_y + blk.y
     if block_y + blk.h >= msg_y and block_y <= msg_y + msg_h then
+      -- Hairline between turns, drawn in the gap above a "你" block: with the
+      -- role labels gone from assistant replies this is what makes the turn
+      -- boundary readable at a glance.
+      if blk.role == "user" and blk.gap > 0 then
+        renderer.draw_rect(msg_x + pad.x, block_y - math.floor(blk.gap * 0.5),
+          msg_w - pad.x * 2, style.divider_size, style.divider)
+      end
       -- subtle per-message bubble: user messages get a faint selection tint,
       -- errors a faint red wash; assistant/system stay clean for contrast.
       local bubble
       if blk.role == "user" then
-        bubble = with_alpha(style.selection or style.background, 85)
+        bubble = with_alpha(style.selection or style.background, 70)
       elseif blk.role == "error" then
         bubble = with_alpha(COLOR_ERROR, 28)
       end
@@ -1704,40 +1814,58 @@ function AIView:draw()
       end
       local role_color
       if blk.role == "user" then role_color = style.accent
-      elseif blk.role == "assistant" then role_color = style.text
       elseif blk.role == "error" then role_color = COLOR_ERROR
       else role_color = style.dim end
-      renderer.draw_rect(msg_x, block_y + 2, strip_w, math.max(0, blk.h - 4), role_color)
-      common.draw_text(font, role_color, blk.role:upper(),
-        "left", msg_x + pad.x, block_y, msg_w - pad.x * 2, lh)
+      -- The strip marks the blocks that are not plain agent output (your turn,
+      -- an error).  Assistant replies get neither strip nor label.
+      if blk.role == "user" or blk.role == "error" then
+        renderer.draw_rect(msg_x, block_y + 2, strip_w, math.max(0, blk.h - 4), role_color)
+      end
+      local cum_y = block_y
+      local label = ROLE_LABEL[blk.role]
+      if label and blk.label_h > 0 then
+        renderer.draw_text(font, label, msg_x + pad.x, block_y, role_color)
+        cum_y = block_y + blk.label_h
+      end
       if self.streaming and blk.role == "assistant" and blk.is_empty then
-        renderer.draw_text(font, "▍", msg_x + pad.x, block_y + role_h, COLOR_OK)
+        local first = blk.rlines[1]
+        renderer.draw_text(font, "▍", msg_x + pad.x,
+          cum_y + (first and ((first.sp or 0) + (first.mt or 0)) or 0), COLOR_OK)
       else
-        local cum_y = block_y + role_h
         for rl_idx, rline in ipairs(blk.rlines) do
-          local ly = cum_y
+          local ly = rline_text_top(rline, cum_y)
           local sx = msg_x + pad.x + (rline.indent or 0)
-          -- code block background (extends 1px below to merge with next line)
+          -- fenced-block background: covers the line's own padding (so the text
+          -- is not flush with the edge) but not the gap in front of the block;
+          -- +1 merges with the neighbouring line's rect
           if rline.bg then
-            renderer.draw_rect(msg_x + math.floor(pad.x * 0.5), ly,
-              msg_w - pad.x, rline.h + 1, rline.bg)
+            renderer.draw_rect(msg_x + math.floor(pad.x * 0.5), cum_y + (rline.sp or 0),
+              msg_w - pad.x, math.max(1, (rline.mt or 0) + rline.h + (rline.mb or 0) + 1),
+              rline.bg)
           end
           -- blockquote left bar
           if rline.is_quote then
-            renderer.draw_rect(msg_x + pad.x, ly,
+            renderer.draw_rect(msg_x + pad.x + math.floor(pad.x * 0.4), ly,
               math.max(1, math.floor(2 * SCALE)), rline.h, style.dim)
           end
           for sg_idx, seg in ipairs(rline.segments) do
+            local seg_pad = seg.pad or 0
+            -- inline `code` chip background
+            if seg_pad > 0 and seg.bg then
+              local chip_h = math.min(rline.h,
+                seg.font:get_height() + math.floor(4 * SCALE))
+              renderer.draw_rect(sx, ly + math.floor((rline.h - chip_h) / 2),
+                seg_advance(seg), chip_h, seg.bg)
+            end
             -- selection highlight (drawn before text so text sits on top)
             if ns then
               local sel = self:_seg_in_selection(blk_idx, rl_idx, sg_idx, seg, ns, ne)
               if sel then
                 local sel_x, sel_w
                 if sel == "all" then
-                  sel_x = sx
-                  sel_w = seg.font:get_width(seg.text)
+                  sel_x, sel_w = sx, seg_advance(seg)
                 else
-                  sel_x = sx + seg.font:get_width(seg.text:sub(1, sel[1] - 1))
+                  sel_x = sx + seg_pad + seg.font:get_width(seg.text:sub(1, sel[1] - 1))
                   sel_w = seg.font:get_width(seg.text:sub(sel[1], sel[2] - 1))
                 end
                 if sel_w > 0 then
@@ -1746,10 +1874,10 @@ function AIView:draw()
                 end
               end
             end
-            renderer.draw_text(seg.font, seg.text, sx, ly, seg.color)
-            sx = sx + seg.font:get_width(seg.text)
+            renderer.draw_text(seg.font, seg.text, sx + seg_pad, ly, seg.color)
+            sx = sx + seg_advance(seg)
           end
-          cum_y = cum_y + rline.h
+          cum_y = cum_y + rline_outer(rline)
         end
       end
     end
