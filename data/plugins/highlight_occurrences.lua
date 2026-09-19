@@ -192,10 +192,15 @@ function DocView:update_occurrences()
   local minline, maxline = self:get_visible_line_range()
   local from = math.max(1, minline - cfg.scan_margin)
   local to = math.min(#doc.lines, maxline + cfg.scan_margin)
-  local key = table.concat({ doc:get_change_id(), needle, from, to,
-    cfg.case_sensitive and 1 or 0 }, "\0")
+  -- this runs on every frame, so compare the fields directly instead of
+  -- building a string key (which allocated one string per frame)
+  local change_id = doc:get_change_id()
   local data = self.highlight_occurrences
-  if data and data.key == key then return end
+  if data and data.change_id == change_id and data.needle == needle
+      and data.from == from and data.to == to
+      and data.case_sensitive == cfg.case_sensitive then
+    return
+  end
 
   local by_line = {}
   for _, occ in ipairs(find_occurrences(doc, needle, from, to, cfg)) do
@@ -207,8 +212,11 @@ function DocView:update_occurrences()
   end
 
   self.highlight_occurrences = {
-    key = key,
+    change_id = change_id,
     needle = needle,
+    from = from,
+    to = to,
+    case_sensitive = cfg.case_sensitive,
     by_line = by_line,
     fill = { table.unpack(style.selection) },
     border = { table.unpack(style.selection) },

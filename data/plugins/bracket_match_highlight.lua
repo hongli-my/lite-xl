@@ -138,8 +138,11 @@ function DocView:update_bracket_match()
   local doc = self.doc
   -- the caret is the active end of the selection
   local _, _, line, col = doc:get_selection()
-  local key = string.format("%d\0%d\0%d", doc:get_change_id(), line, col)
-  if self.bracket_match and self.bracket_match.key == key then return end
+  -- compare the fields instead of building a string key: this runs on every
+  -- frame and used to allocate one string per frame for nothing
+  local change_id = doc:get_change_id()
+  local m = self.bracket_match
+  if m and m.change_id == change_id and m.line == line and m.col == col then return end
 
   local oline, ocol, mline, mcol
   -- the caret sits between two columns: try the char to its right, then left
@@ -159,7 +162,8 @@ function DocView:update_bracket_match()
   local border = { table.unpack(base_color()) }
   border[4] = cfg.border_alpha
   self.bracket_match = {
-    key = key, oline = oline, ocol = ocol, mline = mline, mcol = mcol,
+    change_id = change_id, line = line, col = col,
+    oline = oline, ocol = ocol, mline = mline, mcol = mcol,
     fill = fill, border = border,
   }
 end
