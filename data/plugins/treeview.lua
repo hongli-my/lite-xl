@@ -127,7 +127,7 @@ function TreeView:get_cached(project, path)
   end
   if t.expanded and t.type == "dir" and not t.files then
     t.files = {}
-    for i, file in ipairs(system.list_dir(path)) do
+    for i, file in ipairs(system.list_dir(path) or {}) do
       local l = path .. PATHSEP .. file
       local f
       if self.show_ignored then

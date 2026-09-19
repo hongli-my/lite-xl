@@ -686,7 +686,9 @@ function common.rm(path, recursively)
       return false, error, path
     end
   else
-    local contents = system.list_dir(path)
+    -- system.list_dir returns nil when the directory cannot be listed
+    -- (e.g. "/" on macOS), so guard as the other callers do
+    local contents = system.list_dir(path) or {}
     if #contents > 0 and not recursively then
       return false, "directory is not empty", path
     end
