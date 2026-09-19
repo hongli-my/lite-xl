@@ -390,8 +390,8 @@ local function layout_md(text, max_width)
   local rlines = {}
   local in_code_block = false
   local pad_x = style.padding.x
-  local lh = ai_font:get_height()
-  local code_lh = md_code_font:get_height()
+  local lh = math.floor(ai_font:get_height() * 1.35)
+  local code_lh = math.floor(md_code_font:get_height() * 1.3)
   local code_bg = with_alpha(style.text, 16)
 
   -- Split into raw lines
@@ -540,6 +540,10 @@ function AIView:new()
   self._stream_proc = nil
   self._aborting = false
   self._new_btn_hover = false
+  -- Text selection in the message area.
+  self._selecting = false   -- true while mouse drag-selecting
+  self._sel_start = nil     -- {msg_idx, rline_idx, seg_idx, char_pos}
+  self._sel_end = nil       -- same structure
   local backend_now = config.plugins.aichat.backend or "pibridge"
   table.insert(self.messages, {
     role = "system",
@@ -666,14 +670,185 @@ function AIView:on_mouse_wheel(y, x)
   self:clamp_scroll_position()
 end
 
--- Handle clicks on the header "新对话" button; everything else delegates to
--- the default View handler (scrollbar etc.).
+-------------------------------------------------------------------------------
+-- Text selection in the message area
+-------------------------------------------------------------------------------
+
+-- Map an (x, y) screen coordinate to a position in the message text.
+-- Returns {msg_idx, rline_idx, seg_idx, char_pos} or nil if outside messages.
+function AIView:_hit_test_msg(x, y)
+  if self._dirty then self:layout_messages() end
+  local msg_x, msg_y, msg_w, msg_h = self:message_area()
+  if y < msg_y or y >= msg_y + msg_h
+     or x < msg_x or x >= msg_x + msg_w then
+    return nil
+  end
+  local pad = style.padding
+  local offset_y = msg_y - self.scroll.y
+  local role_h = style.font:get_height() + pad.y * 0.5
+  for blk_idx, blk in ipairs(self._wrapped) do
+    local block_y = offset_y + blk.y
+    -- Role-label line is not selectable; skip to content.
+    if y >= block_y + role_h and y < block_y + blk.h then
+      local cum_y = block_y + role_h
+      for rl_idx, rline in ipairs(blk.rlines) do
+        if y < cum_y + rline.h then
+          local sx = msg_x + pad.x + (rline.indent or 0)
+          local seg_idx, seg, seg_x
+          -- Find which segment x falls into (or clamp to last).
+          for si, s in ipairs(rline.segments) do
+            local sw = s.font:get_width(s.text)
+            if x < sx + sw then
+              seg_idx, seg, seg_x = si, s, sx
+              break
+            end
+            sx = sx + sw
+          end
+          -- Clamp to end of last segment.
+          if not seg_idx then
+            if #rline.segments == 0 then return nil end
+            seg_idx = #rline.segments
+            seg = rline.segments[seg_idx]
+            seg_x = sx - seg.font:get_width(seg.text)
+          end
+          -- Linear-scan char position within seg.text (UTF-8 aware).
+          local best_pos = 1
+          local best_dist = math.huge
+          local seg_w = seg.font:get_width(seg.text)
+          local rel_x = x - seg_x
+          local p = 1
+          while p <= #seg.text + 1 do
+            local w = seg.font:get_width(seg.text:sub(1, p - 1))
+            local dist = math.abs(rel_x - w)
+            if dist < best_dist then
+              best_dist = dist
+              best_pos = p
+            end
+            if p > #seg.text then break end
+            p = utf8_next(seg.text, p)
+          end
+          return {
+            msg_idx = blk_idx, rline_idx = rl_idx,
+            seg_idx = seg_idx, char_pos = best_pos,
+          }
+        end
+        cum_y = cum_y + rline.h
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
+-- Compare two positions: returns -1 if a before b, 0 if equal, 1 if after.
+local function cmp_pos(a, b)
+  if a.msg_idx ~= b.msg_idx then return a.msg_idx < b.msg_idx and -1 or 1 end
+  if a.rline_idx ~= b.rline_idx then return a.rline_idx < b.rline_idx and -1 or 1 end
+  if a.seg_idx ~= b.seg_idx then return a.seg_idx < b.seg_idx and -1 or 1 end
+  if a.char_pos ~= b.char_pos then return a.char_pos < b.char_pos and -1 or 1 end
+  return 0
+end
+
+-- Returns true if selection exists and is non-empty (start != end).
+function AIView:_has_selection()
+  return self._sel_start and self._sel_end
+    and cmp_pos(self._sel_start, self._sel_end) ~= 0
+end
+
+-- Extract the text between _sel_start and _sel_end (inclusive).
+function AIView:_get_selected_text()
+  if not self:_has_selection() then return "" end
+  local s, e = self._sel_start, self._sel_end
+  if cmp_pos(s, e) > 0 then s, e = e, s end -- normalize order
+
+  local parts = {}
+  local mi = s.msg_idx
+  while mi <= e.msg_idx do
+    local blk = self._wrapped[mi]
+    if not blk then break end
+    local rl_start = (mi == s.msg_idx) and s.rline_idx or 1
+    local rl_end   = (mi == e.msg_idx) and e.rline_idx or #blk.rlines
+    for ri = rl_start, rl_end do
+      local rline = blk.rlines[ri]
+      if rline then
+        local seg_start = (mi == s.msg_idx and ri == s.rline_idx) and s.seg_idx or 1
+        local seg_end   = (mi == e.msg_idx and ri == e.rline_idx) and e.seg_idx or #rline.segments
+        local line_text = ""
+        for si = seg_start, seg_end do
+          local seg = rline.segments[si]
+          if seg then
+            if mi == s.msg_idx and ri == s.rline_idx and si == s.seg_idx then
+              line_text = line_text .. seg.text:sub(s.char_pos)
+            elseif mi == e.msg_idx and ri == e.rline_idx and si == e.seg_idx then
+              line_text = line_text .. seg.text:sub(1, e.char_pos - 1)
+            else
+              line_text = line_text .. seg.text
+            end
+          end
+        end
+        parts[#parts + 1] = line_text
+      end
+    end
+    if mi < e.msg_idx then parts[#parts + 1] = "" end -- blank line between msgs
+    mi = mi + 1
+  end
+  return table.concat(parts, "\n")
+end
+
+-- Returns "all", {start_byte, end_byte}, or nil for a given segment.
+-- Bytes are 1-indexed, end exclusive. start/end are already normalized.
+function AIView:_seg_in_selection(blk_idx, rl_idx, sg_idx, seg, ns, ne)
+  if not ns or not ne then return nil end
+  -- Fully before or after selection range?
+  local here = { msg_idx = blk_idx, rline_idx = rl_idx, seg_idx = sg_idx, char_pos = 1 }
+  local after_last = { msg_idx = blk_idx, rline_idx = rl_idx, seg_idx = sg_idx,
+                       char_pos = #seg.text + 1 }
+  if cmp_pos(after_last, ns) <= 0 then return nil end -- segment before selection
+  if cmp_pos(here, ne) >= 0 then return nil end       -- segment after selection
+  -- Fully inside?
+  if cmp_pos(here, ns) >= 0 and cmp_pos(after_last, ne) <= 0 then
+    return "all"
+  end
+  -- Partial: compute byte range.
+  local start_byte = 1
+  if cmp_pos(here, ns) < 0 then
+    -- Selection starts inside this segment.
+    start_byte = ns.char_pos
+  end
+  local end_byte = #seg.text + 1
+  if cmp_pos(after_last, ne) > 0 then
+    -- Selection ends inside this segment.
+    end_byte = ne.char_pos
+  end
+  if start_byte >= end_byte then return nil end
+  return { start_byte, end_byte }
+end
+
+-- Clear the current selection.
+function AIView:_clear_selection()
+  self._sel_start = nil
+  self._sel_end = nil
+  self._selecting = false
+end
+
+-- Handle clicks on the header "新对话" button and text selection in the
+-- message area; everything else delegates to the default View handler
+-- (scrollbar etc.).
 function AIView:on_mouse_pressed(button, x, y, clicks)
   if button == "left" then
     local nbx, nby, nbw, nbh = self:new_btn_rect()
     if x >= nbx - math.floor(4 * SCALE) and x < nbx + nbw + math.floor(4 * SCALE)
        and y >= nby - math.floor(2 * SCALE) and y < nby + nbh + math.floor(2 * SCALE) then
       self:new_session()
+      return true
+    end
+    -- Text selection in message area.
+    local msg_x, msg_y, msg_w, msg_h = self:message_area()
+    if x >= msg_x and x < msg_x + msg_w and y >= msg_y and y < msg_y + msg_h then
+      self._selecting = true
+      self._sel_start = self:_hit_test_msg(x, y)
+      self._sel_end = self._sel_start
+      core.redraw = true
       return true
     end
   end
@@ -688,12 +863,35 @@ function AIView:on_mouse_moved(x, y, dx, dy)
     self._new_btn_hover = over
     core.redraw = true
   end
+  if self._selecting then
+    self._sel_end = self:_hit_test_msg(x, y)
+    core.redraw = true
+    core.request_cursor("ibeam")
+    return true
+  end
   if over then core.request_cursor("hand") end
   return AIView.super.on_mouse_moved(self, x, y, dx, dy)
 end
 
+function AIView:on_mouse_released(button, x, y)
+  if self._selecting then
+    self._selecting = false
+    if self:_has_selection() then
+      local text = self:_get_selected_text()
+      if #text > 0 then
+        system.set_clipboard(text)
+        core.log("已复制 %d 字", #text)
+      end
+    end
+    core.redraw = true
+    return true
+  end
+  return AIView.super.on_mouse_released(self, button, x, y)
+end
+
 function AIView:on_mouse_left()
   self._new_btn_hover = false
+  self._selecting = false
   AIView.super.on_mouse_left(self)
 end
 
@@ -750,6 +948,7 @@ function AIView:clear()
   self._dirty = true
   self.scroll.to.y = 0
   self.scroll.y = 0
+  self:_clear_selection()
   core.redraw = true
 end
 
@@ -832,6 +1031,7 @@ function AIView:_send(user_text)
   table.insert(self.messages, { role = "assistant", content = "" })
   self._dirty = true
   self.streaming = true
+  self:_clear_selection()
   core.redraw = true
 
   local cfg = config.plugins.aichat
@@ -1371,7 +1571,14 @@ function AIView:draw()
   local offset_y = msg_y - self.scroll.y
   local strip_w = 3
   local role_h = lh + pad.y * 0.5
-  for _, blk in ipairs(self._wrapped) do
+  -- Normalize selection range for highlight drawing.
+  local ns, ne
+  if self._sel_start and self._sel_end
+     and cmp_pos(self._sel_start, self._sel_end) ~= 0 then
+    ns, ne = self._sel_start, self._sel_end
+    if cmp_pos(ns, ne) > 0 then ns, ne = ne, ns end
+  end
+  for blk_idx, blk in ipairs(self._wrapped) do
     local block_y = offset_y + blk.y
     if block_y + blk.h >= msg_y and block_y <= msg_y + msg_h then
       -- subtle per-message bubble: user messages get a faint selection tint,
@@ -1398,7 +1605,7 @@ function AIView:draw()
         renderer.draw_text(font, "▍", msg_x + pad.x, block_y + role_h, COLOR_OK)
       else
         local cum_y = block_y + role_h
-        for _, rline in ipairs(blk.rlines) do
+        for rl_idx, rline in ipairs(blk.rlines) do
           local ly = cum_y
           local sx = msg_x + pad.x + (rline.indent or 0)
           -- code block background (extends 1px below to merge with next line)
@@ -1411,7 +1618,25 @@ function AIView:draw()
             renderer.draw_rect(msg_x + pad.x, ly,
               math.max(1, math.floor(2 * SCALE)), rline.h, style.dim)
           end
-          for _, seg in ipairs(rline.segments) do
+          for sg_idx, seg in ipairs(rline.segments) do
+            -- selection highlight (drawn before text so text sits on top)
+            if ns then
+              local sel = self:_seg_in_selection(blk_idx, rl_idx, sg_idx, seg, ns, ne)
+              if sel then
+                local sel_x, sel_w
+                if sel == "all" then
+                  sel_x = sx
+                  sel_w = seg.font:get_width(seg.text)
+                else
+                  sel_x = sx + seg.font:get_width(seg.text:sub(1, sel[1] - 1))
+                  sel_w = seg.font:get_width(seg.text:sub(sel[1], sel[2] - 1))
+                end
+                if sel_w > 0 then
+                  renderer.draw_rect(sel_x, ly, sel_w, rline.h,
+                    style.selection or style.accent)
+                end
+              end
+            end
             renderer.draw_text(seg.font, seg.text, sx, ly, seg.color)
             sx = sx + seg.font:get_width(seg.text)
           end
@@ -1502,6 +1727,15 @@ end, {
   ["aichat:right"]     = function() if ai_view then ai_view:cursor_right() end end,
   ["aichat:up"]        = function() if ai_view then ai_view:scroll_up() end end,
   ["aichat:down"]      = function() if ai_view then ai_view:scroll_down() end end,
+  ["aichat:copy"]      = function()
+    if ai_view and ai_view:_has_selection() then
+      local text = ai_view:_get_selected_text()
+      if #text > 0 then
+        system.set_clipboard(text)
+        core.log("已复制 %d 字", #text)
+      end
+    end
+  end,
 })
 
 keymap.add({
@@ -1513,6 +1747,8 @@ keymap.add({
   ["right"]        = "aichat:right",
   ["up"]           = "aichat:up",
   ["down"]         = "aichat:down",
+  ["cmd+c"]        = "aichat:copy",
+  ["ctrl+c"]       = "aichat:copy",
 })
 
 
