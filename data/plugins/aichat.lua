@@ -213,6 +213,41 @@ json.encode = json_encode
 -------------------------------------------------------------------------------
 -- Word-wrap helper: wraps text into lines fitting max_width using font metrics.
 -------------------------------------------------------------------------------
+
+-- UTF-8 aware cursor movement helpers (avoid splitting a multi-byte char).
+local function utf8_prev(s, pos)
+  local p = pos - 1
+  while p > 1 and s:byte(p) >= 0x80 and s:byte(p) < 0xC0 do p = p - 1 end
+  return p
+end
+local function utf8_next(s, pos)
+  local p = pos + 1
+  while p <= #s and s:byte(p) >= 0x80 and s:byte(p) < 0xC0 do p = p + 1 end
+  return p
+end
+
+-- Break a run that is wider than max_width (a long path, URL or unbreakable
+-- token) at character boundaries, pushing every chunk but the last into
+-- `lines` and returning the remainder.  Without this such a token simply
+-- overflowed and got cut off by the panel's clip rect.
+local function break_long_run(run, font, max_width, lines)
+  local chunk, chunk_w = "", 0
+  local p = 1
+  while p <= #run do
+    local nxt = utf8_next(run, p)
+    local ch = run:sub(p, nxt - 1)
+    local w = font:get_width(ch)
+    if chunk_w > 0 and chunk_w + w > max_width then
+      lines[#lines + 1] = chunk
+      chunk, chunk_w = "", 0
+    end
+    chunk = chunk .. ch
+    chunk_w = chunk_w + w
+    p = nxt
+  end
+  return chunk
+end
+
 local function wrap_text(text, font, max_width)
   local lines = {}
   local n = #text
@@ -237,6 +272,11 @@ local function wrap_text(text, font, max_width)
         else
           line = line .. word
         end
+        -- the word may itself exceed the width (first word of the line, or an
+        -- unbreakable token): hard-break it rather than letting it overflow
+        if font:get_width(line) > max_width then
+          line = break_long_run(line, font, max_width, lines)
+        end
         p = ep + 1
       end
       if #line > 0 then lines[#lines + 1] = line end
@@ -247,16 +287,73 @@ local function wrap_text(text, font, max_width)
   return lines
 end
 
--- UTF-8 aware cursor movement helpers (avoid splitting a multi-byte char).
-local function utf8_prev(s, pos)
-  local p = pos - 1
-  while p > 1 and s:byte(p) >= 0x80 and s:byte(p) < 0xC0 do p = p - 1 end
-  return p
-end
-local function utf8_next(s, pos)
-  local p = pos + 1
-  while p <= #s and s:byte(p) >= 0x80 and s:byte(p) < 0xC0 do p = p + 1 end
-  return p
+-- Wrap STYLED segments to max_width.  Inline markup has to be parsed before the
+-- line is broken: wrapping first split "[the docs](url)", `code` or **bold**
+-- across two lines, and the markers then rendered as literal text.
+-- Returns a list of lines, each a list of { text = ..., seg = <style table> }.
+local function wrap_segments(segs, max_width)
+  -- tokenise on whitespace, keeping the trailing space attached to its token;
+  -- a token continues into the next segment when it did not end on a space
+  local tokens = {}
+  for _, seg in ipairs(segs) do
+    local text = seg.text
+    local p = 1
+    while p <= #text do
+      local sp, ep = text:find("%S+%s*", p)
+      if not sp then break end
+      local last = tokens[#tokens]
+      if not (last and last.open) then
+        last = { pieces = {}, w = 0 }
+        tokens[#tokens + 1] = last
+      end
+      local piece = text:sub(sp, ep)
+      last.pieces[#last.pieces + 1] = { text = piece, seg = seg }
+      last.w = last.w + seg.font:get_width(piece)
+      last.open = not piece:match("%s$")
+      p = ep + 1
+    end
+  end
+
+  local lines, cur, cur_w = {}, {}, 0
+  local function flush()
+    lines[#lines + 1] = cur
+    cur, cur_w = {}, 0
+  end
+  -- append a run, merging it into the previous piece when the style matches
+  local function put(text, seg)
+    local last = cur[#cur]
+    if last and last.seg == seg then
+      last.text = last.text .. text
+    else
+      cur[#cur + 1] = { text = text, seg = seg }
+    end
+    cur_w = cur_w + seg.font:get_width(text)
+  end
+
+  for _, tok in ipairs(tokens) do
+    if cur_w > 0 and cur_w + tok.w > max_width then flush() end
+    if tok.w <= max_width then
+      for _, piece in ipairs(tok.pieces) do put(piece.text, piece.seg) end
+    else
+      -- wider than a whole line: break it at character boundaries
+      for _, piece in ipairs(tok.pieces) do
+        local text = piece.text
+        local p = 1
+        while p <= #text do
+          local nxt = utf8_next(text, p)
+          local ch = text:sub(p, nxt - 1)
+          if cur_w > 0 and cur_w + piece.seg.font:get_width(ch) > max_width then
+            flush()
+          end
+          put(ch, piece.seg)
+          p = nxt
+        end
+      end
+    end
+  end
+  if #cur > 0 then flush() end
+  if #lines == 0 then lines = { {} } end
+  return lines
 end
 
 -- Cached custom colors (style.* colors are read live in draw so theme switches work).
@@ -276,6 +373,26 @@ end
 -- Return a copy of color c with the given alpha (0-255).
 local function with_alpha(c, a)
   return { c[1] or 0, c[2] or 0, c[3] or 0, a }
+end
+
+-- Open a link from the panel: POSIX-escaped, scheme whitelisted (a message is
+-- untrusted text, it arrives from the model).
+local function shell_escape(s)
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+local function open_url(url)
+  if not (url:match("^https?://") or url:match("^mailto:") or url:match("^ftp://")) then
+    core.log("拒绝打开不安全的链接: %s", url)
+    return
+  end
+  if PLATFORM == "macOS" or PLATFORM == "Mac OS X" then
+    os.execute("open " .. shell_escape(url) .. " 2>/dev/null")
+  elseif PLATFORM == "Linux" then
+    os.execute("xdg-open " .. shell_escape(url) .. " 2>/dev/null")
+  elseif PLATFORM == "Windows" then
+    os.execute('start "" "' .. url:gsub('"', '') .. '"')
+  end
 end
 
 -- Advance width of a segment, including any inline-chip padding.
@@ -326,6 +443,31 @@ local CODE_CHIP_PAD = math.floor(3 * SCALE)
 -------------------------------------------------------------------------------
 
 -- Parse inline markdown into styled segments.  Single-pass, no nesting.
+
+-- [label](url) at position i, or nil.
+local function parse_link_at(text, i)
+  if text:byte(i) ~= 91 then return nil end -- '['
+  local close = text:find("]", i + 1, true)
+  if not close or text:byte(close + 1) ~= 40 then return nil end -- '('
+  -- scan to the matching ')': URLs may contain parentheses (e.g. wikipedia)
+  local depth, p = 1, close + 2
+  while p <= #text do
+    local ch = text:sub(p, p)
+    if ch == "(" then
+      depth = depth + 1
+    elseif ch == ")" then
+      depth = depth - 1
+      if depth == 0 then break end
+    end
+    p = p + 1
+  end
+  if depth ~= 0 then return nil end
+  local label = text:sub(i + 1, close - 1)
+  local url = text:sub(close + 2, p - 1)
+  if url == "" or url:find("[%s%c]") then return nil end
+  return { label = (label ~= "") and label or url, url = url }, p + 1
+end
+
 local function parse_md_inline(text, base_color, base_font)
   local segments = {}
   local i, n = 1, #text
@@ -338,8 +480,28 @@ local function parse_md_inline(text, base_color, base_font)
   end
   while i <= n do
     local c = text:byte(i)
+    local link, link_next = parse_link_at(text, i)
+    -- [label](url)
+    if link then
+      flush()
+      segments[#segments + 1] = {
+        text = link.label, font = base_font,
+        color = style.accent or base_color, link = link.url, underline = true,
+      }
+      i = link_next
+    -- bare URL
+    elseif text:sub(i, i + 7):match("^https?://") or text:sub(i, i + 3) == "www." then
+      local url = text:match("^[^%s]+", i):gsub("[%.,;:!%)%]]+$", "")
+      flush()
+      segments[#segments + 1] = {
+        text = url, font = base_font,
+        color = style.accent or base_color,
+        link = url:match("^www%.") and ("https://" .. url) or url,
+        underline = true,
+      }
+      i = i + #url
     -- **bold** or __bold__
-    if (c == 42 and text:byte(i + 1) == 42) or (c == 95 and text:byte(i + 1) == 95) then
+    elseif (c == 42 and text:byte(i + 1) == 42) or (c == 95 and text:byte(i + 1) == 95) then
       local delim = text:sub(i, i + 1)
       local close = text:find(delim, i + 2, true)
       if close then
@@ -464,23 +626,54 @@ local function layout_md(text, max_width)
     pending_gap = 0
   end
 
+  -- Parse inline markup first, then wrap the styled segments (see
+  -- wrap_segments) so markers are never split by the line break.
+  local function add_md_lines(src, font, color, indent, opts)
+    opts = opts or {}
+    local segs = parse_md_inline(src, color, font)
+    if opts.force_font then
+      for _, s in ipairs(segs) do s.font = opts.force_font end
+    end
+    if opts.color then
+      for _, s in ipairs(segs) do s.color = opts.color end
+    end
+    local cont_indent = opts.cont_indent or indent
+    local avail = max_width - math.max(indent, cont_indent) - pad_x
+    local first = true
+    for _, pieces in ipairs(wrap_segments(segs, avail)) do
+      local rsegs = {}
+      if first and opts.bullet then
+        rsegs[1] = {
+          text = opts.bullet, font = ai_font,
+          color = style.accent or style.text,
+        }
+      end
+      for _, pc in ipairs(pieces) do
+        local o = {}
+        for k, v in pairs(pc.seg) do o[k] = v end
+        o.text = pc.text
+        rsegs[#rsegs + 1] = o
+      end
+      add_rline(rsegs, opts.h or lh, {
+        indent = first and indent or cont_indent,
+        sp = first and (opts.sp or 0) or 0,
+        is_header = opts.is_header,
+        is_quote = opts.is_quote,
+      })
+      first = false
+    end
+  end
+
   local in_code_block = false
   local code_lang
-  local code_bar_pending = false
+  local code_bar_idx
+  local code_lines
   local last_code_idx
 
-  -- Emit one line of a fenced block.  The language bar is emitted lazily (only
-  -- for the first body line) so an empty block never renders a lone bar.
+  -- Emit one line of a fenced block.  The bar is emitted when the block opens so
+  -- a copy button is available even without a language tag; it is dropped again
+  -- if the block turns out to be empty (see the closing fence).
   local function emit_code_line(code_line)
-    if code_bar_pending then
-      code_bar_pending = false
-      if code_lang then
-        add_rline({ { text = code_lang, font = ai_font, color = style.dim } },
-          math.floor(lh * 0.9),
-          { is_code_block = true, is_code_bar = true, bg = code_bar_bg,
-            indent = code_indent })
-      end
-    end
     local avail_w = max_width - code_indent - pad_x
     for _, wline in ipairs(wrap_text(code_line, md_code_font, avail_w)) do
       add_rline({ { text = wline, font = md_code_font, color = style.text } },
@@ -489,6 +682,7 @@ local function layout_md(text, max_width)
           mt = (last_code_idx == nil) and code_pad_y or 0 })
       last_code_idx = #rlines
     end
+    code_lines[#code_lines + 1] = code_line
   end
 
   for _, line in ipairs(raw_lines) do
@@ -496,17 +690,34 @@ local function layout_md(text, max_width)
     local info = line:match("^%s*```%s*(.-)%s*$")
     if info then
       if in_code_block then
-        -- bottom padding belongs to the last line of the block, so the tinted
-        -- background covers it instead of leaving the text flush with the edge
-        if last_code_idx then rlines[last_code_idx].mb = code_pad_y end
+        if #code_lines == 0 then
+          -- empty block: drop the bar again, nothing to show or copy
+          if code_bar_idx then table.remove(rlines, code_bar_idx) end
+        else
+          -- bottom padding belongs to the last line of the block, so the tinted
+          -- background covers it instead of leaving the text flush with the edge
+          if last_code_idx then rlines[last_code_idx].mb = code_pad_y end
+          if code_bar_idx then
+            rlines[code_bar_idx].code_text = table.concat(code_lines, "\n")
+          end
+        end
         in_code_block = false
-        code_lang, code_bar_pending, last_code_idx = nil, false, nil
+        code_lang, code_bar_idx, code_lines, last_code_idx = nil, nil, nil, nil
+        pending_gap = math.max(pending_gap, para_gap)  -- gap after the block
       else
         in_code_block = true
         code_lang = (info ~= "") and info or nil
-        code_bar_pending, last_code_idx = true, nil
+        code_lines = {}
+        last_code_idx = nil
+        -- the gap belongs in front of the block, not between bar and code
+        pending_gap = math.max(pending_gap, para_gap)
+        add_rline({ { text = code_lang or " ", font = ai_font, color = style.dim } },
+          math.floor(lh * 0.9),
+          { is_code_block = true, is_code_bar = true, bg = code_bar_bg,
+            indent = code_indent })
+        rlines[#rlines].code_lang = code_lang
+        code_bar_idx = #rlines
       end
-      pending_gap = math.max(pending_gap, para_gap)
     elseif in_code_block then
       emit_code_line(line)
     elseif line:match("^%s*$") then
@@ -517,23 +728,17 @@ local function layout_md(text, max_width)
       if h_marks and h_text and #h_marks <= 3 then
         local hfont = (#h_marks == 1 and md_h1_font)
           or (#h_marks == 2 and md_h2_font) or md_h3_font
-        local h_lh = math.floor(hfont:get_height() * 1.22)
-        for wi, wline in ipairs(wrap_text(h_text, hfont, max_width)) do
-          local segs = parse_md_inline(wline, style.accent or style.text, hfont)
-          -- inline markers keep their color, but must not fall back to body size
-          for _, s in ipairs(segs) do s.font = hfont end
-          add_rline(segs, h_lh, { is_header = true, sp = (wi == 1) and head_gap or 0 })
-        end
+        add_md_lines(h_text, hfont, style.accent or style.text, 0, {
+          h = math.floor(hfont:get_height() * 1.22),
+          is_header = true, sp = head_gap, force_font = hfont,
+        })
       -- Blockquotes: >
       elseif line:match("^>%s?") then
-        local content = line:gsub("^>%s?", "")
-        local q_indent = math.floor(pad_x * 1.4)
-        for wi, wline in ipairs(wrap_text(content, ai_font, max_width - q_indent - pad_x)) do
-          local segs = parse_md_inline(wline, quote_color, ai_font)
-          for _, s in ipairs(segs) do s.color = quote_color end
-          add_rline(segs, lh, { indent = q_indent, is_quote = true,
-            sp = (wi == 1) and math.ceil(lh * 0.25) or 0 })
-        end
+        add_md_lines(line:gsub("^>%s?", ""), ai_font, quote_color,
+          math.floor(pad_x * 1.4), {
+            is_quote = true, color = quote_color,
+            sp = math.ceil(lh * 0.25),
+          })
       else
         -- List items: - * + or "1."
         local bullet, content = line:match("^%s*([-*+])%s+(.*)$")
@@ -547,29 +752,14 @@ local function layout_md(text, max_width)
         if bullet and content then
           local bullet_str = (bullet == "-" or bullet == "*" or bullet == "+")
             and "•" or bullet
-          local bullet_w = ai_font:get_width(bullet_str .. " ")
           -- Hanging indent: wrapped lines line up under the item text, not
           -- under the bullet (they used to shift left by the bullet width).
-          local cont_indent = pad_x + bullet_w
-          local wrapped = wrap_text(content, ai_font, max_width - cont_indent - pad_x)
-          for wi, wline in ipairs(wrapped) do
-            local segs = {}
-            if wi == 1 then
-              segs[#segs + 1] = {
-                text = bullet_str .. " ", font = ai_font,
-                color = style.accent or style.text,
-              }
-            end
-            for _, s in ipairs(parse_md_inline(wline, style.text, ai_font)) do
-              segs[#segs + 1] = s
-            end
-            add_rline(segs, lh, { indent = (wi == 1) and pad_x or cont_indent })
-          end
+          add_md_lines(content, ai_font, style.text, pad_x, {
+            bullet = bullet_str .. " ",
+            cont_indent = pad_x + ai_font:get_width(bullet_str .. " "),
+          })
         else
-          -- Normal paragraph
-          for _, wline in ipairs(wrap_text(line, ai_font, max_width)) do
-            add_rline(parse_md_inline(wline, style.text, ai_font), lh, {})
-          end
+          add_md_lines(line, ai_font, style.text, 0, {})
         end
       end
     end
@@ -631,6 +821,11 @@ function AIView:new()
   self._stream_proc = nil
   self._aborting = false
   self._new_btn_hover = false
+  -- copy button / link interaction state
+  self._copy_hover = nil   -- code bar whose copy button is hovered
+  self._link_hover = nil   -- URL hovered in the message area
+  self._copied_rline = nil -- code bar that was just copied
+  self._copied_at = nil
   -- Text selection in the message area.
   self._selecting = false   -- true while mouse drag-selecting
   self._sel_start = nil     -- {msg_idx, rline_idx, seg_idx, char_pos}
@@ -709,6 +904,10 @@ function AIView:update()
   end
   -- Force continuous redraw while streaming so the spinner animates.
   if self.streaming then core.redraw = true end
+  -- ...and while the copy button shows its "已复制" feedback.
+  if self._copied_at and system.get_time() - self._copied_at < 1.6 then
+    core.redraw = true
+  end
   -- Keep IME candidate window pinned to the input caret.
   if self.ime_status then self:update_ime_location() end
 end
@@ -969,6 +1168,62 @@ function AIView:_clear_selection()
   self._selecting = false
 end
 
+-------------------------------------------------------------------------------
+-- Per-code-block copy button
+-------------------------------------------------------------------------------
+local COPY_LABEL = "复制"
+local COPY_LABEL_DONE = "已复制"
+
+function AIView:_copy_btn_rect(rline, msg_x, msg_w, ly)
+  -- sized for the wider "已复制" label so the button does not jitter on click
+  local label_w = math.max(ai_font:get_width(COPY_LABEL), ai_font:get_width(COPY_LABEL_DONE))
+  local bw = label_w + math.floor(style.padding.x * 1.2)
+  local bh = math.min(rline.h, ai_font:get_height() + math.floor(4 * SCALE))
+  local bx = msg_x + msg_w - math.floor(style.padding.x * 1.1) - bw
+  local by = ly + math.floor((rline.h - bh) / 2)
+  return bx, by, bw, bh
+end
+
+-- Walk the same geometry draw() uses to find the copy button under (x, y).
+function AIView:_copy_btn_at(x, y)
+  local msg_x, msg_y, msg_w, msg_h = self:message_area()
+  if x < msg_x or x >= msg_x + msg_w or y < msg_y or y >= msg_y + msg_h then
+    return nil
+  end
+  local offset_y = msg_y - self.scroll.y
+  for _, blk in ipairs(self._wrapped or {}) do
+    local cum_y = offset_y + blk.y + blk.label_h
+    for _, rline in ipairs(blk.rlines) do
+      if rline.is_code_bar then
+        local ly = rline_text_top(rline, cum_y)
+        local bx, by, bw, bh = self:_copy_btn_rect(rline, msg_x, msg_w, ly)
+        if x >= bx and x < bx + bw and y >= by and y < by + bh then return rline end
+      end
+      cum_y = cum_y + rline_outer(rline)
+    end
+  end
+  return nil
+end
+
+function AIView:_copy_code(rline)
+  if not (rline and rline.code_text) then return end
+  system.set_clipboard(rline.code_text)
+  self._copied_rline = rline
+  self._copied_at = system.get_time()
+  core.log("已复制代码块（%d 字符）", #rline.code_text)
+  core.redraw = true
+end
+
+-- Link under (x, y), if any.
+function AIView:_link_at(x, y)
+  local pos = self:_hit_test_msg(x, y)
+  if not pos then return nil end
+  local blk = self._wrapped and self._wrapped[pos.msg_idx]
+  local rline = blk and blk.rlines[pos.rline_idx]
+  local seg = rline and rline.segments[pos.seg_idx]
+  return seg and seg.link
+end
+
 -- Handle clicks on the header "新对话" button and text selection in the
 -- message area; everything else delegates to the default View handler
 -- (scrollbar etc.).
@@ -978,6 +1233,12 @@ function AIView:on_mouse_pressed(button, x, y, clicks)
     if x >= nbx - math.floor(4 * SCALE) and x < nbx + nbw + math.floor(4 * SCALE)
        and y >= nby - math.floor(2 * SCALE) and y < nby + nbh + math.floor(2 * SCALE) then
       self:new_session()
+      return true
+    end
+    -- Copy button: must win over the drag-to-select handler below.
+    local btn = self:_copy_btn_at(x, y)
+    if btn then
+      self:_copy_code(btn)
       return true
     end
     -- Text selection in message area.
@@ -1008,6 +1269,18 @@ function AIView:on_mouse_moved(x, y, dx, dy)
     return true
   end
   if over then core.request_cursor("hand") end
+  -- copy buttons and links are clickable: show a hand and repaint on change
+  local btn = self:_copy_btn_at(x, y)
+  if btn ~= self._copy_hover then
+    self._copy_hover = btn
+    core.redraw = true
+  end
+  local link = btn and nil or self:_link_at(x, y)
+  if link ~= self._link_hover then
+    self._link_hover = link
+    core.redraw = true
+  end
+  if btn or link then core.request_cursor("hand") end
   return AIView.super.on_mouse_moved(self, x, y, dx, dy)
 end
 
@@ -1020,6 +1293,10 @@ function AIView:on_mouse_released(button, x, y)
         system.set_clipboard(text)
         core.log("已复制 %d 字", #text)
       end
+    else
+      -- a plain click (no drag) on a link opens it
+      local url = self:_link_at(x, y)
+      if url then open_url(url) end
     end
     core.redraw = true
     return true
@@ -1030,6 +1307,8 @@ end
 function AIView:on_mouse_left()
   self._new_btn_hover = false
   self._selecting = false
+  self._copy_hover = nil
+  self._link_hover = nil
   AIView.super.on_mouse_left(self)
 end
 
@@ -1875,7 +2154,29 @@ function AIView:draw()
               end
             end
             renderer.draw_text(seg.font, seg.text, sx + seg_pad, ly, seg.color)
+            -- link underline
+            if seg.underline then
+              local uw = seg.font:get_width(seg.text)
+              renderer.draw_rect(sx + seg_pad,
+                ly + math.min(rline.h, seg.font:get_height()) - 1,
+                uw, math.max(1, math.floor(1 * SCALE)), with_alpha(seg.color, 150))
+            end
             sx = sx + seg_advance(seg)
+          end
+          -- copy button, drawn on top of the bar
+          if rline.is_code_bar then
+            local bx, by, bw, bh = self:_copy_btn_rect(rline, msg_x, msg_w, ly)
+            local hovered = (self._copy_hover == rline)
+            local just = (self._copied_rline == rline)
+              and (system.get_time() - (self._copied_at or 0) < 1.6)
+            local label = just and COPY_LABEL_DONE or COPY_LABEL
+            local color = just and COLOR_OK
+              or (hovered and (style.accent or style.text) or style.dim)
+            renderer.draw_rect(bx, by, bw, bh,
+              with_alpha(style.text, hovered and 46 or 24))
+            renderer.draw_text(ai_font, label,
+              bx + math.floor((bw - ai_font:get_width(label)) / 2),
+              by + math.floor((bh - ai_font:get_height()) / 2), color)
           end
           cum_y = cum_y + rline_outer(rline)
         end
