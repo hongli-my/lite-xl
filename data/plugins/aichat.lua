@@ -15,6 +15,7 @@ local View = require "core.view"
 local RootView = require "core.rootview"
 local style = require "core.style"
 local process = require "core.process"
+local ime = require "core.ime"
 
 -------------------------------------------------------------------------------
 -- Configuration
@@ -544,6 +545,9 @@ function AIView:new()
   self._selecting = false   -- true while mouse drag-selecting
   self._sel_start = nil     -- {msg_idx, rline_idx, seg_idx, char_pos}
   self._sel_end = nil       -- same structure
+  -- IME composition state
+  self.ime_status = false
+  self.ime_text = ""
   local backend_now = config.plugins.aichat.backend or "pibridge"
   table.insert(self.messages, {
     role = "system",
@@ -615,6 +619,8 @@ function AIView:update()
   end
   -- Force continuous redraw while streaming so the spinner animates.
   if self.streaming then core.redraw = true end
+  -- Keep IME candidate window pinned to the input caret.
+  if self.ime_status then self:update_ime_location() end
 end
 
 function AIView:layout_messages()
@@ -896,6 +902,65 @@ function AIView:on_mouse_left()
 end
 
 function AIView:supports_text_input() return true end
+
+-- Compute the screen-space caret position in the input box (used for IME).
+-- Mirrors the logic in _draw_caret but returns coordinates instead of drawing.
+function AIView:_caret_screen_pos()
+  local x, y, w, h = self.position.x, self.position.y, self.size.x, self.size.y
+  local pad = style.padding
+  local lh = style.font:get_height()
+  local input_y = y + h - self.input_height
+  local itext_x = x + pad.x
+  local itext_y = input_y + pad.y
+  -- account for streaming spinner offset
+  if self.streaming then
+    local spinner_r = math.floor(7 * SCALE)
+    itext_x = itext_x + spinner_r * 2 + math.floor(6 * SCALE)
+  end
+  -- split input into lines, find which line the caret is on
+  local s = self.input
+  local lines = {}
+  local i, n = 1, #s
+  while i <= n do
+    local j = i
+    while j <= n and s:byte(j) ~= 10 do j = j + 1 end
+    lines[#lines + 1] = s:sub(i, j - 1)
+    i = j + 1
+  end
+  if #lines == 0 then lines = {""} end
+  local target = self.caret
+  local line_idx, col = 1, 1
+  local acc = 0
+  for li, line in ipairs(lines) do
+    local line_start = acc + 1
+    local line_end = acc + #line
+    if target >= line_start and target <= line_end + 1 then
+      line_idx, col = li, target - line_start + 1
+      break
+    end
+    acc = acc + #line + 1
+  end
+  local before = (lines[line_idx] or ""):sub(1, col - 1)
+  local cx = itext_x + style.font:get_width(before)
+  local cy = itext_y + (line_idx - 1) * lh
+  return cx, cy, lh
+end
+
+-- Set the IME candidate window location to the input caret position.
+function AIView:update_ime_location()
+  if not self.ime_status and core.active_view ~= self then return end
+  local cx, cy, lh = self:_caret_screen_pos()
+  ime.set_location(cx, cy, math.max(2, math.floor(4 * SCALE)), lh)
+end
+
+function AIView:on_ime_text_editing(text, start, length)
+  self.ime_status = #text > 0
+  self.ime_text = text
+  if self.ime_status then
+    self:update_ime_location()
+  end
+  core.redraw = true
+end
 
 function AIView:on_text_input(text)
   self.input = self.input:sub(1, self.caret - 1) .. text .. self.input:sub(self.caret)
