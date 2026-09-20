@@ -170,6 +170,28 @@ static void push_win32_error(lua_State *L, DWORD rc) {
 }
 #endif
 
+#ifdef __APPLE__
+/* macOS turns cmd+w into a window close request: AppKit calls performClose:
+** on the window, the window delegate answers windowShouldClose: with NO (so
+** the window itself is not closed), and SDL then posts SDL_EVENT_QUIT
+** because this is the only toplevel window.
+**
+** Lite XL handles cmd+w itself -- the keymapper closes the active tab -- so
+** that quit event must not reach the editor. Flushing the event queue while
+** handling the key events below is not enough: the close request is not
+** always queued by then (while the window is in fullscreen it arrives after
+** the key events), and the editor would exit instead of closing a tab.
+** Remember when a cmd+w key event was seen and drop quit events that follow
+** it closely. A quit the user really asked for (cmd+q, the window button) is
+** never preceded by cmd+w. */
+#define CMD_W_QUIT_IGNORE_MS 1000
+static Uint64 last_cmd_w_ticks = 0;
+
+static bool event_is_cmd_w(const SDL_Event *e) {
+  return (e->key.key == SDLK_W) && (e->key.mod & SDL_KMOD_GUI);
+}
+#endif
+
 static int f_poll_event(lua_State *L) {
   char buf[16];
   float mx, my;
@@ -184,6 +206,12 @@ top:
 
   switch (e.type) {
     case SDL_EVENT_QUIT:
+#ifdef __APPLE__
+      if (last_cmd_w_ticks != 0 &&
+          (SDL_GetTicks() - last_cmd_w_ticks) < CMD_W_QUIT_IGNORE_MS) {
+        goto top;
+      }
+#endif
       lua_pushstring(L, "quit");
       return 1;
 
@@ -248,7 +276,8 @@ top:
       /* on macos 11.2.3 with sdl 2.0.14 the keyup handler for cmd+w below
       ** was not enough. Maybe the quit event started to be triggered from the
       ** keydown handler? In any case, flushing the quit event here too helped. */
-      if ((e.key.key == SDLK_W) && (e.key.mod & SDL_KMOD_GUI)) {
+      if (event_is_cmd_w(&e)) {
+        last_cmd_w_ticks = SDL_GetTicks();
         SDL_FlushEvent(SDL_EVENT_QUIT);
       }
 #endif
@@ -262,7 +291,8 @@ top:
       ** we want to flush this event and let the keymapper
       ** handle this key combination.
       ** Thanks to mathewmariani, taken from his lite-macos github repository. */
-      if ((e.key.key == SDLK_W) && (e.key.mod & SDL_KMOD_GUI)) {
+      if (event_is_cmd_w(&e)) {
+        last_cmd_w_ticks = SDL_GetTicks();
         SDL_FlushEvent(SDL_EVENT_QUIT);
       }
 #endif

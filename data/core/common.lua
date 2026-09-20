@@ -153,7 +153,10 @@ end
 
 local function compare_score(a, b)
   if a.score == b.score then
-    return a.text < b.text
+    -- Compare the string that was matched. `text` is not necessarily a
+    -- string (autocomplete stores item tables here), so it cannot be used
+    -- directly as sort key.
+    return a.key < b.key
   end
   return a.score > b.score
 end
@@ -162,9 +165,10 @@ local function fuzzy_match_items(items, needle, files)
   local res = {}
   needle = (PLATFORM == "Windows" and files) and needle:gsub('/', PATHSEP) or needle
   for _, item in ipairs(items) do
-    local score = system.fuzzy_match(tostring(item), needle, files)
+    local key = tostring(item)
+    local score = system.fuzzy_match(key, needle, files)
     if score then
-      table.insert(res, { text = item, score = score })
+      table.insert(res, { key = key, text = item, score = score })
     end
   end
   table.sort(res, compare_score)
