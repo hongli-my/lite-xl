@@ -20,6 +20,12 @@ local DocView
 local Doc
 local Project
 
+-- Name/time of the command the keymap performed last.  The macOS native menu
+-- bar (src/bundle_open.m) mirrors the keymap shortcuts, and SDL hands the very
+-- same key press to the keymap as well, so the duplicate menu event has to be
+-- dropped -- see the "menucmd" handler in core.on_event.
+local last_command_name, last_command_time
+
 local core = {}
 
 local function load_session()
@@ -302,6 +308,18 @@ function core.init()
   Project = require "core.project"
   DocView = require "core.docview"
   Doc = require "core.doc"
+
+  -- See `last_command_name`: the native macOS menu bar mirrors the shortcuts
+  -- already bound in data/core/keymap-macos.lua, so one physical key press
+  -- reaches the editor twice -- once through SDL (handled by the keymap) and
+  -- once through the menu (bundle_open.m queues a "menucmd" event).  Record
+  -- what the keymap performed so that the menu event can be recognized as the
+  -- duplicate it is.
+  local perform = command.perform
+  command.perform = function(name, ...)
+    last_command_name, last_command_time = name, system.get_time()
+    return perform(name, ...)
+  end
 
   if PATHSEP == '\\' then
     USERDIR = common.normalize_volume(USERDIR)
@@ -960,7 +978,16 @@ function core.on_event(type, ...)
     -- it through the event queue instead of calling into Lua from AppKit, so
     -- it is performed here, at a safe point of the frame.
     local cmd = ...
-    if cmd and cmd ~= "" then
+    -- AppKit performs the menu item for its key equivalent *and* SDL feeds the
+    -- same key press to the keymap (SDL3Application.sendEvent: dispatches the
+    -- event to SDL before calling super), so a mirrored shortcut used to run
+    -- its command twice: two pasted copies, two tabs closed, undo applied
+    -- twice, ...  The menu event is queued right after the key press, so drop
+    -- it when the keymap just ran the same command.  Picking the item with the
+    -- mouse is unaffected: that is the only path then.
+    local duplicate = last_command_name == cmd and last_command_time
+      and (system.get_time() - last_command_time) < 0.15
+    if cmd and cmd ~= "" and not duplicate then
       command.perform(cmd)
     end
   elseif type == "focuslost" then

@@ -89,8 +89,9 @@ static void install_main_menu(void) {
     add_menu_item(m, @"重做",   @"doc:redo",  @"Z");
     add_menu_item(m, @"剪切",   @"doc:cut",   @"x");
     add_menu_item(m, @"复制",   @"doc:copy",  @"c");
-    add_menu_item(m, @"粘贴",   @"doc:paste", @"v");
-    add_menu_item(m, @"查找…",  @"find-replace:replace", @"f");
+    add_menu_item(m, @"粘贴",   @"doc:paste",  @"v");
+    add_menu_item(m, @"查找…",  @"find-replace:find",    @"f");
+    add_menu_item(m, @"替换…",  @"find-replace:replace", @"r");
   }
   {
     NSMenuItem *g = [main_menu addItemWithTitle:@"视图" action:NULL keyEquivalent:@""];
