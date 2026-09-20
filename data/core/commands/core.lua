@@ -34,7 +34,7 @@ local function open_file(use_dialog)
       if use_dialog then
         default_text = dirname
       else
-        dirname = core.normalize_to_project_dir(dirname)
+        dirname = core.root_project():normalize_path(dirname)
         default_text = dirname == core.root_project().path and "" or common.home_encode(dirname) .. PATHSEP
       end
     end
@@ -59,14 +59,14 @@ local function open_file(use_dialog)
   core.command_view:enter("Open File", {
     text = default_text,
     submit = function(text)
-      local filename = core.project_absolute_path(common.home_expand(text))
+      local filename = core.root_project():absolute_path(common.home_expand(text))
       core.root_view:open_doc(core.open_doc(filename))
     end,
     suggest = function (text)
       return common.home_encode_list(common.path_suggest(common.home_expand(text), core.root_project() and core.root_project().path))
     end,
     validate = function(text)
-        local filename = core.project_absolute_path(common.home_expand(text))
+        local filename = core.root_project():absolute_path(common.home_expand(text))
         local path_stat, err = system.get_file_info(filename)
         if err then
           if err:find("No such file", 1, true) then
