@@ -26,6 +26,14 @@ require "colors.slate"
 -- Do not allow scrolling past the end of the document.
 config.scroll_past_end = false
 
+-- Soft-wrap lines that are wider than the view instead of letting them run off
+-- the right edge.  This is the `linewrapping` plugin's default; toggle it for
+-- the current view with F10 (`line-wrapping:toggle`) and override it per
+-- project from `.lite_project.lua`.
+config.plugins.linewrapping = {
+  enable_by_default = true,
+}
+
 -------------------------------------------------------------------------------
 -- Fonts
 -------------------------------------------------------------------------------
