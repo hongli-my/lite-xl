@@ -164,7 +164,9 @@ function DocView:get_visible_content_width()
   end
 
   local width = 0
-  local gutter_width = self:get_gutter_width()
+  -- the reserved widget strip on the right takes part in the horizontal
+  -- scrolling: the end of a long line must be able to come out from under it
+  local gutter_width = self:get_gutter_width() + self:get_right_inset()
   local padding = style.padding.x
   -- A conservative lower bound of a glyph's advance, used both to derive the
   -- number of columns to measure and to estimate very long lines.
@@ -232,6 +234,17 @@ end
 function DocView:get_gutter_width()
   local padding = style.padding.x * 2
   return self:get_font():get_width(#self.doc.lines) + padding, padding
+end
+
+
+---Extra width to reserve on the right edge of the view.
+---
+---Widgets drawn over the text by a plugin (the find bar's buttons) need to keep
+---the text from running underneath them, so this is subtracted from the area
+---the text is clipped to.  Zero for a plain document.
+---@return number
+function DocView:get_right_inset()
+  return 0
 end
 
 
@@ -692,9 +705,10 @@ function DocView:draw()
 
   local pos = self.position
   x, y = self:get_line_screen_position(minline)
-  -- the clip below ensure we don't write on the gutter region. On the
-  -- right side it is redundant with the Node's clip.
-  core.push_clip_rect(pos.x + gw, pos.y, self.size.x - gw, self.size.y)
+  -- the clip below ensure we don't write on the gutter region, nor under the
+  -- widgets a plugin reserved with `get_right_inset`. On the right side it is
+  -- otherwise redundant with the Node's clip.
+  core.push_clip_rect(pos.x + gw, pos.y, self.size.x - gw - self:get_right_inset(), self.size.y)
   for i = minline, maxline do
     y = y + (self:draw_line_body(i, x, y) or lh)
   end
