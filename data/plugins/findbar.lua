@@ -1,4 +1,4 @@
--- mod-version:4 --priority:20
+-- mod-version:4 --priority:120
 -- findbar: a Sublime-style find bar docked above the status bar.
 --
 -- The stock find (`core/commands/findreplace.lua`) reuses the single
@@ -302,6 +302,9 @@ function FindField:new(kind)
   self.kind = kind
   self.visible = false
   self.size.y = 0
+  -- width of the empty space in front of the query: the row is lined up with
+  -- the document's text column (see get_gutter_width)
+  self.left_inset = 0
   self.controls = {}
   self.controls_width = 0
   self.hovered_control = nil
@@ -463,9 +466,11 @@ function FindField:get_right_inset()
   return self.controls_width + style.padding.x
 end
 
+---No visible gutter, but the row reserves the same width as the line number
+---area of the document it belongs to, so that the query starts exactly where
+---the code does.  `left_inset` is kept up to date by the engine.
 function FindField:get_gutter_width()
-  -- no gutter: the query starts at the left edge of the row
-  return 0, 0
+  return self.left_inset or 0, 0
 end
 
 ---The inherited CommandView implementation draws a label in the gutter; the bar
@@ -898,6 +903,11 @@ function tick()
   local field = state.field
   if not field or not state.doc then return end
 
+  -- keep the two rows aligned with the document's text column
+  local inset = state.target:get_gutter_width()
+  field.left_inset = inset
+  state.field_replace.left_inset = inset
+
   -- the tab we were searching is gone
   if not core.root_view.root_node:get_node_for_view(state.target) then
     close_bar()
@@ -1222,13 +1232,46 @@ state.field = find_field
 state.field_replace = replace_field
 
 -- Locked nodes take their size from their view's `size.y`, which
--- `FindField:update` animates between 0 and one row.  Docking them above the
--- status bar gives a full width bar that never overlaps the document; the
--- replace row sits directly above the status bar, the find row above it.
+-- `FindField:update` animates between 0 and one row.
+--
+-- Docking: the bar belongs to the *editing area*, not to the window.  The
+-- sidebar and the AI panel dock into the document leaf themselves and they load
+-- before us (see the plugin priority), so the primary node is exactly the area
+-- the code lives in: docking there lines the query up with the code, gives the
+-- sidebar its full height back, and keeps the bar off the parts of the window
+-- that are not the editor.  Docking into the root chain instead spans the whole
+-- window, i.e. the input starts underneath the sidebar.
+--
+-- The rows go at the *bottom* of that area (above the status bar), like
+-- Sublime's find panel: the document keeps the top of the screen, the panel
+-- grows from the bottom edge of the editor.
 do
-  local status_node = core.root_view.root_node:get_node_for_view(core.status_view)
-  if status_node then
-    replace_field.node = status_node:split("up", replace_field, { y = true })
+  -- Reuse the nodes of a previous load (core:reload-module while hacking on
+  -- this file): docking a second time would leave the old rows behind.
+  local function take_over(field)
+    for _, v in ipairs(core.root_view.root_node:get_children()) do
+      if v ~= field and v.kind == field.kind and v.__tostring and v:__tostring() == "FindField" then
+        local node = core.root_view.root_node:get_node_for_view(v)
+        if node and #node.views == 1 then
+          node.views[1] = field
+          node.active_view = field
+          field.node = node
+          return true
+        end
+      end
+    end
+    return false
+  end
+
+  local node = core.root_view:get_primary_node()
+  if not take_over(replace_field) and node and node.type == "leaf" then
+    -- the replace row goes directly under the document...
+    replace_field.node = node:split("down", replace_field, { y = true })
+  end
+  if not take_over(find_field) and replace_field.node then
+    -- ...and the find row right above it: the bar sits at the bottom of the
+    -- editing area, just above the status bar, with Find over Replace -- the
+    -- order Sublime's panel uses
     find_field.node = replace_field.node:split("up", find_field, { y = true })
   end
 end
