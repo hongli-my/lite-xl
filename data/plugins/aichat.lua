@@ -1740,6 +1740,8 @@ end
 --   POST /abort           {session_id}               -> {ok}
 -- SSE frames: "data: {json}\n\n", heartbeat ": ping\n\n".
 --   text_delta: {"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"..."}}
+--   thinking_delta: 同样的 assistantMessageEvent 形状，内容是模型的思考过程；
+--                   面板不显示，直接忽略（只渲染 text_delta）。
 --   error:      {"type":"message_end","message":{"stopReason":"error","errorMessage":"..."}}
 --   done:       {"type":"agent_settled"}
 -------------------------------------------------------------------------------
@@ -1786,7 +1788,8 @@ function AIView:_handle_sse_frame(data, assistant_idx)
   local t = obj.type
   if t == "message_update" and obj.assistantMessageEvent then
     local ae = obj.assistantMessageEvent
-    if (ae.type == "text_delta" or ae.type == "thinking_delta") and ae.delta then
+    -- 只渲染正式回答。thinking_delta 是模型的思考过程，面板不显示。
+    if ae.type == "text_delta" and ae.delta then
       self.messages[assistant_idx].content =
         self.messages[assistant_idx].content .. ae.delta
       self._dirty = true
