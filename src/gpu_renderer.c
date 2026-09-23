@@ -265,7 +265,7 @@ static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
   ci.vertex_input_state.num_vertex_buffers = 1;
   ci.vertex_input_state.vertex_attributes = attrs;
   ci.vertex_input_state.num_vertex_attributes = 2;
-  ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+  ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
   ci.rasterizer_state = (SDL_GPURasterizerState){
     .fill_mode = SDL_GPU_FILLMODE_FILL,
     .cull_mode = SDL_GPU_CULLMODE_NONE,
@@ -814,7 +814,8 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   SDL_DestroySurface(rgba);
 
   /* Push a textured quad. UV maps the sub-region used (image may be smaller
-   * than the cached texture). Text pipeline color mode = standard blend. */
+   * than the cached texture). Text pipeline color mode = standard blend.
+   * Triangle list: 6 verts (TL,BL,TR + TR,BL,BR). */
   float x0 = (float)(rect.x * ss), y0 = (float)(rect.y * ss);
   float x1 = x0 + dw, y1 = y0 + dh;
   float umax = (float)iw / s->image_tex_w;
@@ -823,15 +824,17 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   v[0] = (GpuVertex){ x0, y0, 0, 0 };
   v[1] = (GpuVertex){ x0, y1, 0, vmax };
   v[2] = (GpuVertex){ x1, y0, umax, 0 };
-  v[3] = (GpuVertex){ x1, y1, umax, vmax };
+  v[3] = (GpuVertex){ x1, y0, umax, 0 };
+  v[4] = (GpuVertex){ x0, y1, 0, vmax };
+  v[5] = (GpuVertex){ x1, y1, umax, vmax };
   Uint32 off = s->vbuf_used;
-  s->vbuf_used += 4;
+  s->vbuf_used += 6;
 
   GpuDrawCmd *d = push_draw(s);
   if (!d) return;
   d->kind = GPU_DRAW_TEXT;  /* reuse text pipeline (color mode) */
   d->vert_offset = off;
-  d->vert_count = 4;
+  d->vert_count = 6;
   d->clip = (SDL_FRect){ (float)(clip.x * ss), (float)(clip.y * ss),
                          (float)(clip.width * ss), (float)(clip.height * ss) };
   d->funiform[0] = 1.0f;  /* white tint */

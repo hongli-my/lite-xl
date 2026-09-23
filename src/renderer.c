@@ -824,6 +824,15 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
   int font_height = ren_font_group_get_height(fonts) * surface_scale;
   int baseline = fonts[0]->baseline * surface_scale;
 
+  /* Batch consecutive glyph quads that share the same atlas texture + format
+   * into a single draw call. Reduces draw calls from O(glyphs) to
+   * O(atlas-surface-changes). Uses TRIANGLE_LIST (6 verts/quad). */
+  enum { BATCH_CAP = 2048 };
+  GpuTextVertex batch[BATCH_CAP];
+  int batch_count = 0;
+  void *batch_tex = NULL;
+  int batch_mode = -1;
+
   while (text < end) {
     unsigned int codepoint;
     text = utf8_to_codepoint(text, end, &codepoint);
@@ -836,9 +845,14 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
     int end_x = metric->x1 + start_x;
 
     /* Missing glyph box (same as CPU path) */
-    if (!font_surface && !is_whitespace(codepoint))
+    if (!font_surface && !is_whitespace(codepoint)) {
+      if (batch_count > 0) {
+        gpu_draw_text_quads(ren, batch_tex, batch, batch_count, color, batch_mode, clip_phys);
+        batch_count = 0;
+      }
       gpu_draw_rect(ren, (RenRect){ start_x + 1, y,
         (int)font->space_advance - 1, font_height }, color, clip);
+    }
 
     if (!is_whitespace(codepoint) && font_surface && color.a > 0) {
       GlyphAtlas *atlas = &font->glyphs.atlas[metric->format][metric->atlas_idx];
@@ -852,13 +866,24 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
         float v0 = (float)metric->y0 / surf_h;
         float v1 = (float)metric->y1 / surf_h;
 
-        GpuTextVertex verts[4];
-        /* Triangle strip: TL, BL, TR, BR */
-        verts[0] = (GpuTextVertex){ (float)start_x, (float)gy, 0.0f, v0 };
-        verts[1] = (GpuTextVertex){ (float)start_x, (float)(gy + gh), 0.0f, v1 };
-        verts[2] = (GpuTextVertex){ (float)end_x,  (float)gy, u1, v0 };
-        verts[3] = (GpuTextVertex){ (float)end_x,  (float)(gy + gh), u1, v1 };
-        gpu_draw_text_quads(ren, tex, verts, 4, color, metric->format, clip_phys);
+        /* Flush if texture/mode changed or buffer is full. */
+        if (batch_count > 0 && (tex != batch_tex || metric->format != batch_mode
+                                || batch_count + 6 > BATCH_CAP)) {
+          gpu_draw_text_quads(ren, batch_tex, batch, batch_count, color, batch_mode, clip_phys);
+          batch_count = 0;
+        }
+        batch_tex = tex;
+        batch_mode = metric->format;
+
+        /* Triangle list: TL,BL,TR + TR,BL,BR */
+        float sx = (float)start_x, ex = (float)end_x;
+        float ty = (float)gy, by = (float)(gy + gh);
+        batch[batch_count++] = (GpuTextVertex){ sx, by, 0.0f, v1 };
+        batch[batch_count++] = (GpuTextVertex){ sx, ty, 0.0f, v0 };
+        batch[batch_count++] = (GpuTextVertex){ ex, by, u1, v1 };
+        batch[batch_count++] = (GpuTextVertex){ ex, by, u1, v1 };
+        batch[batch_count++] = (GpuTextVertex){ sx, ty, 0.0f, v0 };
+        batch[batch_count++] = (GpuTextVertex){ ex, ty, u1, v0 };
       }
     }
 
@@ -882,6 +907,8 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
 
     pen_x += adv;
   }
+  if (batch_count > 0)
+    gpu_draw_text_quads(ren, batch_tex, batch, batch_count, color, batch_mode, clip_phys);
   return pen_x / surface_scale;
 }
 #endif /* LITE_USE_GPU_RENDERER */
