@@ -457,6 +457,9 @@ static bool ensure_resources(GpuWindowState *s, int w, int h) {
  * NOT allowed (SDL_gpu requires SDL_GPUBuffer). So we need a GPU vertex
  * buffer + upload. We allocate one big enough for the whole frame. */
 
+static Uint32 g_frame_count = 0;
+static Uint32 g_gpu_draw_total = 0;
+
 bool gpu_begin_frame(RenWindow *ren) {
   if (!g_ctx.device || !ren || !ren->gpu_state) return false;
   GpuWindowState *s = ren->gpu_state;
@@ -464,6 +467,10 @@ bool gpu_begin_frame(RenWindow *ren) {
   RenSurface rs = renwin_get_surface(ren);
   int w = rs.surface->w, h = rs.surface->h;
   if (!ensure_resources(s, w, h)) { fprintf(stderr, "[gpu] begin_frame: ensure_resources FAILED\n"); return false; }
+
+  g_frame_count++;
+  if (g_frame_count == 1)
+    fprintf(stderr, "[gpu] GPU render path active (Metal)\n");
 
   /* Map the vertex transfer buffer for streaming verts during the frame. */
   s->vbuf_mapped = SDL_MapGPUTransferBuffer(g_ctx.device, s->vbuf_xfer, true);
@@ -829,6 +836,12 @@ void gpu_end_frame(RenWindow *ren) {
   if (!submitted) {
     fprintf(stderr, "[gpu] end_frame SubmitGPUCommandBuffer failed: %s\n",
             SDL_GetError());
+  }
+  g_gpu_draw_total += s->draws_count;
+  if ((g_frame_count % 300) == 0) {
+    fprintf(stderr, "[gpu] %u frames | draws/frame: %u | verts: %u | "
+            "atlas uploads: %d\n",
+            g_frame_count, s->draws_count, s->vbuf_used, g_upload_count);
   }
   s->cmd = NULL;
   s->vbuf_used = 0;
