@@ -42,13 +42,13 @@ typedef struct {
 } GpuVertex;
 
 /* A deferred draw command. We collect these during the frame (while the
- * transfer buffer is mapped) and replay them inside the render pass in
- * gpu_end_frame, after uploading all verts in a single copy pass. This is
- * necessary because SDL_gpu forbids beginning a copy pass while a render
- * pass is active. */
+ * vertex transfer buffer is mapped) and replay them inside the render pass in
+ * gpu_end_frame, after uploading all verts + dirty atlas regions in one or
+ * more copy passes. This is necessary because SDL_gpu forbids beginning a
+ * copy pass while a render pass is active. */
 typedef enum {
   GPU_DRAW_RECT,
-  GPU_DRAW_TEXT,  /* Stage 2b */
+  GPU_DRAW_TEXT,
 } GpuDrawKind;
 
 typedef struct {
@@ -56,7 +56,9 @@ typedef struct {
   Uint32 vert_offset;  /* index into the vertex transfer buffer */
   Uint32 vert_count;
   SDL_FRect clip;      /* scissor in pixels (0,0,0,0 = full target) */
-  float funiform[4];   /* fragment uniform (color / mode packed) */
+  float funiform[8];   /* fragment uniform: rect={color.rgba,_,_,_,_},
+                        * text={color.rgba, mode.x,0,0,0} */
+  void *texture;       /* SDL_GPUTexture* for text; NULL for rect */
 } GpuDrawCmd;
 
 /* Per-window GPU state. */
@@ -87,7 +89,35 @@ typedef struct {
   /* Current command buffer (valid between begin/end_frame). */
   SDL_GPUCommandBuffer *cmd;
   SDL_GPURenderPass *pass;
+  bool need_clear;   /* true after (re)creating target_tex */
 } GpuWindowState;
+
+/*----------------------------------------------------------------------------
+ * Glyph atlas GPU texture management
+ *
+ * CPU surfaces (in renderer.c GlyphAtlas) are mirrored to GPU textures.
+ * When a glyph is first rasterized, renderer.c calls gpu_atlas_mark_dirty().
+ * At gpu_end_frame, all dirty regions are uploaded (with pixel format
+ * conversion) in copy passes before the render pass begins.
+ *
+ * Format mapping (SDL_gpu has no R8G8B8, so LCD/color expand to RGBA):
+ *   Grayscale (INDEX8, 1B/px) -> R8_UNORM        (direct copy)
+ *   Subpixel  (RGB24,  3B/px) -> R8G8B8A8_UNORM  (RGB->RGBA, A=255)
+ *   Color     (BGRA32, 4B/px) -> R8G8B8A8_UNORM  (BGRA->RGBA, swap R/B)
+ *--------------------------------------------------------------------------*/
+typedef struct {
+  void *tex;          /* SDL_GPUTexture* */
+  SDL_Surface *surf;  /* CPU source surface */
+  SDL_Rect dirty;     /* merged dirty region in surf coordinates */
+  int fmt;            /* 0=grayscale, 1=subpixel, 2=color */
+} AtlasUpload;
+
+static AtlasUpload *g_uploads = NULL;
+static int g_upload_count = 0, g_upload_cap = 0;
+
+/* Transfer buffer for atlas uploads (grown as needed). */
+static SDL_GPUTransferBuffer *g_atlas_xfer = NULL;
+static Uint32 g_atlas_xfer_size = 0;
 
 /* Shared, device-wide resources (created once in gpu_init). */
 typedef struct {
@@ -185,6 +215,58 @@ static SDL_GPUGraphicsPipeline *make_rect_pipeline(void) {
   return p;
 }
 
+static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
+  /* Same vertex layout as rect (float2 pos + float2 texcoord, 16 bytes).
+   * Blend is DISABLED: the fragment shader uses Metal framebuffer fetch
+   * ([[color(0)]]) to read the destination pixel and composite in-shader,
+   * which replaces dual-source blending (SDL_gpu 3.2.8 has no SRC1_COLOR).
+   * The render pass must use load_op=CLEAR or LOAD (not DONTCARE). */
+  static const SDL_GPUVertexBufferDescription vbuf_desc = {
+    .slot = 0,
+    .pitch = sizeof(GpuVertex),
+    .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX,
+    .instance_step_rate = 0,
+  };
+  static const SDL_GPUVertexAttribute attrs[2] = {
+    { .location = 0, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
+    { .location = 1, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 8 },
+  };
+  SDL_GPUColorTargetBlendState blend = {0};
+  blend.enable_blend = false;  /* framebuffer fetch composites in-shader */
+  blend.enable_color_write_mask = false;
+
+  SDL_GPUGraphicsPipelineCreateInfo ci = {0};
+  ci.vertex_shader = g_ctx.text_vs;
+  ci.fragment_shader = g_ctx.text_fs;
+  ci.vertex_input_state.vertex_buffer_descriptions = &vbuf_desc;
+  ci.vertex_input_state.num_vertex_buffers = 1;
+  ci.vertex_input_state.vertex_attributes = attrs;
+  ci.vertex_input_state.num_vertex_attributes = 2;
+  ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+  ci.rasterizer_state = (SDL_GPURasterizerState){
+    .fill_mode = SDL_GPU_FILLMODE_FILL,
+    .cull_mode = SDL_GPU_CULLMODE_NONE,
+  };
+  ci.multisample_state = (SDL_GPUMultisampleState){
+    .sample_count = SDL_GPU_SAMPLECOUNT_1,
+  };
+  ci.target_info = (SDL_GPUGraphicsPipelineTargetInfo){0};
+  SDL_GPUColorTargetDescription ctd = {0};
+  ctd.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+  ctd.blend_state = blend;
+  ci.target_info.color_target_descriptions = &ctd;
+  ci.target_info.num_color_targets = 1;
+
+  SDL_GPUGraphicsPipeline *p =
+    SDL_CreateGPUGraphicsPipeline(g_ctx.device, &ci);
+  if (!p)
+    fprintf(stderr, "gpu: CreateGPUGraphicsPipeline(text) failed: %s\n",
+            SDL_GetError());
+  return p;
+}
+
 /*----------------------------------------------------------------------------
  * Device lifecycle
  *--------------------------------------------------------------------------*/
@@ -216,6 +298,9 @@ bool gpu_init(void) {
   g_ctx.rect_pipeline = make_rect_pipeline();
   if (!g_ctx.rect_pipeline) return false;
 
+  g_ctx.text_pipeline = make_text_pipeline();
+  if (!g_ctx.text_pipeline) return false;
+
   /* Shared sampler for glyph atlas (Stage 2b). */
   SDL_GPUSamplerCreateInfo sci = {0};
   sci.min_filter = SDL_GPU_FILTER_LINEAR;
@@ -244,6 +329,9 @@ void gpu_free(void) {
   if (g_ctx.rect_fs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.rect_fs);
   if (g_ctx.text_vs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.text_vs);
   if (g_ctx.text_fs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.text_fs);
+  if (g_atlas_xfer) { SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer); g_atlas_xfer = NULL; }
+  g_atlas_xfer_size = 0;
+  SDL_free(g_uploads); g_uploads = NULL; g_upload_count = g_upload_cap = 0;
   SDL_DestroyGPUDevice(g_ctx.device);
   g_ctx.device = NULL;
   memset(&g_ctx, 0, sizeof(g_ctx));
@@ -321,6 +409,7 @@ static bool ensure_resources(GpuWindowState *s, int w, int h) {
     }
     s->target_w = w;
     s->target_h = h;
+    s->need_clear = true;
     /* Surface upload buffer is size-dependent; recreate on resize. */
     if (s->surf_xfer) {
       SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->surf_xfer);
@@ -368,11 +457,6 @@ static bool ensure_resources(GpuWindowState *s, int w, int h) {
  * NOT allowed (SDL_gpu requires SDL_GPUBuffer). So we need a GPU vertex
  * buffer + upload. We allocate one big enough for the whole frame. */
 
-/* Extended per-window state: add a vertex GPU buffer. We piggyback on
- * GpuWindowState by adding the field via a parallel struct; but since
- * ren->gpu_state is void*, we just cast. Let's extend the struct. */
-/* (The struct above already lacks a GPU vertex buffer; we add it here.) */
-
 bool gpu_begin_frame(RenWindow *ren) {
   if (!g_ctx.device || !ren || !ren->gpu_state) return false;
   GpuWindowState *s = ren->gpu_state;
@@ -416,10 +500,8 @@ static GpuDrawCmd *push_draw(GpuWindowState *s) {
   }
   return &s->draws[s->draws_count++];
 }
-static void flush_verts(RenWindow *ren, Uint32 vert_count) {
-  (void)ren; (void)vert_count;
-  /* Obsolete: draw commands are now deferred and replayed in gpu_end_frame. */
-}
+
+
 
 void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
                    RenRect clip) {
@@ -449,58 +531,197 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   d->funiform[1] = color.g / 255.0f;
   d->funiform[2] = color.b / 255.0f;
   d->funiform[3] = color.a / 255.0f;
+  d->texture = NULL;
 }
 
-void gpu_draw_text(RenWindow *ren, RenRect clip) {
-  (void)ren; (void)clip;
-  /* Stage 2b: glyph atlas upload + textured draw. Stub for now. */
-}
+/*----------------------------------------------------------------------------
+ * Glyph atlas GPU texture management
+ *--------------------------------------------------------------------------*/
 
-void gpu_set_scissor(RenWindow *ren, RenRect clip) {
-  GpuWindowState *s = ren->gpu_state;
-  if (!s || !s->pass) return;
-  SDL_Rect sc;
-  if (clip.width <= 0 || clip.height <= 0) {
-    sc = (SDL_Rect){ 0, 0, s->target_w, s->target_h };
-  } else {
-    sc = (SDL_Rect){ clip.x, clip.y, clip.width, clip.height };
+static SDL_GPUTextureFormat atlas_gpu_format(int fmt) {
+  switch (fmt) {
+    case 0: return SDL_GPU_TEXTUREFORMAT_R8_UNORM;       /* grayscale */
+    default: return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM; /* LCD, color */
   }
-  SDL_SetGPUScissor(s->pass, &sc);
+}
+
+void *gpu_atlas_create_texture(int w, int h, int fmt) {
+  if (!g_ctx.device) return NULL;
+  SDL_GPUTextureCreateInfo tci = {0};
+  tci.type = SDL_GPU_TEXTURETYPE_2D;
+  tci.format = atlas_gpu_format(fmt);
+  tci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+  tci.width = (Uint32)w;
+  tci.height = (Uint32)h;
+  tci.layer_count_or_depth = 1;
+  tci.num_levels = 1;
+  tci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+  SDL_GPUTexture *tex = SDL_CreateGPUTexture(g_ctx.device, &tci);
+  if (!tex)
+    fprintf(stderr, "gpu: atlas CreateGPUTexture failed: %s\n", SDL_GetError());
+  return tex;
+}
+
+void gpu_atlas_destroy_texture(void *tex) {
+  if (g_ctx.device && tex)
+    SDL_ReleaseGPUTexture(g_ctx.device, (SDL_GPUTexture *)tex);
+}
+
+void gpu_atlas_mark_dirty(void *tex, SDL_Surface *surf,
+                          int x, int y, int w, int h, int fmt) {
+  if (!tex || !surf || w <= 0 || h <= 0) return;
+  /* Find existing entry for this texture (merge dirty rect). */
+  for (int i = 0; i < g_upload_count; i++) {
+    if (g_uploads[i].tex == tex) {
+      SDL_Rect *d = &g_uploads[i].dirty;
+      int x0 = d->x < x ? d->x : x;
+      int y0 = d->y < y ? d->y : y;
+      int x1 = (d->x + d->w) > (x + w) ? (d->x + d->w) : (x + w);
+      int y1 = (d->y + d->h) > (y + h) ? (d->y + d->h) : (y + h);
+      d->x = x0; d->y = y0; d->w = x1 - x0; d->h = y1 - y0;
+      return;
+    }
+  }
+  if (g_upload_count == g_upload_cap) {
+    int nc = g_upload_cap ? g_upload_cap * 2 : 32;
+    AtlasUpload *nd = SDL_realloc(g_uploads, nc * sizeof(AtlasUpload));
+    if (!nd) return;
+    g_uploads = nd;
+    g_upload_cap = nc;
+  }
+  g_uploads[g_upload_count].tex = tex;
+  g_uploads[g_upload_count].surf = surf;
+  g_uploads[g_upload_count].dirty = (SDL_Rect){ x, y, w, h };
+  g_uploads[g_upload_count].fmt = fmt;
+  g_upload_count++;
+}
+
+/* Copy a dirty region from the CPU surface to the transfer buffer,
+ * converting pixel format as needed. dst is RGBA32 (4 B/px) or R8 (1 B/px)
+ * depending on the GPU texture format. */
+static void copy_atlas_region(Uint8 *dst, int dst_pitch,
+                              SDL_Surface *surf, const SDL_Rect *r, int fmt) {
+  const Uint8 *src = (const Uint8 *)surf->pixels;
+  int src_pitch = surf->pitch;
+  if (fmt == 0) {
+    /* Grayscale: INDEX8 surface, R8 GPU texture — 1:1 byte copy */
+    for (int y = 0; y < r->h; y++) {
+      const Uint8 *s = src + (r->y + y) * src_pitch + r->x;
+      SDL_memcpy(dst + y * dst_pitch, s, (size_t)r->w);
+    }
+  } else if (fmt == 1) {
+    /* Subpixel LCD: RGB24 surface (3 B/px) -> RGBA32 (4 B/px), A=255 */
+    for (int y = 0; y < r->h; y++) {
+      const Uint8 *s = src + (r->y + y) * src_pitch + r->x * 3;
+      Uint8 *d = dst + y * dst_pitch;
+      for (int x = 0; x < r->w; x++) {
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255;
+        s += 3; d += 4;
+      }
+    }
+  } else {
+    /* Color emoji: BGRA32 surface -> RGBA32, swap R and B */
+    for (int y = 0; y < r->h; y++) {
+      const Uint8 *s = src + (r->y + y) * src_pitch + r->x * 4;
+      Uint8 *d = dst + y * dst_pitch;
+      for (int x = 0; x < r->w; x++) {
+        d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
+        s += 4; d += 4;
+      }
+    }
+  }
+}
+
+/* Upload all pending dirty atlas regions. Called from gpu_end_frame before
+ * the render pass. Each dirty entry gets its own transfer buffer (small,
+ * transient — only new glyphs per frame). */
+static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
+  if (g_upload_count == 0) return;
+  SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+  if (!cp) { g_upload_count = 0; return; }
+  for (int i = 0; i < g_upload_count; i++) {
+    AtlasUpload *u = &g_uploads[i];
+    int bpp = (u->fmt == 0) ? 1 : 4;
+    Uint32 size = (Uint32)(u->dirty.w * u->dirty.h * bpp);
+    /* Grow the shared atlas transfer buffer if needed. */
+    if (size > g_atlas_xfer_size) {
+      if (g_atlas_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+      SDL_GPUTransferBufferCreateInfo bci = {0};
+      bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+      bci.size = size;
+      g_atlas_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
+      g_atlas_xfer_size = size;
+      if (!g_atlas_xfer) { g_atlas_xfer_size = 0; continue; }
+    }
+    Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
+    if (mapped) {
+      copy_atlas_region(mapped, u->dirty.w * bpp, u->surf, &u->dirty, u->fmt);
+      SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+    }
+    SDL_GPUTextureTransferInfo tsrc = {0};
+    tsrc.transfer_buffer = g_atlas_xfer;
+    tsrc.offset = 0;
+    tsrc.pixels_per_row = (Uint32)u->dirty.w;
+    tsrc.rows_per_layer = (Uint32)u->dirty.h;
+    SDL_GPUTextureRegion tdst = {0};
+    tdst.texture = (SDL_GPUTexture *)u->tex;
+    tdst.x = (Uint32)u->dirty.x;
+    tdst.y = (Uint32)u->dirty.y;
+    tdst.w = (Uint32)u->dirty.w;
+    tdst.h = (Uint32)u->dirty.h;
+    tdst.d = 1;
+    SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
+  }
+  SDL_EndGPUCopyPass(cp);
+  g_upload_count = 0;
+}
+
+void gpu_draw_text_quads(RenWindow *ren, void *tex,
+                         const GpuTextVertex *verts, int vert_count,
+                         RenColor color, int mode, RenRect clip) {
+  GpuWindowState *s = ren->gpu_state;
+  if (!s || !s->vbuf_mapped || !s->cmd || !tex || vert_count <= 0) return;
+  if (s->vbuf_used + (Uint32)vert_count > s->vbuf_capacity) return;
+
+  GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
+  for (int i = 0; i < vert_count; i++) {
+    v[i] = (GpuVertex){ verts[i].x, verts[i].y, verts[i].u, verts[i].v };
+  }
+  Uint32 off = s->vbuf_used;
+  s->vbuf_used += vert_count;
+
+  GpuDrawCmd *d = push_draw(s);
+  if (!d) return;
+  d->kind = GPU_DRAW_TEXT;
+  d->vert_offset = off;
+  d->vert_count = (Uint32)vert_count;
+  d->clip = (SDL_FRect){ (float)clip.x, (float)clip.y,
+                         (float)clip.width, (float)clip.height };
+  d->funiform[0] = color.r / 255.0f;
+  d->funiform[1] = color.g / 255.0f;
+  d->funiform[2] = color.b / 255.0f;
+  d->funiform[3] = color.a / 255.0f;
+  d->funiform[4] = (float)mode;
+  d->funiform[5] = 0;
+  d->funiform[6] = 0;
+  d->funiform[7] = 0;
+  d->texture = tex;
 }
 
 void gpu_end_frame(RenWindow *ren) {
   GpuWindowState *s = ren->gpu_state;
   if (!s || !s->cmd) return;
 
-  /* Unmap the transfer buffer (verts are all written by now). */
+  /* Unmap the vertex transfer buffer (verts are all written by now). */
   if (s->vbuf_mapped) {
     SDL_UnmapGPUTransferBuffer(g_ctx.device, s->vbuf_xfer);
     s->vbuf_mapped = NULL;
   }
 
-  /* 1. Upload the CPU surface (text + images) into the render target as
-   *    the base layer, and upload verts, in a single copy pass. */
-  RenSurface rs = renwin_get_surface(ren);
-  SDL_Surface *surf = rs.surface;
-  if (surf && s->surf_xfer) {
-    void *smapped = SDL_MapGPUTransferBuffer(g_ctx.device, s->surf_xfer, true);
-    if (smapped) {
-      /* The surface may have a pitch != w*4; copy row by row. */
-      int row_bytes = surf->w * 4;
-      if (surf->pitch == row_bytes) {
-        SDL_memcpy(smapped, surf->pixels, (size_t)row_bytes * surf->h);
-      } else {
-        Uint8 *dst = smapped; const Uint8 *src = surf->pixels;
-        for (int y = 0; y < surf->h; y++) {
-          SDL_memcpy(dst, src, row_bytes);
-          dst += row_bytes; src += surf->pitch;
-        }
-      }
-      SDL_UnmapGPUTransferBuffer(g_ctx.device, s->surf_xfer);
-    }
-  }
+  /* 1. Upload dirty glyph atlas regions (new glyphs rasterized this frame). */
+  flush_atlas_uploads(s->cmd);
 
-  /* 1. Grow the GPU vertex buffer if needed (outside any pass). */
+  /* 2. Grow the GPU vertex buffer if needed. */
   Uint32 vert_bytes = s->vbuf_used * sizeof(GpuVertex);
   if (vert_bytes > 0 && (!s->vbuf_gpu || s->vbuf_gpu_size < vert_bytes)) {
     if (s->vbuf_gpu) SDL_ReleaseGPUBuffer(g_ctx.device, s->vbuf_gpu);
@@ -511,23 +732,10 @@ void gpu_end_frame(RenWindow *ren) {
     s->vbuf_gpu_size = vert_bytes;
   }
 
-  /* 2. Copy pass: upload CPU surface -> render target, and verts -> GPU buf. */
-  SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
-  if (cp) {
-    if (surf && s->surf_xfer) {
-      SDL_GPUTextureTransferInfo tsrc = {0};
-      tsrc.transfer_buffer = s->surf_xfer;
-      tsrc.offset = 0;
-      tsrc.pixels_per_row = (Uint32)surf->w;
-      tsrc.rows_per_layer = (Uint32)surf->h;
-      SDL_GPUTextureRegion tdst = {0};
-      tdst.texture = s->target_tex;
-      tdst.w = (Uint32)surf->w;
-      tdst.h = (Uint32)surf->h;
-      tdst.d = 1;
-      SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
-    }
-    if (vert_bytes > 0 && s->vbuf_gpu) {
+  /* 3. Copy pass: upload verts -> GPU vertex buffer. */
+  if (vert_bytes > 0 && s->vbuf_gpu) {
+    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
+    if (cp) {
       SDL_GPUTransferBufferLocation bsrc = {0};
       bsrc.transfer_buffer = s->vbuf_xfer;
       bsrc.offset = 0;
@@ -536,53 +744,63 @@ void gpu_end_frame(RenWindow *ren) {
       bdst.offset = 0;
       bdst.size = vert_bytes;
       SDL_UploadToGPUBuffer(cp, &bsrc, &bdst, true);
+      SDL_EndGPUCopyPass(cp);
     }
-    SDL_EndGPUCopyPass(cp);
   }
 
-  /* 2. Begin render pass on the target texture (only if we have GPU
-   *    draws; otherwise the uploaded surface is the final image). The LOAD
-   *    op preserves the surface we just uploaded into the target. */
-  if (s->draws_count > 0 && vert_bytes > 0) {
+  /* 4. Render pass on the target texture.
+   *    - First frame after (re)create: CLEAR to black, then draw everything.
+   *    - Subsequent frames: LOAD (preserve previous content for dirty-rect
+   *      incremental redraw + framebuffer fetch in text shader). */
+  {
     SDL_GPUColorTargetInfo tgt = {0};
     tgt.texture = s->target_tex;
-    tgt.load_op = SDL_GPU_LOADOP_LOAD;   /* preserve uploaded surface */
+    tgt.load_op = s->need_clear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
     tgt.store_op = SDL_GPU_STOREOP_STORE;
+    tgt.clear_color = (SDL_FColor){0, 0, 0, 1};
     tgt.cycle = false;
+    s->need_clear = false;
     s->pass = SDL_BeginGPURenderPass(s->cmd, &tgt, 1, NULL);
-
-    if (s->pass && s->vbuf_gpu) {
-      SDL_GPUBufferBinding bind = {0};
-      bind.buffer = s->vbuf_gpu;
-      bind.offset = 0;
-      SDL_BindGPUVertexBuffers(s->pass, 0, &bind, 1);
-
-      /* 3. Replay deferred draws. */
-      float vuniform[4] = { (float)s->target_w, (float)s->target_h, 0, 0 };
-      SDL_PushGPUVertexUniformData(s->cmd, 0, vuniform, sizeof(vuniform));
-      for (Uint32 i = 0; i < s->draws_count; i++) {
-        GpuDrawCmd *d = &s->draws[i];
-        /* scissor */
-        SDL_Rect sc;
-        if (d->clip.w > 0 && d->clip.h > 0) {
-          sc = (SDL_Rect){ (int)d->clip.x, (int)d->clip.y,
-                           (int)d->clip.w, (int)d->clip.h };
-        } else {
-          sc = (SDL_Rect){ 0, 0, s->target_w, s->target_h };
-        }
-        SDL_SetGPUScissor(s->pass, &sc);
-        if (d->kind == GPU_DRAW_RECT) {
-          SDL_BindGPUGraphicsPipeline(s->pass, g_ctx.rect_pipeline);
-          SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
-          SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
-        }
-        /* GPU_DRAW_TEXT: Stage 2b */
-      }
-    }
-    if (s->pass) { SDL_EndGPURenderPass(s->pass); s->pass = NULL; }
   }
 
-  /* 4. Blit render target -> swapchain. */
+  if (s->pass && s->vbuf_gpu && s->draws_count > 0) {
+    SDL_GPUBufferBinding bind = {0};
+    bind.buffer = s->vbuf_gpu;
+    bind.offset = 0;
+    SDL_BindGPUVertexBuffers(s->pass, 0, &bind, 1);
+
+    float vuniform[4] = { (float)s->target_w, (float)s->target_h, 0, 0 };
+    SDL_PushGPUVertexUniformData(s->cmd, 0, vuniform, sizeof(vuniform));
+
+    for (Uint32 i = 0; i < s->draws_count; i++) {
+      GpuDrawCmd *d = &s->draws[i];
+      SDL_Rect sc;
+      if (d->clip.w > 0 && d->clip.h > 0) {
+        sc = (SDL_Rect){ (int)d->clip.x, (int)d->clip.y,
+                         (int)d->clip.w, (int)d->clip.h };
+      } else {
+        sc = (SDL_Rect){ 0, 0, s->target_w, s->target_h };
+      }
+      SDL_SetGPUScissor(s->pass, &sc);
+
+      if (d->kind == GPU_DRAW_RECT) {
+        SDL_BindGPUGraphicsPipeline(s->pass, g_ctx.rect_pipeline);
+        SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
+        SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
+      } else if (d->kind == GPU_DRAW_TEXT && d->texture) {
+        SDL_BindGPUGraphicsPipeline(s->pass, g_ctx.text_pipeline);
+        SDL_GPUTextureSamplerBinding tsb = {0};
+        tsb.texture = (SDL_GPUTexture *)d->texture;
+        tsb.sampler = g_ctx.atlas_sampler;
+        SDL_BindGPUFragmentSamplers(s->pass, 0, &tsb, 1);
+        SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
+        SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
+      }
+    }
+  }
+  if (s->pass) { SDL_EndGPURenderPass(s->pass); s->pass = NULL; }
+
+  /* 5. Blit render target -> swapchain. */
   SDL_GPUTexture *swapchain = NULL;
   Uint32 sw = 0, sh = 0;
   bool got = SDL_WaitAndAcquireGPUSwapchainTexture(s->cmd, ren->window, &swapchain,
@@ -590,7 +808,7 @@ void gpu_end_frame(RenWindow *ren) {
   if (!got) {
     fprintf(stderr, "[gpu] end_frame: AcquireSwapchain FAILED: %s\n", SDL_GetError());
   } else if (!swapchain) {
-    fprintf(stderr, "[gpu] end_frame: swapchain NULL\n");
+    /* Window minimized — not an error, cancel is automatic on submit. */
   }
   if (got && swapchain) {
     SDL_GPUBlitInfo info = {0};

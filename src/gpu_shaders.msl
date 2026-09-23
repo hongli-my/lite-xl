@@ -62,6 +62,15 @@ lite_rect_fragment(RectVertexOut in [[stage_in]],
 
 /*=============================================================================
  * Stage 2b: textured glyph rendering
+ *
+ * Uses Metal framebuffer fetch ([[color(0)]]) to read the destination pixel
+ * and do per-channel compositing in the shader. This replaces dual-source
+ * blending (which SDL_gpu 3.2.8 doesn't expose) for LCD subpixel rendering.
+ * On Apple Silicon (tile-based deferred renderer) framebuffer fetch is free —
+ * data stays in tile memory, no round-trip to system RAM.
+ *
+ * Render target load_op must be CLEAR or LOAD (not DONTCARE) so [[color(0)]]
+ * has defined contents for the first draw in each tile.
  *===========================================================================*/
 
 typedef struct {
@@ -102,25 +111,27 @@ fragment float4
 lite_text_fragment(TextVertexOut in [[stage_in]],
                    constant TextFragmentUniform &u [[buffer(0)]],
                    texture2d<float> atlas [[texture(0)]],
-                   sampler atlasSampler [[sampler(0)]])
+                   sampler atlasSampler [[sampler(0)]],
+                   float4 dst [[color(0)]])
 {
   float4 glyph = atlas.sample(atlasSampler, in.texcoord);
   int mode = int(u.mode.x);
-  float4 result;
+  float3 rgb;
+  /* All modes composite onto dst via per-channel coverage.
+   *   result = src * coverage + dst * (1 - coverage)
+   * Alpha is always 1.0 (render target is opaque, blitted to swapchain). */
   if (mode == 2) {
-    /* Color glyph (emoji): use glyph's own RGB, alpha = glyph.a * fg.a */
-    result.rgb = glyph.rgb;
-    result.a = glyph.a * u.color.a;
+    /* Color emoji: glyph provides RGB + alpha coverage */
+    float3 coverage = float3(glyph.a * u.color.a);
+    rgb = glyph.rgb * coverage + dst.rgb * (1.0 - coverage);
   } else if (mode == 1) {
-    /* Subpixel LCD: glyph.rgb is per-channel coverage */
-    float coverage = (glyph.r + glyph.g + glyph.b) / 3.0;
-    result.rgb = u.color.rgb * glyph.rgb;
-    result.a = coverage * u.color.a;
+    /* Subpixel LCD: glyph.rgb is per-R/G/B channel coverage */
+    float3 coverage = glyph.rgb * u.color.a;
+    rgb = u.color.rgb * coverage + dst.rgb * (1.0 - coverage);
   } else {
-    /* Grayscale: glyph.r is coverage */
-    float coverage = glyph.r;
-    result.rgb = u.color.rgb;
-    result.a = coverage * u.color.a;
+    /* Grayscale: glyph.r is uniform coverage */
+    float coverage = glyph.r * u.color.a;
+    rgb = u.color.rgb * coverage + dst.rgb * (1.0 - coverage);
   }
-  return result;
+  return float4(rgb, 1.0);
 }

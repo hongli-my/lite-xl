@@ -37,25 +37,45 @@ void gpu_window_resize(RenWindow *ren);
 /*----------------------------------------------------------------------------
  * Frame lifecycle (called by rencache_end_frame)
  *
- *   gpu_begin_frame(ren)           -> acquires cmd buf, ensures render target,
- *                                     begins render pass (load previous content)
- *   gpu_draw_rect(...)             -> push verts + uniform, draw
- *   gpu_draw_text(...)             -> (Stage 2b) bind atlas, push verts, draw
- *   gpu_end_frame(ren)             -> end render pass, blit target->swapchain,
- *                                     submit. This REPLACES renwin_update_rects.
+ *   gpu_begin_frame(ren)           -> acquires cmd buf, maps vertex transfer
+ *                                     buffer (render pass opened in end_frame)
+ *   gpu_draw_rect(...)             -> push quad verts + deferred draw cmd
+ *   gpu_draw_text_quads(...)       -> push glyph quad verts + deferred draw cmd
+ *   gpu_end_frame(ren)             -> upload dirty atlas + verts in copy pass,
+ *                                     begin render pass (LOAD op for fb fetch),
+ *                                     replay draws, blit target->swapchain,
+ *                                     submit.
  *--------------------------------------------------------------------------*/
 bool gpu_begin_frame(RenWindow *ren);
 void gpu_end_frame(RenWindow *ren);
 
-/* Solid-color rectangle (Stage 2a). Coordinates are in surface pixels
- * (already scaled by surface_scale). Straight-alpha color. */
+/* Solid-color rectangle. Coordinates are in surface pixels (already scaled
+ * by surface_scale). Straight-alpha color. */
 void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color, RenRect clip);
 
-/* Set the scissor rect for the current render pass (pixels, surface scale). */
-void gpu_set_scissor(RenWindow *ren, RenRect clip);
+/* Glyph atlas GPU texture lifecycle.
+ *   fmt: 0=grayscale, 1=subpixel LCD, 2=color (emoji)
+ * Returns an opaque pointer (SDL_GPUTexture* internally). */
+void *gpu_atlas_create_texture(int w, int h, int fmt);
+void gpu_atlas_destroy_texture(void *tex);
 
-/* (Stage 2b, declared for forward compatibility) */
-void gpu_draw_text(RenWindow *ren, RenRect clip);
+/* Mark a sub-region of an atlas texture dirty. The corresponding CPU surface
+ * region will be uploaded (with format conversion) at the next gpu_end_frame.
+ * Safe to call during begin_frame..end_frame (just records into a list). */
+void gpu_atlas_mark_dirty(void *tex, SDL_Surface *surf,
+                          int x, int y, int w, int h, int fmt);
+
+/* A glyph quad vertex: position (pixels) + texcoord (normalized 0..1). */
+typedef struct {
+  float x, y, u, v;
+} GpuTextVertex;
+
+/* Push one or more glyph quads as a single draw. All verts must sample the
+ * same atlas texture. mode: 0=grayscale, 1=subpixel LCD, 2=color emoji.
+ * color is the foreground tint (straight alpha). */
+void gpu_draw_text_quads(RenWindow *ren, void *tex,
+                         const GpuTextVertex *verts, int vert_count,
+                         RenColor color, int mode, RenRect clip);
 
 /* Legacy Stage 1 entry, kept for the non-GPU rencache path fallback. */
 bool gpu_present_surface(RenWindow *ren, SDL_Surface *surface,

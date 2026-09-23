@@ -101,6 +101,9 @@ typedef struct {
 typedef struct {
   SDL_Surface **surfaces;
   unsigned int width, nsurface;
+#ifdef LITE_USE_GPU_RENDERER
+  void **gpu_tex;  /* GPU mirror, 1:1 with surfaces[] (SDL_GPUTexture*) */
+#endif
 } GlyphAtlas;
 
 // maps glyph IDs -> glyph metrics
@@ -246,6 +249,9 @@ static SDL_Surface *font_allocate_glyph_surface(RenFont *font, FT_GlyphSlot slot
     font->glyphs.atlas[glyph_format][font->glyphs.natlas[glyph_format]] = (GlyphAtlas) {
       .width = metric->x1 + FONT_WIDTH_OVERFLOW_PX, .nsurface = 0,
       .surfaces = NULL,
+#ifdef LITE_USE_GPU_RENDERER
+      .gpu_tex = NULL,
+#endif
     };
     font->glyphs.bytesize += sizeof(GlyphAtlas);
     atlas_idx = font->glyphs.natlas[glyph_format]++;
@@ -275,6 +281,10 @@ static SDL_Surface *font_allocate_glyph_surface(RenFont *font, FT_GlyphSlot slot
     SDL_PixelFormat format = glyphformat_to_pixelformat(glyph_format, &depth);
     atlas->surfaces = check_alloc(SDL_realloc(atlas->surfaces, sizeof(SDL_Surface *) * (atlas->nsurface + 1)));
     atlas->surfaces[atlas->nsurface] = check_alloc(SDL_CreateSurface(atlas->width, GLYPHS_PER_ATLAS * h, format));
+#ifdef LITE_USE_GPU_RENDERER
+    atlas->gpu_tex = check_alloc(SDL_realloc(atlas->gpu_tex, sizeof(void*) * (atlas->nsurface + 1)));
+    atlas->gpu_tex[atlas->nsurface] = gpu_atlas_create_texture(atlas->width, GLYPHS_PER_ATLAS * h, glyph_format);
+#endif
     userdata = SDL_GetSurfaceProperties(atlas->surfaces[atlas->nsurface]);
     SDL_SetPointerProperty(userdata, "metric", NULL);
     surface_idx = atlas->nsurface++;
@@ -385,6 +395,16 @@ static SDL_Surface *font_load_glyph_bitmap(RenFont *font, unsigned int glyph_id,
       memcpy(&pixels[target_offset], &slot->bitmap.buffer[source_offset], slot->bitmap.width * bytes_per_pixel);
     }
   }
+#ifdef LITE_USE_GPU_RENDERER
+  /* Mark the newly rasterized glyph region dirty for GPU upload. */
+  {
+    GlyphAtlas *ga = &font->glyphs.atlas[metric->format][metric->atlas_idx];
+    if (ga->gpu_tex && metric->surface_idx < (int)ga->nsurface)
+      gpu_atlas_mark_dirty(ga->gpu_tex[metric->surface_idx], surface,
+                           0, metric->y0, metric->x1,
+                           metric->y1 - metric->y0, metric->format);
+  }
+#endif
   return surface;
 }
 
@@ -424,6 +444,11 @@ static void font_clear_glyph_cache(RenFont* font) {
       for (int surface_idx = 0; surface_idx < atlas->nsurface; surface_idx++) {
         SDL_DestroySurface(atlas->surfaces[surface_idx]);
       }
+#ifdef LITE_USE_GPU_RENDERER
+      for (int surface_idx = 0; surface_idx < atlas->nsurface; surface_idx++)
+        gpu_atlas_destroy_texture(atlas->gpu_tex[surface_idx]);
+      SDL_free(atlas->gpu_tex);
+#endif
       SDL_free(atlas->surfaces);
     }
     SDL_free(font->glyphs.atlas[glyph_format_idx]);
@@ -773,6 +798,89 @@ double ren_draw_text(RenSurface *rs, RenFont **fonts, const char *text, size_t l
   return pen_x / surface_scale;
 }
 
+#ifdef LITE_USE_GPU_RENDERER
+/* GPU text path: mirrors ren_draw_text's layout logic but pushes textured
+ * quads to the GPU draw list instead of blending to a CPU surface.
+ * Coordinates are in surface pixels (already scaled by surface_scale). */
+double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
+                         size_t len, float x, int y, RenColor color,
+                         RenTab tab, RenRect clip) {
+  RenSurface rs = renwin_get_surface(ren);
+  const int surface_scale = rs.scale;
+  double pen_x = x * surface_scale;
+  double original_pen_x = pen_x;
+  y *= surface_scale;
+  const char* end = text + len;
+
+  RenFont* last = NULL;
+  double last_pen_x = pen_x;
+  bool underline = fonts[0]->style & FONT_STYLE_UNDERLINE;
+  bool strikethrough = fonts[0]->style & FONT_STYLE_STRIKETHROUGH;
+  int font_height = ren_font_group_get_height(fonts) * surface_scale;
+  int baseline = fonts[0]->baseline * surface_scale;
+
+  while (text < end) {
+    unsigned int codepoint;
+    text = utf8_to_codepoint(text, end, &codepoint);
+    SDL_Surface *font_surface = NULL; GlyphMetric *metric = NULL;
+    RenFont* font = font_group_get_glyph(fonts, codepoint,
+      (int)(fmod(pen_x, 1.0) * SUBPIXEL_BITMAPS_CACHED), &font_surface, &metric);
+    if (!metric) break;
+
+    int start_x = floor(pen_x) + metric->bitmap_left;
+    int end_x = metric->x1 + start_x;
+
+    /* Missing glyph box (same as CPU path) */
+    if (!font_surface && !is_whitespace(codepoint))
+      gpu_draw_rect(ren, (RenRect){ start_x + 1, y,
+        (int)font->space_advance - 1, font_height }, color, clip);
+
+    if (!is_whitespace(codepoint) && font_surface && color.a > 0) {
+      GlyphAtlas *atlas = &font->glyphs.atlas[metric->format][metric->atlas_idx];
+      if (atlas->gpu_tex && metric->surface_idx < (int)atlas->nsurface) {
+        void *tex = atlas->gpu_tex[metric->surface_idx];
+        int surf_w = atlas->width;
+        int surf_h = atlas->surfaces[metric->surface_idx]->h;
+        int gy = y - metric->bitmap_top + baseline;
+        int gh = metric->y1 - metric->y0;
+        float u1 = (float)metric->x1 / surf_w;
+        float v0 = (float)metric->y0 / surf_h;
+        float v1 = (float)metric->y1 / surf_h;
+
+        GpuTextVertex verts[4];
+        /* Triangle strip: TL, BL, TR, BR */
+        verts[0] = (GpuTextVertex){ (float)start_x, (float)gy, 0.0f, v0 };
+        verts[1] = (GpuTextVertex){ (float)start_x, (float)(gy + gh), 0.0f, v1 };
+        verts[2] = (GpuTextVertex){ (float)end_x,  (float)gy, u1, v0 };
+        verts[3] = (GpuTextVertex){ (float)end_x,  (float)(gy + gh), u1, v1 };
+        gpu_draw_text_quads(ren, tex, verts, 4, color, metric->format, clip);
+      }
+    }
+
+    float adv = font_get_xadvance(fonts[0], codepoint, metric,
+                                  pen_x - original_pen_x, tab);
+
+    if(!last) last = font;
+    else if(font != last || text == end) {
+      double local_pen_x = text == end ? pen_x + adv : pen_x;
+      int ux = (int)last_pen_x;
+      int uw = (int)(local_pen_x - last_pen_x);
+      int uy = y + (last->height - 1) * surface_scale;
+      int uh = last->underline_thickness * surface_scale;
+      if (underline)
+        gpu_draw_rect(ren, (RenRect){ ux, uy, uw, uh }, color, clip);
+      if (strikethrough)
+        gpu_draw_rect(ren, (RenRect){ ux, y + last->height * surface_scale / 2, uw, uh }, color, clip);
+      last = font;
+      last_pen_x = pen_x;
+    }
+
+    pen_x += adv;
+  }
+  return pen_x / surface_scale;
+}
+#endif /* LITE_USE_GPU_RENDERER */
+
 /******************* Rectangles **********************/
 static inline RenColor blend_pixel(RenColor dst, RenColor src) {
   int ia = 0xff - src.a;
@@ -914,6 +1022,12 @@ RenWindow* ren_create(SDL_Window *win) {
    * the SDL renderer / surface fallback (renwin_update_rects checks
    * gpu_state before using the GPU path). */
   gpu_window_attach(window_renderer);
+  /* Show the window here (not in rencache_end_frame) to avoid a reentrancy
+   * deadlock: SDL_ShowWindow can synchronously deliver window events that
+   * re-enter rencache_end_frame, which would acquire a second command buffer
+   * while the first is still in flight. */
+  if (window_renderer->gpu_state)
+    renwin_show_window(window_renderer);
 #endif
 
   ren_add_window(window_renderer);

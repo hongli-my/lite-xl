@@ -39,6 +39,15 @@ void update_font_scale(RenWindow *window_renderer, RenFont **fonts);
 void ren_font_group_set_tab_size(RenFont **font, int n);
 double ren_font_group_get_width(RenFont **font, const char *text, size_t len, RenTab tab, int *x_offset);
 double ren_draw_text(RenSurface *rs, RenFont **font, const char *text, size_t len, float x, int y, RenColor color, RenTab tab);
+#ifdef LITE_USE_GPU_RENDERER
+/* GPU text path: rasterizes glyphs (lazy, via font_group_get_glyph), uploads
+ * dirty atlas regions, and pushes textured quads to the GPU draw list.
+ * clip is the scissor rect (dirty rect ∩ set_clip). Does NOT touch the CPU
+ * surface. Returns final pen_x (same as ren_draw_text). */
+double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
+                         size_t len, float x, int y, RenColor color,
+                         RenTab tab, RenRect clip);
+#endif
 
 void ren_draw_rect(RenSurface *rs, RenRect rect, RenColor color);
 void ren_draw_image(RenSurface *rs, SDL_Surface *img, RenRect rect);

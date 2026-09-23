@@ -328,15 +328,46 @@ void rencache_end_frame(RenWindow *window_renderer) {
 
   RenSurface rs = renwin_get_surface(window_renderer);
 #ifdef LITE_USE_GPU_RENDERER
-  /* GPU path is currently disabled at the rencache level. All drawing goes
-   * to the CPU surface as usual, and presentation is handled by
-   * renwin_update_rects -> gpu_present_surface (Stage 1 path, known good).
-   * The Stage 2 GPU draw_rect/draw_text code in gpu_renderer.c is compiled
-   * and ready, but not wired into rencache until text is also on GPU (2b),
-   * so rect/text layering stays correct. */
-  /* (Stage 2 rencache GPU path goes here once 2b is done.) */
+  if (window_renderer->gpu_state) {
+    /* ---- GPU path: replay commands as GPU draw calls ---- */
+    if (rect_count > 0) {
+      gpu_begin_frame(window_renderer);
+      for (int i = 0; i < rect_count; i++) {
+        RenRect r = rect_buf[i];
+        RenRect current_clip = r;
+        cmd = NULL;
+        while (next_command(window_renderer, &cmd)) {
+          SetClipCommand *ccmd = (SetClipCommand*)&cmd->command;
+          DrawRectCommand *rcmd = (DrawRectCommand*)&cmd->command;
+          DrawTextCommand *tcmd = (DrawTextCommand*)&cmd->command;
+          switch (cmd->type) {
+            case SET_CLIP:
+              current_clip = intersect_rects(ccmd->rect, r);
+              break;
+            case DRAW_RECT:
+              gpu_draw_rect(window_renderer, rcmd->rect, rcmd->color, current_clip);
+              break;
+            case DRAW_TEXT:
+              ren_font_group_set_tab_size(tcmd->fonts, tcmd->tab_size);
+              ren_draw_text_gpu(window_renderer, tcmd->fonts, tcmd->text,
+                tcmd->len, tcmd->text_x, tcmd->rect.y, tcmd->color,
+                tcmd->tab, current_clip);
+              break;
+            case DRAW_IMAGE:
+              /* GPU image path not yet implemented — skip. */
+              break;
+          }
+        }
+        if (show_debug) {
+          RenColor color = { rand(), rand(), rand(), 50 };
+          gpu_draw_rect(window_renderer, r, color, current_clip);
+        }
+      }
+      gpu_end_frame(window_renderer);
+    }
+  } else
 #endif
-  /* redraw updated regions */
+  /* ---- CPU path (fallback) ---- */
   for (int i = 0; i < rect_count; i++) {
     /* draw */
     RenRect r = rect_buf[i];
