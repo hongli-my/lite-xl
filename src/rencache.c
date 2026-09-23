@@ -353,9 +353,11 @@ void rencache_end_frame(RenWindow *window_renderer) {
                 tcmd->len, tcmd->text_x, tcmd->rect.y, tcmd->color,
                 tcmd->tab, current_clip);
               break;
-            case DRAW_IMAGE:
-              /* GPU image path not yet implemented — skip. */
+            case DRAW_IMAGE: {
+              DrawImageCommand *icmd = (DrawImageCommand*)&cmd->command;
+              gpu_draw_image(window_renderer, icmd->surface, icmd->rect, current_clip);
               break;
+            }
           }
         }
         if (show_debug) {

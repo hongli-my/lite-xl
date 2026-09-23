@@ -77,6 +77,12 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
                          const GpuTextVertex *verts, int vert_count,
                          RenColor color, int mode, RenRect clip);
 
+/* Draw an image (SDL_Surface) into a rectangle. The surface is converted to
+ * RGBA32 and uploaded to a cached GPU texture, then drawn as a textured quad
+ * using the text pipeline in color mode (standard SRC-over alpha blend). */
+void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
+                    RenRect rect, RenRect clip);
+
 /* Legacy Stage 1 entry, kept for the non-GPU rencache path fallback. */
 bool gpu_present_surface(RenWindow *ren, SDL_Surface *surface,
                          RenRect *rects, int count);

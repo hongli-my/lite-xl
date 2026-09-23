@@ -82,9 +82,14 @@ typedef struct {
   SDL_GPUBuffer *vbuf_gpu;
   Uint32 vbuf_gpu_size;
 
-  /* Transfer buffer for uploading the CPU surface into the render target
-   * (the base layer; GPU rects are drawn on top). */
+  /* Transfer buffer for the fallback present path (gpu_present_surface).
+   * NOT used by the GPU rencache path. Lazily created on first present. */
   SDL_GPUTransferBuffer *surf_xfer;
+  Uint32 surf_xfer_size;
+
+  /* Cached texture for DRAW_IMAGE (grown if a larger image is drawn). */
+  SDL_GPUTexture *image_tex;
+  int image_tex_w, image_tex_h;
 
   /* Current command buffer (valid between begin/end_frame). */
   SDL_GPUCommandBuffer *cmd;
@@ -130,6 +135,15 @@ typedef struct {
 } GpuContext;
 
 static GpuContext g_ctx = {0};
+
+/* Performance counters (set in gpu_init; LITE_GPU_STATS=1 for per-frame). */
+static Uint64 g_perf_freq = 0;
+static bool   g_perf_verbose = false;
+static Uint64 g_perf_sum_ns = 0;
+static Uint64 g_perf_min_ns = 0;
+static Uint64 g_perf_max_ns = 0;
+static Uint64 g_frame_start = 0;
+static int    g_uploads_last = 0;
 
 /* Wrapper that lets us specify the entrypoint (rect vs text shaders share
  * the create-info but differ in entrypoint). */
@@ -322,6 +336,9 @@ bool gpu_init(void) {
     return false;
   }
 
+  g_perf_freq = SDL_GetPerformanceFrequency();
+  g_perf_verbose = SDL_GetHintBoolean("LITE_GPU_STATS", false);
+
   fprintf(stderr, "[gpu] device + pipelines + sampler ready\n");
   return true;
 }
@@ -373,6 +390,7 @@ void gpu_window_detach(RenWindow *ren) {
   if (!s) return;
   SDL_WaitForGPUIdle(g_ctx.device);
   if (s->target_tex)  SDL_ReleaseGPUTexture(g_ctx.device, s->target_tex);
+  if (s->image_tex)   SDL_ReleaseGPUTexture(g_ctx.device, s->image_tex);
   if (s->vbuf_xfer)   SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->vbuf_xfer);
   if (s->surf_xfer)   SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->surf_xfer);
   if (s->vbuf_gpu)    SDL_ReleaseGPUBuffer(g_ctx.device, s->vbuf_gpu);
@@ -417,24 +435,6 @@ static bool ensure_resources(GpuWindowState *s, int w, int h) {
     s->target_w = w;
     s->target_h = h;
     s->need_clear = true;
-    /* Surface upload buffer is size-dependent; recreate on resize. */
-    if (s->surf_xfer) {
-      SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->surf_xfer);
-      s->surf_xfer = NULL;
-    }
-  }
-
-  /* Surface upload transfer buffer (w*h*4 bytes, BGRA). */
-  if (!s->surf_xfer) {
-    SDL_GPUTransferBufferCreateInfo sbci = {0};
-    sbci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    sbci.size = (Uint32)(w * h) * 4;
-    s->surf_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &sbci);
-    if (!s->surf_xfer) {
-      fprintf(stderr, "gpu: surf CreateGPUTransferBuffer failed: %s\n",
-              SDL_GetError());
-      return false;
-    }
   }
 
   /* Vertex transfer buffer (size-independent, create once). */
@@ -476,6 +476,7 @@ bool gpu_begin_frame(RenWindow *ren) {
   if (!ensure_resources(s, w, h)) { fprintf(stderr, "[gpu] begin_frame: ensure_resources FAILED\n"); return false; }
 
   g_frame_count++;
+  g_frame_start = SDL_GetPerformanceCounter();
   if (g_frame_count == 1)
     fprintf(stderr, "[gpu] GPU render path active (Metal, %dx%d)\n", w, h);
 
@@ -692,6 +693,7 @@ static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
     SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
   }
   SDL_EndGPUCopyPass(cp);
+  g_uploads_last = g_upload_count;
   g_upload_count = 0;
 }
 
@@ -727,6 +729,122 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   d->texture = tex;
 }
 
+/*----------------------------------------------------------------------------
+ * Image drawing (DRAW_IMAGE)
+ *
+ * Converts the SDL_Surface to RGBA32, uploads to a cached GPU texture
+ * (grown on demand), and draws a textured quad using the text pipeline in
+ * color mode (mode=2, white tint) → standard SRC-over alpha blend, matching
+ * the CPU path's SDL_BlitSurface(BLEND) semantics.
+ *--------------------------------------------------------------------------*/
+void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
+                    RenRect rect, RenRect clip) {
+  GpuWindowState *s = ren->gpu_state;
+  if (!s || !s->vbuf_mapped || !s->cmd || !img) return;
+  if (rect.width <= 0 || rect.height <= 0) return;
+  if (s->vbuf_used + 4 > s->vbuf_capacity) return;
+
+  RenSurface rs = renwin_get_surface(ren);
+  int ss = rs.scale;
+  int dw = rect.width * ss, dh = rect.height * ss;
+
+  /* Convert to RGBA32 (memory layout R,G,B,A = R8G8B8A8_UNORM). */
+  SDL_Surface *rgba = SDL_ConvertSurface(img, SDL_PIXELFORMAT_RGBA32);
+  if (!rgba) return;
+  int iw = rgba->w, ih = rgba->h;
+  if (iw <= 0 || ih <= 0) { SDL_DestroySurface(rgba); return; }
+
+  /* Ensure the cached image texture is large enough (grow-only). */
+  if (!s->image_tex || s->image_tex_w < iw || s->image_tex_h < ih) {
+    if (s->image_tex) SDL_ReleaseGPUTexture(g_ctx.device, s->image_tex);
+    SDL_GPUTextureCreateInfo tci = {0};
+    tci.type = SDL_GPU_TEXTURETYPE_2D;
+    tci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    tci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    tci.width = iw; tci.height = ih;
+    tci.layer_count_or_depth = 1;
+    tci.num_levels = 1;
+    tci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    s->image_tex = SDL_CreateGPUTexture(g_ctx.device, &tci);
+    s->image_tex_w = iw;
+    s->image_tex_h = ih;
+  }
+  if (!s->image_tex) { SDL_DestroySurface(rgba); return; }
+
+  /* Upload image data via the shared atlas transfer buffer. */
+  Uint32 size = (Uint32)(iw * ih) * 4;
+  if (size > g_atlas_xfer_size) {
+    if (g_atlas_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+    SDL_GPUTransferBufferCreateInfo bci = {0};
+    bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    bci.size = size;
+    g_atlas_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
+    g_atlas_xfer_size = size;
+    if (!g_atlas_xfer) { g_atlas_xfer_size = 0; SDL_DestroySurface(rgba); return; }
+  }
+  Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
+  if (mapped) {
+    int row_bytes = iw * 4;
+    if (rgba->pitch == row_bytes) {
+      SDL_memcpy(mapped, rgba->pixels, (size_t)row_bytes * ih);
+    } else {
+      Uint8 *d = mapped; const Uint8 *p = rgba->pixels;
+      for (int y = 0; y < ih; y++) {
+        SDL_memcpy(d, p, row_bytes);
+        d += row_bytes; p += rgba->pitch;
+      }
+    }
+    SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+  }
+  SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
+  if (cp) {
+    SDL_GPUTextureTransferInfo tsrc = {0};
+    tsrc.transfer_buffer = g_atlas_xfer;
+    tsrc.offset = 0;
+    tsrc.pixels_per_row = (Uint32)iw;
+    tsrc.rows_per_layer = (Uint32)ih;
+    SDL_GPUTextureRegion tdst = {0};
+    tdst.texture = s->image_tex;
+    tdst.w = (Uint32)iw;
+    tdst.h = (Uint32)ih;
+    tdst.d = 1;
+    SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
+    SDL_EndGPUCopyPass(cp);
+  }
+  SDL_DestroySurface(rgba);
+
+  /* Push a textured quad. UV maps the sub-region used (image may be smaller
+   * than the cached texture). Text pipeline color mode = standard blend. */
+  float x0 = (float)(rect.x * ss), y0 = (float)(rect.y * ss);
+  float x1 = x0 + dw, y1 = y0 + dh;
+  float umax = (float)iw / s->image_tex_w;
+  float vmax = (float)ih / s->image_tex_h;
+  GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
+  v[0] = (GpuVertex){ x0, y0, 0, 0 };
+  v[1] = (GpuVertex){ x0, y1, 0, vmax };
+  v[2] = (GpuVertex){ x1, y0, umax, 0 };
+  v[3] = (GpuVertex){ x1, y1, umax, vmax };
+  Uint32 off = s->vbuf_used;
+  s->vbuf_used += 4;
+
+  GpuDrawCmd *d = push_draw(s);
+  if (!d) return;
+  d->kind = GPU_DRAW_TEXT;  /* reuse text pipeline (color mode) */
+  d->vert_offset = off;
+  d->vert_count = 4;
+  d->clip = (SDL_FRect){ (float)(clip.x * ss), (float)(clip.y * ss),
+                         (float)(clip.width * ss), (float)(clip.height * ss) };
+  d->funiform[0] = 1.0f;  /* white tint */
+  d->funiform[1] = 1.0f;
+  d->funiform[2] = 1.0f;
+  d->funiform[3] = 1.0f;
+  d->funiform[4] = 2.0f;  /* mode = color */
+  d->funiform[5] = 0;
+  d->funiform[6] = 0;
+  d->funiform[7] = 0;
+  d->texture = s->image_tex;
+}
+
 void gpu_end_frame(RenWindow *ren) {
   GpuWindowState *s = ren->gpu_state;
   if (!s || !s->cmd) return;
@@ -744,11 +862,17 @@ void gpu_end_frame(RenWindow *ren) {
   Uint32 vert_bytes = s->vbuf_used * sizeof(GpuVertex);
   if (vert_bytes > 0 && (!s->vbuf_gpu || s->vbuf_gpu_size < vert_bytes)) {
     if (s->vbuf_gpu) SDL_ReleaseGPUBuffer(g_ctx.device, s->vbuf_gpu);
+    /* Grow with 2x strategy from an initial 64 KB (4096 verts) to avoid
+     * recreating the GPU buffer every time the vert count fluctuates. */
+    Uint32 alloc = s->vbuf_gpu_size ? s->vbuf_gpu_size : 4096 * sizeof(GpuVertex);
+    while (alloc < vert_bytes) alloc *= 2;
+    if (alloc > VBUF_MAX_VERTS * sizeof(GpuVertex))
+      alloc = VBUF_MAX_VERTS * sizeof(GpuVertex);
     SDL_GPUBufferCreateInfo bci = {0};
     bci.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
-    bci.size = vert_bytes;
+    bci.size = alloc;
     s->vbuf_gpu = SDL_CreateGPUBuffer(g_ctx.device, &bci);
-    s->vbuf_gpu_size = vert_bytes;
+    s->vbuf_gpu_size = alloc;
   }
 
   /* 3. Copy pass: upload verts -> GPU vertex buffer. */
@@ -850,10 +974,26 @@ void gpu_end_frame(RenWindow *ren) {
             SDL_GetError());
   }
   g_gpu_draw_total += s->draws_count;
+  if (g_perf_freq) {
+    Uint64 dt = SDL_GetPerformanceCounter() - g_frame_start;
+    Uint64 ns = dt * 1000000000ULL / g_perf_freq;
+    g_perf_sum_ns += ns;
+    if (ns < g_perf_min_ns || g_perf_min_ns == 0) g_perf_min_ns = ns;
+    if (ns > g_perf_max_ns) g_perf_max_ns = ns;
+    if (g_perf_verbose)
+      fprintf(stderr, "[gpu] frame %u: %.3f ms | draws=%u verts=%u uploads=%d\n",
+              g_frame_count, ns / 1000000.0, s->draws_count, s->vbuf_used,
+              g_uploads_last);
+  }
   if ((g_frame_count % 300) == 0) {
-    fprintf(stderr, "[gpu] %u frames | draws/frame: %u | verts: %u | "
-            "atlas uploads: %d\n",
-            g_frame_count, s->draws_count, s->vbuf_used, g_upload_count);
+    double avg = g_perf_freq ? (double)g_perf_sum_ns / 300.0 / 1000000.0 : 0;
+    double mn = g_perf_min_ns / 1000000.0;
+    double mx = g_perf_max_ns / 1000000.0;
+    fprintf(stderr, "[gpu] %u frames | draws=%u verts=%u uploads=%d | "
+            "frame avg=%.2f min=%.2f max=%.2f ms\n",
+            g_frame_count, s->draws_count, s->vbuf_used, g_uploads_last,
+            avg, mn, mx);
+    g_perf_sum_ns = 0; g_perf_min_ns = 0; g_perf_max_ns = 0;
   }
   s->cmd = NULL;
   s->vbuf_used = 0;
@@ -877,6 +1017,18 @@ bool gpu_present_surface(RenWindow *ren, SDL_Surface *surface,
 
   SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(g_ctx.device);
   if (!cmd) return false;
+
+  /* Lazily create the surface upload transfer buffer (fallback path only). */
+  Uint32 surf_bytes = (Uint32)(w * h) * 4;
+  if (!s->surf_xfer || s->surf_xfer_size < surf_bytes) {
+    if (s->surf_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->surf_xfer);
+    SDL_GPUTransferBufferCreateInfo sbci = {0};
+    sbci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    sbci.size = surf_bytes;
+    s->surf_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &sbci);
+    s->surf_xfer_size = s->surf_xfer ? surf_bytes : 0;
+    if (!s->surf_xfer) { SDL_SubmitGPUCommandBuffer(cmd); return false; }
+  }
 
   /* Upload surface pixels -> render target texture. */
   if (s->surf_xfer) {
