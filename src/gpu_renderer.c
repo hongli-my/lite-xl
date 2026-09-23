@@ -87,9 +87,12 @@ typedef struct {
   SDL_GPUTransferBuffer *surf_xfer;
   Uint32 surf_xfer_size;
 
-  /* Cached texture for DRAW_IMAGE (grown if a larger image is drawn). */
+  /* Cached texture for DRAW_IMAGE (grown if a larger image is drawn).
+   * last_img caches the surface pointer to skip re-uploading when the
+   * same image is redrawn (e.g. markdown preview dirty-redraw). */
   SDL_GPUTexture *image_tex;
   int image_tex_w, image_tex_h;
+  SDL_Surface *last_img;
 
   /* Current command buffer (valid between begin/end_frame). */
   SDL_GPUCommandBuffer *cmd;
@@ -391,6 +394,8 @@ void gpu_window_detach(RenWindow *ren) {
   SDL_WaitForGPUIdle(g_ctx.device);
   if (s->target_tex)  SDL_ReleaseGPUTexture(g_ctx.device, s->target_tex);
   if (s->image_tex)   SDL_ReleaseGPUTexture(g_ctx.device, s->image_tex);
+  /* last_img is a borrowed pointer (owned by rencache), just clear it. */
+  s->last_img = NULL;
   if (s->vbuf_xfer)   SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->vbuf_xfer);
   if (s->surf_xfer)   SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->surf_xfer);
   if (s->vbuf_gpu)    SDL_ReleaseGPUBuffer(g_ctx.device, s->vbuf_gpu);
@@ -743,76 +748,84 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   GpuWindowState *s = ren->gpu_state;
   if (!s || !s->vbuf_mapped || !s->cmd || !img) return;
   if (rect.width <= 0 || rect.height <= 0) return;
-  if (s->vbuf_used + 4 > s->vbuf_capacity) return;
+  if (clip.width <= 0 || clip.height <= 0) return;
+  if (s->vbuf_used + 6 > s->vbuf_capacity) return;
 
   RenSurface rs = renwin_get_surface(ren);
   int ss = rs.scale;
   int dw = rect.width * ss, dh = rect.height * ss;
+  int iw = img->w, ih = img->h;
 
-  /* Convert to RGBA32 (memory layout R,G,B,A = R8G8B8A8_UNORM). */
-  SDL_Surface *rgba = SDL_ConvertSurface(img, SDL_PIXELFORMAT_RGBA32);
-  if (!rgba) return;
-  int iw = rgba->w, ih = rgba->h;
-  if (iw <= 0 || ih <= 0) { SDL_DestroySurface(rgba); return; }
+  /* Upload only when the surface pointer changes. rencache reuses the
+   * same SDL_Surface object across frames, so pointer equality means the
+   * image content hasn't changed and we can skip the convert+upload. */
+  if (img != s->last_img) {
+    SDL_Surface *rgba = SDL_ConvertSurface(img, SDL_PIXELFORMAT_RGBA32);
+    if (!rgba) return;
+    iw = rgba->w; ih = rgba->h;
+    if (iw <= 0 || ih <= 0) { SDL_DestroySurface(rgba); return; }
 
-  /* Ensure the cached image texture is large enough (grow-only). */
-  if (!s->image_tex || s->image_tex_w < iw || s->image_tex_h < ih) {
-    if (s->image_tex) SDL_ReleaseGPUTexture(g_ctx.device, s->image_tex);
-    SDL_GPUTextureCreateInfo tci = {0};
-    tci.type = SDL_GPU_TEXTURETYPE_2D;
-    tci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-    tci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
-    tci.width = iw; tci.height = ih;
-    tci.layer_count_or_depth = 1;
-    tci.num_levels = 1;
-    tci.sample_count = SDL_GPU_SAMPLECOUNT_1;
-    s->image_tex = SDL_CreateGPUTexture(g_ctx.device, &tci);
-    s->image_tex_w = iw;
-    s->image_tex_h = ih;
-  }
-  if (!s->image_tex) { SDL_DestroySurface(rgba); return; }
-
-  /* Upload image data via the shared atlas transfer buffer. */
-  Uint32 size = (Uint32)(iw * ih) * 4;
-  if (size > g_atlas_xfer_size) {
-    if (g_atlas_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
-    SDL_GPUTransferBufferCreateInfo bci = {0};
-    bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    bci.size = size;
-    g_atlas_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
-    g_atlas_xfer_size = size;
-    if (!g_atlas_xfer) { g_atlas_xfer_size = 0; SDL_DestroySurface(rgba); return; }
-  }
-  Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
-  if (mapped) {
-    int row_bytes = iw * 4;
-    if (rgba->pitch == row_bytes) {
-      SDL_memcpy(mapped, rgba->pixels, (size_t)row_bytes * ih);
-    } else {
-      Uint8 *d = mapped; const Uint8 *p = rgba->pixels;
-      for (int y = 0; y < ih; y++) {
-        SDL_memcpy(d, p, row_bytes);
-        d += row_bytes; p += rgba->pitch;
-      }
+    /* Ensure the cached image texture is large enough (grow-only). */
+    if (!s->image_tex || s->image_tex_w < iw || s->image_tex_h < ih) {
+      if (s->image_tex) SDL_ReleaseGPUTexture(g_ctx.device, s->image_tex);
+      SDL_GPUTextureCreateInfo tci = {0};
+      tci.type = SDL_GPU_TEXTURETYPE_2D;
+      tci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+      tci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+      tci.width = iw; tci.height = ih;
+      tci.layer_count_or_depth = 1;
+      tci.num_levels = 1;
+      tci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+      s->image_tex = SDL_CreateGPUTexture(g_ctx.device, &tci);
+      s->image_tex_w = iw;
+      s->image_tex_h = ih;
     }
-    SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+    if (!s->image_tex) { SDL_DestroySurface(rgba); return; }
+
+    /* Upload image data via the shared atlas transfer buffer. */
+    Uint32 size = (Uint32)(iw * ih) * 4;
+    if (size > g_atlas_xfer_size) {
+      if (g_atlas_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+      SDL_GPUTransferBufferCreateInfo bci = {0};
+      bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+      bci.size = size;
+      g_atlas_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
+      g_atlas_xfer_size = size;
+      if (!g_atlas_xfer) { g_atlas_xfer_size = 0; SDL_DestroySurface(rgba); return; }
+    }
+    Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
+    if (mapped) {
+      int row_bytes = iw * 4;
+      if (rgba->pitch == row_bytes) {
+        SDL_memcpy(mapped, rgba->pixels, (size_t)row_bytes * ih);
+      } else {
+        Uint8 *d = mapped; const Uint8 *p = rgba->pixels;
+        for (int y = 0; y < ih; y++) {
+          SDL_memcpy(d, p, row_bytes);
+          d += row_bytes; p += rgba->pitch;
+        }
+      }
+      SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+    }
+    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
+    if (cp) {
+      SDL_GPUTextureTransferInfo tsrc = {0};
+      tsrc.transfer_buffer = g_atlas_xfer;
+      tsrc.offset = 0;
+      tsrc.pixels_per_row = (Uint32)iw;
+      tsrc.rows_per_layer = (Uint32)ih;
+      SDL_GPUTextureRegion tdst = {0};
+      tdst.texture = s->image_tex;
+      tdst.w = (Uint32)iw;
+      tdst.h = (Uint32)ih;
+      tdst.d = 1;
+      SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
+      SDL_EndGPUCopyPass(cp);
+    }
+    SDL_DestroySurface(rgba);
+    s->last_img = img;
   }
-  SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
-  if (cp) {
-    SDL_GPUTextureTransferInfo tsrc = {0};
-    tsrc.transfer_buffer = g_atlas_xfer;
-    tsrc.offset = 0;
-    tsrc.pixels_per_row = (Uint32)iw;
-    tsrc.rows_per_layer = (Uint32)ih;
-    SDL_GPUTextureRegion tdst = {0};
-    tdst.texture = s->image_tex;
-    tdst.w = (Uint32)iw;
-    tdst.h = (Uint32)ih;
-    tdst.d = 1;
-    SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
-    SDL_EndGPUCopyPass(cp);
-  }
-  SDL_DestroySurface(rgba);
+  if (!s->image_tex) return;
 
   /* Push a textured quad. UV maps the sub-region used (image may be smaller
    * than the cached texture). Text pipeline color mode = standard blend.
