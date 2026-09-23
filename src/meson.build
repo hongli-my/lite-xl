@@ -16,6 +16,18 @@ lite_sources = [
 # SDL_gpu presentation backend (only compiled in when the meson option is on).
 if get_option('gpu_renderer')
     lite_sources += 'gpu_renderer.c'
+
+    # Auto-generate gpu_shaders_msl.h from gpu_shaders.msl so the header
+    # never goes stale. Output goes to the build directory; meson adds it
+    # to the include path automatically.
+    python = find_program('python3')
+    gpu_shaders_h = custom_target('gpu_shaders_msl.h',
+        input: 'gpu_shaders.msl',
+        output: 'gpu_shaders_msl.h',
+        command: [python, files('../scripts/msl-to-header.py'), '@INPUT@', '@OUTPUT@'],
+        build_by_default: true,
+    )
+    lite_sources += gpu_shaders_h
 endif
 
 #===============================================================================
