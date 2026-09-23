@@ -465,7 +465,6 @@ static bool ensure_resources(GpuWindowState *s, int w, int h) {
  * buffer + upload. We allocate one big enough for the whole frame. */
 
 static Uint32 g_frame_count = 0;
-static Uint32 g_gpu_draw_total = 0;
 
 bool gpu_begin_frame(RenWindow *ren) {
   if (!g_ctx.device || !ren || !ren->gpu_state) return false;
@@ -522,6 +521,7 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
                    RenRect clip) {
   GpuWindowState *s = ren->gpu_state;
   if (!s || !s->vbuf_mapped || !s->cmd) return;
+  if (clip.width <= 0 || clip.height <= 0) return;
   if (s->vbuf_used + 4 > s->vbuf_capacity) return;
 
   /* rencache commands use logical (HiDPI-divided) coordinates; the GPU
@@ -702,6 +702,7 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
                          RenColor color, int mode, RenRect clip) {
   GpuWindowState *s = ren->gpu_state;
   if (!s || !s->vbuf_mapped || !s->cmd || !tex || vert_count <= 0) return;
+  if (clip.width <= 0 || clip.height <= 0) return;
   if (s->vbuf_used + (Uint32)vert_count > s->vbuf_capacity) return;
 
   GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
@@ -976,7 +977,6 @@ void gpu_end_frame(RenWindow *ren) {
     fprintf(stderr, "[gpu] end_frame SubmitGPUCommandBuffer failed: %s\n",
             SDL_GetError());
   }
-  g_gpu_draw_total += s->draws_count;
   if (g_perf_freq) {
     Uint64 dt = SDL_GetPerformanceCounter() - g_frame_start;
     Uint64 ns = dt * 1000000000ULL / g_perf_freq;
