@@ -37,178 +37,8 @@ config.plugins.aichat = common.merge({
   model = "gpt-4o-mini",
 }, config.plugins.aichat)
 
--------------------------------------------------------------------------------
--- Minimal JSON (encode + decode) — core has no JSON module.
--------------------------------------------------------------------------------
-local json = {}
 
-local function json_escape(s)
-  local map = {
-    ['\\'] = '\\\\',
-    ['"']  = '\\"',
-    ['\n'] = '\\n',
-    ['\r'] = '\\r',
-    ['\t'] = '\\t',
-  }
-  s = s:gsub('[\\"\n\r\t]', map)
-  s = s:gsub('[%z\1-\31]', function(c)
-    return string.format('\\u%04x', c:byte())
-  end)
-  return s
-end
-
-local function json_encode(value)
-  local t = type(value)
-  if t == "string" then
-    return '"' .. json_escape(value) .. '"'
-  elseif t == "number" then
-    if value ~= value or value == math.huge or value == -math.huge then
-      return "null"
-    end
-    return string.format("%.14g", value)
-  elseif t == "boolean" then
-    return value and "true" or "false"
-  elseif t == "nil" then
-    return "null"
-  elseif t == "table" then
-    local is_array = true
-    local count = 0
-    for k in pairs(value) do
-      count = count + 1
-      if type(k) ~= "number" then is_array = false; break end
-    end
-    if count == 0 then return "{}" end
-    local parts = {}
-    if is_array then
-      for i = 1, #value do parts[i] = json_encode(value[i]) end
-      return "[" .. table.concat(parts, ",") .. "]"
-    else
-      for k, v in pairs(value) do
-        parts[#parts + 1] = '"' .. json_escape(tostring(k)) .. '":' .. json_encode(v)
-      end
-      return "{" .. table.concat(parts, ",") .. "}"
-    end
-  end
-  return "null"
-end
-
-local decode_value
-local function decode_whitespace(s, pos)
-  while pos <= #s and s:byte(pos) <= 32 do pos = pos + 1 end
-  return pos
-end
-local function decode_string(s, pos)
-  pos = pos + 1 -- skip opening quote
-  local buf = {}
-  while pos <= #s do
-    local b = s:byte(pos)
-    if b == 34 then -- closing quote
-      return table.concat(buf), pos + 1
-    elseif b == 92 then -- backslash escape
-      pos = pos + 1
-      local c = s:byte(pos)
-      if c == 110 then buf[#buf+1] = "\n"
-      elseif c == 114 then buf[#buf+1] = "\r"
-      elseif c == 116 then buf[#buf+1] = "\t"
-      elseif c == 98 then buf[#buf+1] = "\b"
-      elseif c == 102 then buf[#buf+1] = "\f"
-      elseif c == 34 then buf[#buf+1] = '"'
-      elseif c == 92 then buf[#buf+1] = "\\"
-      elseif c == 47 then buf[#buf+1] = "/" -- '/'
-      elseif c == 117 then -- 'u' followed by 4 hex digits
-        local hex = s:sub(pos+1, pos+4)
-        local code = tonumber(hex, 16)
-        pos = pos + 4
-        if code then
-          if code < 0x80 then
-            buf[#buf+1] = string.char(code)
-          elseif code < 0x800 then
-            buf[#buf+1] = string.char(0xC0 + math.floor(code/64), 0x80 + code%64)
-          else
-            buf[#buf+1] = string.char(0xE0 + math.floor(code/4096),
-                                    0x80 + math.floor(code/64)%64,
-                                    0x80 + code%64)
-          end
-        end
-      else
-        buf[#buf+1] = string.char(c)
-      end
-      pos = pos + 1
-    else
-      buf[#buf+1] = string.char(b)
-      pos = pos + 1
-    end
-  end
-  error("unterminated string")
-end
-local function decode_number(s, pos)
-  local start = pos
-  if s:byte(pos) == 45 then pos = pos + 1 end -- '-'
-  while pos <= #s do
-    local c = s:byte(pos)
-    if (c >= 48 and c <= 57) or c == 46 or c == 101 or c == 69 or c == 43 or c == 45 then
-      pos = pos + 1
-    else break end
-  end
-  return tonumber(s:sub(start, pos - 1)), pos
-end
-decode_value = function(s, pos)
-  pos = decode_whitespace(s, pos)
-  local c = s:byte(pos)
-  if c == 34 then -- '"'
-    return decode_string(s, pos)
-  elseif c == 123 then -- '{'
-    pos = pos + 1
-    local obj = {}
-    pos = decode_whitespace(s, pos)
-    if s:byte(pos) == 125 then return obj, pos + 1 end -- '}'
-    while true do
-      pos = decode_whitespace(s, pos)
-      local key, kpos = decode_string(s, pos)
-      pos = kpos
-      pos = decode_whitespace(s, pos)
-      if s:byte(pos) ~= 58 then error("expected ':'") end -- ':'
-      pos = pos + 1
-      local val
-      val, pos = decode_value(s, pos)
-      obj[key] = val
-      pos = decode_whitespace(s, pos)
-      local sep = s:byte(pos)
-      if sep == 44 then pos = pos + 1 -- ','
-      elseif sep == 125 then return obj, pos + 1 -- '}'
-      else error("expected ',' or '}'") end
-    end
-  elseif c == 91 then -- '['
-    pos = pos + 1
-    local arr = {}
-    pos = decode_whitespace(s, pos)
-    if s:byte(pos) == 93 then return arr, pos + 1 end -- ']'
-    local idx = 1
-    while true do
-      local val
-      val, pos = decode_value(s, pos)
-      arr[idx] = val
-      idx = idx + 1
-      pos = decode_whitespace(s, pos)
-      local sep = s:byte(pos)
-      if sep == 44 then pos = pos + 1 -- ','
-      elseif sep == 93 then return arr, pos + 1 -- ']'
-      else error("expected ',' or ']'") end
-    end
-  elseif c == 45 or (c >= 48 and c <= 57) then -- '-' or digit
-    return decode_number(s, pos)
-  elseif c == 116 then return true, pos + 4 -- 'true'
-  elseif c == 102 then return false, pos + 5 -- 'false'
-  elseif c == 110 then return nil, pos + 4 -- 'null'
-  else error("unexpected character at position " .. pos) end
-end
-function json.decode(s)
-  if not s or s == "" then return nil end
-  local val = decode_value(s, 1)
-  return val
-end
-json.encode = json_encode
-
+local json = require "core.json"
 
 -------------------------------------------------------------------------------
 -- Word-wrap helper: wraps text into lines fitting max_width using font metrics.
@@ -1477,6 +1307,40 @@ end
 function AIView:supports_text_input() return true end
 
 -- Compute the screen-space caret position in the input box (used for IME).
+-- Split self.input into lines at '\n', returning the lines table and a
+-- parallel table of each line's starting byte offset in self.input.
+-- Always returns at least one line.
+function AIView:_input_lines()
+  local s = self.input
+  local lines, starts = {}, {}
+  local i, n = 1, #s
+  while i <= n do
+    local j = i
+    while j <= n and s:byte(j) ~= 10 do j = j + 1 end
+    lines[#lines + 1] = s:sub(i, j - 1)
+    starts[#starts + 1] = i
+    i = j + 1
+  end
+  if #lines == 0 then lines, starts = { "" }, { 1 } end
+  return lines, starts
+end
+
+-- Returns (line_idx, col, line_text) for the current caret position.
+-- col is 1-based into line_text.  Mirrors the scan in _draw_caret.
+function AIView:_caret_line_info()
+  local lines, starts = self:_input_lines()
+  local target = self.caret
+  for li, line in ipairs(lines) do
+    local line_start = starts[li]
+    local line_end = line_start + #line  -- last byte offset of this line
+    -- caret may sit at line_end + 1 (just past the line, on the '\n' or EOL)
+    if target >= line_start and target <= line_end + 1 then
+      return li, target - line_start + 1, line
+    end
+  end
+  return 1, 1, lines[1] or ""
+end
+
 -- Mirrors the logic in _draw_caret but returns coordinates instead of drawing.
 function AIView:_caret_screen_pos()
   local x, y, w, h = self.position.x, self.position.y, self.size.x, self.size.y
@@ -1490,29 +1354,8 @@ function AIView:_caret_screen_pos()
     local spinner_r = math.floor(7 * SCALE)
     itext_x = itext_x + spinner_r * 2 + math.floor(6 * SCALE)
   end
-  -- split input into lines, find which line the caret is on
-  local s = self.input
-  local lines = {}
-  local i, n = 1, #s
-  while i <= n do
-    local j = i
-    while j <= n and s:byte(j) ~= 10 do j = j + 1 end
-    lines[#lines + 1] = s:sub(i, j - 1)
-    i = j + 1
-  end
-  if #lines == 0 then lines = {""} end
-  local target = self.caret
-  local line_idx, col = 1, 1
-  local acc = 0
-  for li, line in ipairs(lines) do
-    local line_start = acc + 1
-    local line_end = acc + #line
-    if target >= line_start and target <= line_end + 1 then
-      line_idx, col = li, target - line_start + 1
-      break
-    end
-    acc = acc + #line + 1
-  end
+  local line_idx, col = self:_caret_line_info()
+  local lines = self:_input_lines()
   local before = (lines[line_idx] or ""):sub(1, col - 1)
   local cx = itext_x + style.font:get_width(before)
   local cy = itext_y + (line_idx - 1) * lh
@@ -1565,6 +1408,93 @@ end
 
 function AIView:cursor_right()
   if self.caret <= #self.input then self.caret = utf8_next(self.input, self.caret); core.blink_reset(); core.redraw = true end
+end
+
+-- Move the caret up/down within the multi-line input.  When the input is a
+-- single line, fall through to scrolling the message area (preserves the old
+-- single-line behaviour).  Column is clamped to the target line's length.
+function AIView:cursor_up()
+  local lines, starts = self:_input_lines()
+  if #lines <= 1 then return self:scroll_up() end
+  local li, col = self:_caret_line_info()
+  if li <= 1 then
+    self.caret = 1
+  else
+    local prev_line = lines[li - 1]
+    local new_col = math.min(col, #prev_line + 1)
+    self.caret = starts[li - 1] + new_col - 1
+  end
+  core.blink_reset(); core.redraw = true
+end
+
+function AIView:cursor_down()
+  local lines, starts = self:_input_lines()
+  if #lines <= 1 then return self:scroll_down() end
+  local li, col = self:_caret_line_info()
+  if li >= #lines then
+    self.caret = #self.input + 1
+  else
+    local next_line = lines[li + 1]
+    local new_col = math.min(col, #next_line + 1)
+    self.caret = starts[li + 1] + new_col - 1
+  end
+  core.blink_reset(); core.redraw = true
+end
+
+-- Home / End: move to the start / end of the current input line.
+function AIView:line_home()
+  local li = self:_caret_line_info()
+  local _, starts = self:_input_lines()
+  self.caret = starts[li]
+  core.blink_reset(); core.redraw = true
+end
+
+function AIView:line_end()
+  local lines, starts = self:_input_lines()
+  local li = self:_caret_line_info()
+  self.caret = starts[li] + #lines[li]
+  core.blink_reset(); core.redraw = true
+end
+
+-- Delete the previous word (up to the previous word boundary).  A "word" here
+-- is a run of word characters or a run of non-word non-space characters,
+-- matching the editor's symbol_pattern notion loosely.
+local function word_boundary_back(s, pos)
+  local p = pos - 1
+  -- skip trailing whitespace
+  while p >= 1 and s:byte(p) == 32 do p = p - 1 end
+  if p < 1 then return pos end
+  local c = s:byte(p)
+  local is_word = (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+    or (c >= 48 and c <= 57) or c == 95  -- [A-Za-z0-9_]
+  while p >= 1 do
+    local pc = s:byte(p)
+    local pis_word = (pc >= 65 and pc <= 90) or (pc >= 97 and pc <= 122)
+      or (pc >= 48 and pc <= 57) or pc == 95
+    if is_word ~= pis_word then break end
+    if pc == 32 then break end
+    p = p - 1
+  end
+  return p + 1
+end
+
+function AIView:delete_word_back()
+  if self.caret <= 1 then return end
+  local target = word_boundary_back(self.input, self.caret)
+  self.input = self.input:sub(1, target - 1) .. self.input:sub(self.caret)
+  self.caret = target
+  core.blink_reset(); core.redraw = true
+end
+
+-- Delete from the caret back to the start of the current line.
+function AIView:delete_to_line_start()
+  local li = self:_caret_line_info()
+  local _, starts = self:_input_lines()
+  local line_start = starts[li]
+  if self.caret <= line_start then return end
+  self.input = self.input:sub(1, line_start - 1) .. self.input:sub(self.caret)
+  self.caret = line_start
+  core.blink_reset(); core.redraw = true
 end
 
 function AIView:scroll_up()
@@ -1820,17 +1750,25 @@ function AIView:_handle_sse_frame(data, assistant_idx)
   end
 end
 
+-- Terminal failure: mark the assistant message as an error and stop
+-- streaming. Used by every backend when the request cannot start or the
+-- body cannot be sent (session/curl/stdin failures).  In-progress stream
+-- errors (SSE frames, finalize) keep their own logic.
+function AIView:_fail(idx, text)
+  self.messages[idx].role = "error"
+  self.messages[idx].content = text
+  self.streaming = false
+  self._dirty = true
+  core.redraw = true
+end
+
 function AIView:_send_pibridge(assistant_idx, user_text)
   local cfg = config.plugins.aichat
   core.add_thread(function()
     -- 1. ensure session
     local session_id, serr = self:_ensure_session()
     if not session_id then
-      self.messages[assistant_idx].role = "error"
-      self.messages[assistant_idx].content = serr or "无法创建会话"
-      self.streaming = false
-      self._dirty = true
-      core.redraw = true
+      self:_fail(assistant_idx, serr or "无法创建会话")
       return
     end
 
@@ -1843,11 +1781,7 @@ function AIView:_send_pibridge(assistant_idx, user_text)
       cfg.api_base .. "/chat/stream"
     })
     if not ok or not proc then
-      self.messages[assistant_idx].role = "error"
-      self.messages[assistant_idx].content = "curl 启动失败: " .. tostring(proc)
-      self.streaming = false
-      self._dirty = true
-      core.redraw = true
+      self:_fail(assistant_idx, "curl 启动失败: " .. tostring(proc))
       return
     end
     self._stream_proc = proc
@@ -1860,12 +1794,8 @@ function AIView:_send_pibridge(assistant_idx, user_text)
       proc.stdin:close()
     end)
     if not wok then
-      self.messages[assistant_idx].role = "error"
-      self.messages[assistant_idx].content = "请求发送失败: " .. tostring(werr)
-      self.streaming = false
+      self:_fail(assistant_idx, "请求发送失败: " .. tostring(werr))
       self._stream_proc = nil
-      self._dirty = true
-      core.redraw = true
       return
     end
 
@@ -1985,12 +1915,8 @@ function AIView:_send_openai(assistant_idx)
 
   local api_key = cfg.api_key
   if not api_key or #api_key == 0 then
-    self.messages[assistant_idx].role = "error"
-    self.messages[assistant_idx].content =
-      "No API key set. Set OPENAI_API_KEY env var or config.plugins.aichat.api_key."
-    self.streaming = false
-    self._dirty = true
-    core.redraw = true
+    self:_fail(assistant_idx,
+      "No API key set. Set OPENAI_API_KEY env var or config.plugins.aichat.api_key.")
     return
   end
 
@@ -2003,11 +1929,7 @@ function AIView:_send_openai(assistant_idx)
       cfg.endpoint .. "/chat/completions",
     })
     if not ok or not proc then
-      self.messages[assistant_idx].role = "error"
-      self.messages[assistant_idx].content = "Failed to start curl: " .. tostring(proc)
-      self.streaming = false
-      self._dirty = true
-      core.redraw = true
+      self:_fail(assistant_idx, "Failed to start curl: " .. tostring(proc))
       return
     end
 
@@ -2016,11 +1938,7 @@ function AIView:_send_openai(assistant_idx)
       proc.stdin:close()
     end)
     if not wok then
-      self.messages[assistant_idx].role = "error"
-      self.messages[assistant_idx].content = "Failed to send request: " .. tostring(werr)
-      self.streaming = false
-      self._dirty = true
-      core.redraw = true
+      self:_fail(assistant_idx, "Failed to send request: " .. tostring(werr))
       return
     end
 
@@ -2150,35 +2068,9 @@ function AIView:_input_wrapped(width)
 end
 
 function AIView:_draw_caret(x, y, width, lh)
-  local s = self.input
-  local lines = {}
-  local i = 1
-  local n = #s
-  while i <= n do
-    local j = i
-    while j <= n and s:byte(j) ~= 10 do j = j + 1 end
-    lines[#lines + 1] = s:sub(i, j - 1)
-    i = j + 1
-  end
-  if #lines == 0 then lines = {""} end
-
-  local target = self.caret
-  local line_idx = 1
-  local col = 1
-  local acc = 0
-  for li, line in ipairs(lines) do
-    local line_start = acc + 1
-    local line_end = acc + #line
-    if target >= line_start and target <= line_end + 1 then
-      line_idx = li
-      col = target - line_start + 1
-      break
-    end
-    acc = acc + #line + 1
-  end
-
-  local caret_line = lines[line_idx] or ""
-  local before = caret_line:sub(1, col - 1)
+  local line_idx, col = self:_caret_line_info()
+  local lines = self:_input_lines()
+  local before = (lines[line_idx] or ""):sub(1, col - 1)
   local cx = x + style.font:get_width(before)
   local cy = y + (line_idx - 1) * lh
   renderer.draw_rect(cx, cy, style.caret_width, lh, style.caret or style.text)
@@ -2279,14 +2171,18 @@ function AIView:draw()
         for rl_idx, rline in ipairs(blk.rlines) do
           local ly = rline_text_top(rline, cum_y)
           local sx = msg_x + pad.x + (rline.indent or 0)
-          -- fenced-block background: covers the line's own padding (so the text
-          -- is not flush with the edge) but not the gap in front of the block;
-          -- +1 merges with the neighbouring line's rect
+          -- fenced-block / table background.  Previously each line drew its
+          -- own rect with a translucent fill and a +1 merge hack; the +1 made
+          -- adjacent rects overlap by 1px, and because the fill is translucent
+          -- the overlap stacked alpha into a visible dark rule between every
+          -- pair of code lines.  Now each rect covers exactly mt+h+mb with no
+          -- +1: code-block body lines have sp=0 between them, so their rects
+          -- abut exactly — no overlap (no stacked alpha), no seam.
           if rline.bg then
             local bg_x, bg_w = msg_x + math.floor(pad.x * 0.5), msg_w - pad.x
             if rline.table_w then bg_x, bg_w = msg_x + pad.x, rline.table_w end
             renderer.draw_rect(bg_x, cum_y + (rline.sp or 0), bg_w,
-              math.max(1, (rline.mt or 0) + rline.h + (rline.mb or 0) + 1),
+              math.max(1, (rline.mt or 0) + rline.h + (rline.mb or 0)),
               rline.bg)
           end
           -- table header rule
@@ -2437,8 +2333,12 @@ end, {
   ["aichat:backspace"] = function() if ai_view then ai_view:backspace() end end,
   ["aichat:left"]      = function() if ai_view then ai_view:cursor_left() end end,
   ["aichat:right"]     = function() if ai_view then ai_view:cursor_right() end end,
-  ["aichat:up"]        = function() if ai_view then ai_view:scroll_up() end end,
-  ["aichat:down"]      = function() if ai_view then ai_view:scroll_down() end end,
+  ["aichat:up"]        = function() if ai_view then ai_view:cursor_up() end end,
+  ["aichat:down"]      = function() if ai_view then ai_view:cursor_down() end end,
+  ["aichat:line-home"] = function() if ai_view then ai_view:line_home() end end,
+  ["aichat:line-end"]  = function() if ai_view then ai_view:line_end() end end,
+  ["aichat:delete-word-back"] = function() if ai_view then ai_view:delete_word_back() end end,
+  ["aichat:delete-to-line-start"] = function() if ai_view then ai_view:delete_to_line_start() end end,
   ["aichat:copy"]      = function()
     if ai_view and ai_view:_has_selection() then
       local text = ai_view:_get_selected_text()
@@ -2459,6 +2359,15 @@ keymap.add({
   ["right"]        = "aichat:right",
   ["up"]           = "aichat:up",
   ["down"]         = "aichat:down",
+  ["cmd+left"]     = "aichat:line-home",
+  ["cmd+right"]    = "aichat:line-end",
+  ["ctrl+left"]    = "aichat:line-home",
+  ["ctrl+right"]   = "aichat:line-end",
+  ["home"]         = "aichat:line-home",
+  ["end"]          = "aichat:line-end",
+  ["alt+backspace"]    = "aichat:delete-word-back",
+  ["ctrl+backspace"]   = "aichat:delete-word-back",
+  ["cmd+backspace"]    = "aichat:delete-to-line-start",
   ["cmd+c"]        = "aichat:copy",
   ["ctrl+c"]       = "aichat:copy",
 })
