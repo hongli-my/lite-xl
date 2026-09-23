@@ -1,3 +1,5 @@
+#ifndef RENWINDOW_H
+#define RENWINDOW_H
 #include <SDL3/SDL.h>
 #include "renderer.h"
 
@@ -31,4 +33,6 @@ void renwin_show_window(RenWindow *ren);
 void renwin_update_rects(RenWindow *ren, RenRect *rects, int count);
 void renwin_free(RenWindow *ren);
 RenSurface renwin_get_surface(RenWindow *ren);
+
+#endif /* RENWINDOW_H */
 

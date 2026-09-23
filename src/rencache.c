@@ -20,6 +20,7 @@
 #include <lauxlib.h>
 #include "rencache.h"
 #include "renwindow.h"
+#include "gpu_renderer.h"
 
 /* a cache over the software renderer -- all drawing operations are stored as
 ** commands when issued. At the end of the frame we write the commands to a grid
@@ -326,6 +327,15 @@ void rencache_end_frame(RenWindow *window_renderer) {
   }
 
   RenSurface rs = renwin_get_surface(window_renderer);
+#ifdef LITE_USE_GPU_RENDERER
+  /* GPU path is currently disabled at the rencache level. All drawing goes
+   * to the CPU surface as usual, and presentation is handled by
+   * renwin_update_rects -> gpu_present_surface (Stage 1 path, known good).
+   * The Stage 2 GPU draw_rect/draw_text code in gpu_renderer.c is compiled
+   * and ready, but not wired into rencache until text is also on GPU (2b),
+   * so rect/text layering stays correct. */
+  /* (Stage 2 rencache GPU path goes here once 2b is done.) */
+#endif
   /* redraw updated regions */
   for (int i = 0; i < rect_count; i++) {
     /* draw */

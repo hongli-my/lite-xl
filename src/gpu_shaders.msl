@@ -1,0 +1,126 @@
+/* Metal Shading Language (MSL) shaders for lite-xl GPU renderer.
+ *
+ * SDL_gpu's Metal backend compiles MSL *source strings* at runtime via
+ * [MTLDevice newLibraryWithSource:options:error:], so no offline metal
+ * compiler is needed — we just embed the source as C string literals.
+ *
+ * Binding conventions (per SDL_gpu Metal backend):
+ *   - Vertex attributes come via [[stage_in]] + [[attribute(n)]]; the actual
+ *     vertex buffer occupies Metal slot 14+ (METAL_FIRST_VERTEX_BUFFER_SLOT),
+ *     managed by SDL_gpu — the shader never references it directly.
+ *   - Uniform buffers: [[buffer(0)]] for both vertex and fragment stages
+ *     (they're separate address spaces, no conflict).
+ *   - Samplers/textures: [[sampler(0)]] / [[texture(0)]] in fragment stage.
+ *
+ * Coordinate convention: pixel coords (top-left origin) -> NDC in vertex
+ * shader. Y flipped so pixel y=0 (top) maps to NDC y=+1 (top), because
+ * Metal's framebuffer origin is top-left but NDC Y is up.
+ */
+
+#include <metal_stdlib>
+using namespace metal;
+
+/*=============================================================================
+ * Stage 2a: solid-color rectangle
+ *===========================================================================*/
+
+typedef struct {
+  float2 position [[attribute(0)]];
+  float2 texcoord [[attribute(1)]];
+} RectVertexIn;
+
+typedef struct {
+  float4 position [[position]];
+} RectVertexOut;
+
+/* Vertex uniform: viewport size in pixels (zw unused, vec4 for std140). */
+typedef struct {
+  float4 viewport;
+} RectVertexUniform;
+
+vertex RectVertexOut
+lite_rect_vertex(RectVertexIn in [[stage_in]],
+                 constant RectVertexUniform &u [[buffer(0)]])
+{
+  RectVertexOut out;
+  float x = (in.position.x / u.viewport.x) * 2.0 - 1.0;
+  float y = 1.0 - (in.position.y / u.viewport.y) * 2.0;
+  out.position = float4(x, y, 0.0, 1.0);
+  return out;
+}
+
+typedef struct {
+  float4 color; /* straight alpha */
+} RectFragmentUniform;
+
+fragment float4
+lite_rect_fragment(RectVertexOut in [[stage_in]],
+                   constant RectFragmentUniform &u [[buffer(0)]])
+{
+  return u.color;
+}
+
+/*=============================================================================
+ * Stage 2b: textured glyph rendering
+ *===========================================================================*/
+
+typedef struct {
+  float2 position [[attribute(0)]];
+  float2 texcoord [[attribute(1)]];
+} TextVertexIn;
+
+typedef struct {
+  float4 position [[position]];
+  float2 texcoord;
+} TextVertexOut;
+
+typedef struct {
+  float4 viewport;
+} TextVertexUniform;
+
+vertex TextVertexOut
+lite_text_vertex(TextVertexIn in [[stage_in]],
+                 constant TextVertexUniform &u [[buffer(0)]])
+{
+  TextVertexOut out;
+  float x = (in.position.x / u.viewport.x) * 2.0 - 1.0;
+  float y = 1.0 - (in.position.y / u.viewport.y) * 2.0;
+  out.position = float4(x, y, 0.0, 1.0);
+  out.texcoord = in.texcoord;
+  return out;
+}
+
+/* Fragment uniform for text. std140: vec4 + vec4 = 32 bytes.
+ *   color: foreground tint (straight alpha)
+ *   mode:  x = 0 grayscale, 1 subpixel, 2 color (emoji) */
+typedef struct {
+  float4 color;
+  float4 mode;
+} TextFragmentUniform;
+
+fragment float4
+lite_text_fragment(TextVertexOut in [[stage_in]],
+                   constant TextFragmentUniform &u [[buffer(0)]],
+                   texture2d<float> atlas [[texture(0)]],
+                   sampler atlasSampler [[sampler(0)]])
+{
+  float4 glyph = atlas.sample(atlasSampler, in.texcoord);
+  int mode = int(u.mode.x);
+  float4 result;
+  if (mode == 2) {
+    /* Color glyph (emoji): use glyph's own RGB, alpha = glyph.a * fg.a */
+    result.rgb = glyph.rgb;
+    result.a = glyph.a * u.color.a;
+  } else if (mode == 1) {
+    /* Subpixel LCD: glyph.rgb is per-channel coverage */
+    float coverage = (glyph.r + glyph.g + glyph.b) / 3.0;
+    result.rgb = u.color.rgb * glyph.rgb;
+    result.a = coverage * u.color.a;
+  } else {
+    /* Grayscale: glyph.r is coverage */
+    float coverage = glyph.r;
+    result.rgb = u.color.rgb;
+    result.a = coverage * u.color.a;
+  }
+  return result;
+}
