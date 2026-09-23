@@ -63,14 +63,15 @@ lite_rect_fragment(RectVertexOut in [[stage_in]],
 /*=============================================================================
  * Stage 2b: textured glyph rendering
  *
- * Uses Metal framebuffer fetch ([[color(0)]]) to read the destination pixel
- * and do per-channel compositing in the shader. This replaces dual-source
- * blending (which SDL_gpu 3.2.8 doesn't expose) for LCD subpixel rendering.
- * On Apple Silicon (tile-based deferred renderer) framebuffer fetch is free —
- * data stays in tile memory, no round-trip to system RAM.
+ * Uses premultiplied-alpha blending instead of Metal framebuffer fetch.
+ * The shader outputs (color.rgb * coverage, coverage) and the pipeline
+ * blends with SRC_ALPHA / ONE_MINUS_SRC_ALPHA, giving:
+ *   result = color.rgb * coverage + dst.rgb * (1 - coverage)
+ * which exactly matches the CPU grayscale formula.
  *
- * Render target load_op must be CLEAR or LOAD (not DONTCARE) so [[color(0)]]
- * has defined contents for the first draw in each tile.
+ * For subpixel LCD, we approximate by averaging the R/G/B coverage channels.
+ * This loses subpixel sharpness but is correct color-wise. A framebuffer-fetch
+ * path can be added later for true per-channel LCD blending.
  *===========================================================================*/
 
 typedef struct {
@@ -111,27 +112,26 @@ fragment float4
 lite_text_fragment(TextVertexOut in [[stage_in]],
                    constant TextFragmentUniform &u [[buffer(0)]],
                    texture2d<float> atlas [[texture(0)]],
-                   sampler atlasSampler [[sampler(0)]],
-                   float4 dst [[color(0)]])
+                   sampler atlasSampler [[sampler(0)]])
 {
   float4 glyph = atlas.sample(atlasSampler, in.texcoord);
   int mode = int(u.mode.x);
-  float3 rgb;
-  /* All modes composite onto dst via per-channel coverage.
-   *   result = src * coverage + dst * (1 - coverage)
-   * Alpha is always 1.0 (render target is opaque, blitted to swapchain). */
+  float coverage;
+  float3 src_color;
+
   if (mode == 2) {
     /* Color emoji: glyph provides RGB + alpha coverage */
-    float3 coverage = float3(glyph.a * u.color.a);
-    rgb = glyph.rgb * coverage + dst.rgb * (1.0 - coverage);
+    coverage = glyph.a * u.color.a;
+    src_color = glyph.rgb;
   } else if (mode == 1) {
-    /* Subpixel LCD: glyph.rgb is per-R/G/B channel coverage */
-    float3 coverage = glyph.rgb * u.color.a;
-    rgb = u.color.rgb * coverage + dst.rgb * (1.0 - coverage);
+    /* Subpixel LCD: average R/G/B coverage (approximation) */
+    coverage = (glyph.r + glyph.g + glyph.b) / 3.0 * u.color.a;
+    src_color = u.color.rgb;
   } else {
     /* Grayscale: glyph.r is uniform coverage */
-    float coverage = glyph.r * u.color.a;
-    rgb = u.color.rgb * coverage + dst.rgb * (1.0 - coverage);
+    coverage = glyph.r * u.color.a;
+    src_color = u.color.rgb;
   }
-  return float4(rgb, 1.0);
+  /* Premultiplied output: blend does result = src + dst*(1-alpha) */
+  return float4(src_color * coverage, coverage);
 }
