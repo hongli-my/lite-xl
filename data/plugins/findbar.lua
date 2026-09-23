@@ -1051,10 +1051,6 @@ end, {
     end
     return true
   end,
-  ["findbar:escape"] = function()
-    close_bar()
-    return true
-  end,
   ["findbar:history-previous"] = function(field)
     field:history_walk(-1)
     return true
@@ -1082,13 +1078,28 @@ command.add(function() return bar_open() end, {
   end,
 })
 
+-- Esc must close the bar whenever it is open, not only when a field has the
+-- focus: clicking into the document (or switching tabs) moves the focus away
+-- from the field, but the bar stays on screen and Esc should still dismiss it.
+-- Gated on state.open alone (not bar_open, which also needs a compiled query)
+-- so an empty bar can be dismissed too.  Overrides the FindField registration
+-- above (command.add replaces existing entries).
+command.add(function() return state.open end, {
+  ["findbar:escape"] = function()
+    close_bar()
+    return true
+  end,
+})
+
 command.add(nil, {
   ["findbar:find"] = function()
     local was_open = state.open
     if not open_bar() then
-      -- no document has been opened yet: fall back to the stock prompt, which
-      -- reports the usual "Couldn't find" instead of a dead shortcut
-      if legacy and legacy.find then legacy.find.perform() end
+      -- No document to search: nothing to do.  We must not call the legacy
+      -- find prompt here: its .perform() runs the handler unconditionally
+      -- (no predicate check) and the handler dereferences
+      -- core.active_view.doc, which is nil when no DocView exists, so it
+      -- would crash with "attempt to index a nil value".
       return true
     end
     -- Seed the query from the selection, but only when the bar was closed: once
@@ -1139,7 +1150,6 @@ command.add(nil, {
   ["findbar:find-replace"] = function()
     local was_open = state.open
     if not open_bar(true) then
-      if legacy and legacy.replace then legacy.replace.perform() end
       return true
     end
     if not was_open then
@@ -1281,8 +1291,6 @@ end
 -- implementations stay in core/commands/findreplace.lua and are used when the
 -- bar has no query yet (their `last_fn`/`last_text` still work).
 legacy = {
-  find = command.map["find-replace:find"],
-  replace = command.map["find-replace:replace"],
   repeat_find = command.map["find-replace:repeat-find"],
   previous_find = command.map["find-replace:previous-find"],
 }
