@@ -470,7 +470,7 @@ bool gpu_begin_frame(RenWindow *ren) {
 
   g_frame_count++;
   if (g_frame_count == 1)
-    fprintf(stderr, "[gpu] GPU render path active (Metal)\n");
+    fprintf(stderr, "[gpu] GPU render path active (Metal, %dx%d)\n", w, h);
 
   /* Map the vertex transfer buffer for streaming verts during the frame. */
   s->vbuf_mapped = SDL_MapGPUTransferBuffer(g_ctx.device, s->vbuf_xfer, true);
@@ -516,9 +516,14 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   if (!s || !s->vbuf_mapped || !s->cmd) return;
   if (s->vbuf_used + 4 > s->vbuf_capacity) return;
 
+  /* rencache commands use logical (HiDPI-divided) coordinates; the GPU
+   * render target is in physical pixels, so scale up. */
+  RenSurface rs = renwin_get_surface(ren);
+  int ss = rs.scale;
+
   /* Triangle strip quad: TL, BL, TR, BR (Y-down, top-left origin in pixels). */
-  float x0 = (float)rect.x, y0 = (float)rect.y;
-  float x1 = (float)(rect.x + rect.width), y1 = (float)(rect.y + rect.height);
+  float x0 = (float)(rect.x * ss), y0 = (float)(rect.y * ss);
+  float x1 = (float)((rect.x + rect.width) * ss), y1 = (float)((rect.y + rect.height) * ss);
   GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
   v[0] = (GpuVertex){ x0, y0, 0, 0 };
   v[1] = (GpuVertex){ x0, y1, 0, 1 };
@@ -532,8 +537,8 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   d->kind = GPU_DRAW_RECT;
   d->vert_offset = off;
   d->vert_count = 4;
-  d->clip = (SDL_FRect){ (float)clip.x, (float)clip.y,
-                         (float)clip.width, (float)clip.height };
+  d->clip = (SDL_FRect){ (float)(clip.x * ss), (float)(clip.y * ss),
+                         (float)(clip.width * ss), (float)(clip.height * ss) };
   d->funiform[0] = color.r / 255.0f;
   d->funiform[1] = color.g / 255.0f;
   d->funiform[2] = color.b / 255.0f;

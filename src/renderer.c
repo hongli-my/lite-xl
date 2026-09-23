@@ -812,6 +812,11 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
   y *= surface_scale;
   const char* end = text + len;
 
+  /* clip is in logical pixels; text quads are in physical pixels, so scale
+   * the clip for the scissor. gpu_draw_rect scales internally. */
+  RenRect clip_phys = { clip.x * surface_scale, clip.y * surface_scale,
+                        clip.width * surface_scale, clip.height * surface_scale };
+
   RenFont* last = NULL;
   double last_pen_x = pen_x;
   bool underline = fonts[0]->style & FONT_STYLE_UNDERLINE;
@@ -853,7 +858,7 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
         verts[1] = (GpuTextVertex){ (float)start_x, (float)(gy + gh), 0.0f, v1 };
         verts[2] = (GpuTextVertex){ (float)end_x,  (float)gy, u1, v0 };
         verts[3] = (GpuTextVertex){ (float)end_x,  (float)(gy + gh), u1, v1 };
-        gpu_draw_text_quads(ren, tex, verts, 4, color, metric->format, clip);
+        gpu_draw_text_quads(ren, tex, verts, 4, color, metric->format, clip_phys);
       }
     }
 

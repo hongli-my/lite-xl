@@ -403,8 +403,12 @@ void rencache_end_frame(RenWindow *window_renderer) {
     }
   }
 
-  /* update dirty rects */
-  if (rect_count > 0) {
+  /* update dirty rects (CPU path only; GPU path presents in gpu_end_frame) */
+  bool gpu_presented = false;
+#ifdef LITE_USE_GPU_RENDERER
+  gpu_presented = (window_renderer->gpu_state != NULL);
+#endif
+  if (!gpu_presented && rect_count > 0) {
     ren_update_rects(window_renderer, rect_buf, rect_count);
   }
 
