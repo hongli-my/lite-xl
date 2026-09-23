@@ -61,7 +61,46 @@ static void add_menu_item(NSMenu *menu, NSString *title, NSString *cmd, NSString
   [item setRepresentedObject:cmd];
 }
 
+/* 本地事件监视器：在 AppKit 派发 keydown 之前截获 Cmd+W。
+ * macOS 下 Cmd+W 会触发 NSWindow performClose:（窗口带标准 close 按钮），
+ * 即便窗口 delegate windowShouldClose: 返回 NO 不关窗，SDL3 仍会因
+ * "唯一顶层窗口被请求关闭"而 post SDL_EVENT_QUIT；全屏/最大化过渡动画
+ * 会让该 quit 延迟到 key 事件之后入队，漏过 system.c 里的 1000ms quit
+ * 过滤（CMD_W_QUIT_IGNORE_MS hack），导致编辑器误退出而不是关闭标签。
+ *
+ * 在事件派发前吃掉 Cmd+W 并直接投递 root:close 命令，从源头消除
+ * performClose:，于是不再产生 SDL_EVENT_QUIT。事件被吞后 SDL keymap
+ * 那条 cmd+w 绑定也不再触发，关标签统一走 menucmd 路径，其 0.15s
+ * 去重与 root:close 自身的 300ms 去重共同处理按键重复，行为同现状。 */
+static id g_cmdw_monitor = nil;
+
+static BOOL event_is_cmd_w_key(NSEvent *e) {
+  if ([e type] != NSEventTypeKeyDown) return NO;
+  /* 只看逻辑修饰键，过滤设备相关位（如 caps lock 状态） */
+  NSUInteger mods = [e modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
+  if (!(mods & NSEventModifierFlagCommand)) return NO;
+  /* 排除带 Option/Control/Shift 的变体，留给其它绑定 */
+  if (mods & (NSEventModifierFlagOption | NSEventModifierFlagControl | NSEventModifierFlagShift)) return NO;
+  /* 与 AppKit 的 key equivalent 匹配一致，用忽略修饰键后的字符，
+   * 精确拦截 AppKit 会触发 performClose: 的那个事件 */
+  return [[[e charactersIgnoringModifiers] lowercaseString] isEqualToString:@"w"];
+}
+
+static void install_cmdw_monitor(void) {
+  if (g_cmdw_monitor != nil) return;  /* 进程级，只挂一次；原地重启不重复 */
+  g_cmdw_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                                          handler:^NSEvent *(NSEvent *e) {
+    if (event_is_cmd_w_key(e)) {
+      push_menu_command(@"root:close");
+      return nil;  /* 吞掉，阻止 performClose: → SDL_EVENT_QUIT */
+    }
+    return e;
+  }];
+}
+
 static void install_main_menu(void) {
+  install_cmdw_monitor();
+
   /* The key equivalents below intentionally repeat bindings that already exist
    * in data/core/keymap-macos.lua: out of a bundle there is no native menu, so
    * the keymap is the only way to reach those commands.  When the bundle is
