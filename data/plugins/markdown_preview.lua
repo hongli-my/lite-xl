@@ -24,6 +24,12 @@ local common = require "core.common"
 local View = require "core.view"
 local DocView = require "core.docview"
 local Doc = require "core.doc"
+local util = require "core.util"
+-- Local aliases for the shared helpers in core.util; keeps the call sites
+-- unchanged while removing the per-plugin copies.
+local is_dark = util.is_dark
+local shell_escape, open_url, open_path = util.shell_escape, util.open_url, util.open_path
+local truncate_to_width = util.truncate_to_width
 
 config.plugins.markdown_preview = common.merge({
   max_cached_images = 32,
@@ -67,23 +73,6 @@ rebuild_fonts()
 -- ============================================================
 -- Theme-aware colors
 -- ============================================================
-local function luminance(c) return (c[1] * 0.299 + c[2] * 0.587 + c[3] * 0.114) / 255 end
-local function is_dark() return luminance(style.background) < 0.5 end
-
--- Truncate `text` to fit within `max_w` (in the given font), appending "…".
-local function truncate_to_width(font, text, max_w)
-  if max_w <= 0 then return "" end
-  if font:get_width(text) <= max_w then return text end
-  local ell = "…"
-  local ew = font:get_width(ell)
-  if max_w <= ew then return ell end
-  local lo, hi = 1, #text
-  while lo < hi do
-    local mid = math.floor((lo + hi + 1) / 2)
-    if font:get_width(text:sub(1, mid)) + ew <= max_w then lo = mid else hi = mid - 1 end
-  end
-  return text:sub(1, lo) .. ell
-end
 
 -- Theme-aware background colors. Cached and rebuilt only when the theme
 -- (style.background reference) changes, to avoid allocating tables every frame.
@@ -950,36 +939,6 @@ function MarkdownPreviewView:on_mouse_left(...)
   self.hovered_link = nil
   self.hovered_copy_btn = nil
   self.hovered_heading = nil
-end
-
-local function shell_escape(s)
-  -- POSIX single-quote escape; safe against shell metacharacters
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
-
-local function open_url(url)
-  -- only allow safe schemes to prevent shell injection via crafted URLs
-  if not (url:match("^https?://") or url:match("^mailto:") or url:match("^file://") or url:match("^ftp://")) then
-    core.log("Refused to open unsafe link: %s", url)
-    return
-  end
-  if PLATFORM == "macOS" or PLATFORM == "Mac OS X" then
-    os.execute("open " .. shell_escape(url) .. " 2>/dev/null")
-  elseif PLATFORM == "Linux" then
-    os.execute("xdg-open " .. shell_escape(url) .. " 2>/dev/null")
-  elseif PLATFORM == "Windows" then
-    os.execute('start "" "' .. url:gsub('"', '') .. '"')
-  end
-end
-
-local function open_path(path)
-  if PLATFORM == "macOS" or PLATFORM == "Mac OS X" then
-    os.execute("open " .. shell_escape(path) .. " 2>/dev/null")
-  elseif PLATFORM == "Linux" then
-    os.execute("xdg-open " .. shell_escape(path) .. " 2>/dev/null")
-  elseif PLATFORM == "Windows" then
-    os.execute('start "" "' .. path:gsub('"', '') .. '"')
-  end
 end
 
 function MarkdownPreviewView:on_mouse_pressed(button, x, y, clicks)

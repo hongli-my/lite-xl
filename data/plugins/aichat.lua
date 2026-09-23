@@ -39,6 +39,11 @@ config.plugins.aichat = common.merge({
 
 
 local json = require "core.json"
+local util = require "core.util"
+-- Local aliases for the shared helpers in core.util; keeps the many call sites
+-- unchanged while removing the per-plugin copies.
+local blend, with_alpha = util.blend, util.with_alpha
+local shell_escape, open_url = util.shell_escape, util.open_url
 
 -------------------------------------------------------------------------------
 -- Word-wrap helper: wraps text into lines fitting max_width using font metrics.
@@ -121,24 +126,6 @@ end
 -- line is broken: wrapping first split "[the docs](url)", `code` or **bold**
 -- across two lines, and the markers then rendered as literal text.
 -- Returns a list of lines, each a list of { text = ..., seg = <style table> }.
--- Truncate to a pixel width, appending an ellipsis (UTF-8 aware).
-local function truncate_to_width(text, font, max_w)
-  if font:get_width(text) <= max_w then return text end
-  local ell_w = font:get_width("…")
-  local out, cur = "", 0
-  local p = 1
-  while p <= #text do
-    local nxt = utf8_next(text, p)
-    local ch = text:sub(p, nxt - 1)
-    local cw = font:get_width(ch)
-    if cur + cw + ell_w > max_w then break end
-    out = out .. ch
-    cur = cur + cw
-    p = nxt
-  end
-  return out .. "…"
-end
-
 -- GFM table helpers (a row of | cells, a ---|:--: delimiter row, body rows).
 local function split_table_row(row)
   local cells = {}
@@ -232,41 +219,6 @@ end
 -- Cached custom colors (style.* colors are read live in draw so theme switches work).
 local COLOR_ERROR = { common.color("#ff5555") }
 local COLOR_OK    = { common.color("#5fd75f") }
-
--- Blend two {r,g,b,a} colors: t=0 -> c1, t=1 -> c2. Alpha taken from c1.
-local function blend(c1, c2, t)
-  return {
-    math.floor((c1[1] or 0) + ((c2[1] or 0) - (c1[1] or 0)) * t),
-    math.floor((c1[2] or 0) + ((c2[2] or 0) - (c1[2] or 0)) * t),
-    math.floor((c1[3] or 0) + ((c2[3] or 0) - (c1[3] or 0)) * t),
-    c1[4] or 255,
-  }
-end
-
--- Return a copy of color c with the given alpha (0-255).
-local function with_alpha(c, a)
-  return { c[1] or 0, c[2] or 0, c[3] or 0, a }
-end
-
--- Open a link from the panel: POSIX-escaped, scheme whitelisted (a message is
--- untrusted text, it arrives from the model).
-local function shell_escape(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
-
-local function open_url(url)
-  if not (url:match("^https?://") or url:match("^mailto:") or url:match("^ftp://")) then
-    core.log("拒绝打开不安全的链接: %s", url)
-    return
-  end
-  if PLATFORM == "macOS" or PLATFORM == "Mac OS X" then
-    os.execute("open " .. shell_escape(url) .. " 2>/dev/null")
-  elseif PLATFORM == "Linux" then
-    os.execute("xdg-open " .. shell_escape(url) .. " 2>/dev/null")
-  elseif PLATFORM == "Windows" then
-    os.execute('start "" "' .. url:gsub('"', '') .. '"')
-  end
-end
 
 -- Advance width of a segment.  Segments may carry an explicit advance instead
 -- of deriving it from the font: table cells use it so columns line up exactly
@@ -602,7 +554,7 @@ local function layout_md(text, max_width)
 
     local function cell_text(cells, ci)
       local w = col_w[ci]
-      local text = truncate_to_width(cells[ci] or "", tfont, w - pad_c * 2 * unit)
+      local text = util.truncate_to_width(tfont, cells[ci] or "", w - pad_c * 2 * unit)
       local slack = math.max(0, w - tfont:get_width(text))
       local off = pad_c * unit
       local align = aligns[ci] or "left"
