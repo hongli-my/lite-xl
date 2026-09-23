@@ -6,3 +6,4 @@ option('dirmonitor_backend', type : 'combo', value : '', choices : ['', 'inotify
 option('arch_tuple', type : 'string', value : '', description: 'Specify a custom architecture tuple')
 option('use_system_lua', type : 'boolean', value : false, description: 'Prefer System Lua over a the meson wrap')
 option('bundle_plugins', type : 'array', value : [], description: 'Plugins to bundle when building Lite XL')
+option('gpu_renderer', type : 'boolean', value : false, description: 'Use SDL_gpu for presentation (experimental; macOS/Metal only)')

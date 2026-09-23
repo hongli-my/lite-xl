@@ -13,6 +13,11 @@ struct RenWindow {
   SDL_Texture *texture;
   RenSurface rensurface;
 #endif
+#ifdef LITE_USE_GPU_RENDERER
+  /* Opaque per-window GPU state (GpuWindowState in gpu_renderer.c). NULL when
+   * the GPU backend is disabled for this window or not attached yet. */
+  void *gpu_state;
+#endif
 };
 typedef struct RenWindow RenWindow;
 

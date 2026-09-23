@@ -110,7 +110,11 @@ int main(int argc, char **argv) {
 #endif
 
   SDL_SetAppMetadata("Lite XL", LITE_PROJECT_VERSION_STR, "com.lite_xl.LiteXL");
-  if (!SDL_Init(SDL_INIT_EVENTS)) {
+  if (!SDL_Init(SDL_INIT_EVENTS
+#ifdef LITE_USE_GPU_RENDERER
+    | SDL_INIT_VIDEO
+#endif
+  )) {
     fprintf(stderr, "Error initializing sdl: %s", SDL_GetError());
     exit(1);
   }

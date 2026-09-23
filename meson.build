@@ -57,6 +57,12 @@ lite_cargs = [
 if get_option('renderer') or host_machine.system() == 'darwin'
     lite_cargs += '-DLITE_USE_SDL_RENDERER'
 endif
+# Experimental SDL_gpu presentation backend (macOS/Metal). When enabled the
+# software surface is still the drawing target; only the final present step
+# goes through SDL_gpu. See src/gpu_renderer.c.
+if get_option('gpu_renderer')
+    lite_cargs += '-DLITE_USE_GPU_RENDERER'
+endif
 if get_option('arch_tuple') != ''
     arch_tuple = get_option('arch_tuple')
 else
@@ -70,6 +76,11 @@ lite_cargs += '-DLITE_ARCH_TUPLE="@0@"'.format(arch_tuple)
 lite_link_args = []
 if host_machine.system() == 'darwin'
     lite_link_args += ['-framework', 'CoreServices', '-framework', 'Foundation', '-framework', 'AppKit']
+    # SDL_gpu Metal backend (static SDL3 already pulls Metal, but be explicit so
+    # the gpu_renderer.c symbols resolve even with -Wl,-dead_strip_dylibs).
+    if get_option('gpu_renderer')
+        lite_link_args += ['-framework', 'Metal', '-framework', 'QuartzCore']
+    endif
 endif
 #===============================================================================
 # Install Configuration

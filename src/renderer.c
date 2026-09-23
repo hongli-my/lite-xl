@@ -12,6 +12,7 @@
 
 #include "renderer.h"
 #include "renwindow.h"
+#include "gpu_renderer.h"
 
 // uncomment the line below for more debugging information through printf
 // #define RENDERER_DEBUG
@@ -884,10 +885,18 @@ int ren_init(void) {
   if ((err = FT_Init_FreeType(&library)) != 0)
     return SDL_SetError("%s", get_ft_error(err));
 
+#ifdef LITE_USE_GPU_RENDERER
+  if (!gpu_init())
+    return -1; // error already logged by gpu_init
+#endif
+
   return 0;
 }
 
 void ren_free(void) {
+#ifdef LITE_USE_GPU_RENDERER
+  gpu_free();
+#endif
   SDL_DestroySurface(draw_rect_surface);
   FT_Done_FreeType(library);
 }
@@ -900,6 +909,13 @@ RenWindow* ren_create(SDL_Window *win) {
   renwin_init_surface(window_renderer);
   renwin_init_command_buf(window_renderer);
   renwin_clip_to_surface(window_renderer);
+
+#ifdef LITE_USE_GPU_RENDERER
+  /* Claim the window for GPU presentation. If this fails we keep running on
+   * the SDL renderer / surface fallback (renwin_update_rects checks
+   * gpu_state before using the GPU path). */
+  gpu_window_attach(window_renderer);
+#endif
 
   ren_add_window(window_renderer);
   return window_renderer;

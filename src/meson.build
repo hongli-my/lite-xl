@@ -13,6 +13,10 @@ lite_sources = [
     'rencache.c',
     'main.c',
 ]
+# SDL_gpu presentation backend (only compiled in when the meson option is on).
+if get_option('gpu_renderer')
+    lite_sources += 'gpu_renderer.c'
+endif
 
 #===============================================================================
 # Dependencies

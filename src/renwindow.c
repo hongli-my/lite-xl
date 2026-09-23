@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "renwindow.h"
+#include "gpu_renderer.h"
 
 #ifdef LITE_USE_SDL_RENDERER
 static int query_surface_scale(RenWindow *ren) {
@@ -99,6 +100,11 @@ void renwin_resize_surface(RenWindow *ren) {
     setup_renderer(ren, new_w, new_h);
   }
 #endif
+#ifdef LITE_USE_GPU_RENDERER
+  /* The staging texture / transfer buffer are sized to the surface; drop
+   * them so they get recreated on the next present. */
+  if (ren->gpu_state) gpu_window_resize(ren);
+#endif
 }
 
 void renwin_update_scale(RenWindow *ren) {
@@ -116,6 +122,16 @@ void renwin_show_window(RenWindow *ren) {
 }
 
 void renwin_update_rects(RenWindow *ren, RenRect *rects, int count) {
+#ifdef LITE_USE_GPU_RENDERER
+  /* GPU backend takes over presentation: upload the software surface to a
+   * GPU texture and blit it to the swapchain. Falls through to the SDL
+   * renderer / surface path if the GPU state isn't attached. */
+  if (ren->gpu_state) {
+    RenSurface rs = renwin_get_surface(ren);
+    gpu_present_surface(ren, rs.surface, rects, count);
+    return;
+  }
+#endif
 #ifdef LITE_USE_SDL_RENDERER
   const int scale = ren->rensurface.scale;
   for (int i = 0; i < count; i++) {
@@ -134,6 +150,9 @@ void renwin_update_rects(RenWindow *ren, RenRect *rects, int count) {
 }
 
 void renwin_free(RenWindow *ren) {
+#ifdef LITE_USE_GPU_RENDERER
+  if (ren->gpu_state) gpu_window_detach(ren);
+#endif
 #ifdef LITE_USE_SDL_RENDERER
   SDL_DestroyTexture(ren->texture);
   SDL_DestroyRenderer(ren->renderer);
