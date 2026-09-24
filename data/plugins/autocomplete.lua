@@ -128,6 +128,34 @@ config.plugins.autocomplete = common.merge({
   }
 }, config.plugins.autocomplete)
 
+-------------------------------------------------------------------------------
+-- Popup color scheme
+-- The autocomplete popup may use a light background (style.background3) even
+-- when the editor is dark (slate theme: bg3 = #f0f0f0, text = #d4d4d4).  Pick
+-- text colors that contrast with the popup background, not the editor.
+-------------------------------------------------------------------------------
+local popup_bg     = style.background3
+local popup_text   = style.text
+local popup_dim    = style.dim
+local popup_accent = style.accent
+local popup_sel_bg = style.selection
+
+-- Detect whether the popup background is light or dark, then choose readable
+-- text colors.  Luminance threshold: > 0.5 = light background.
+local function luminance(c)
+  return (c[1] * 0.299 + c[2] * 0.587 + c[3] * 0.114) / 255
+end
+
+if luminance(popup_bg) > 0.5 then
+  -- Light popup background: use dark text
+  popup_text   = { common.color "#333333" }
+  popup_dim    = { common.color "#888888" }
+  popup_sel_bg = { common.color "#d6ebff" }
+  if luminance(popup_accent) > 0.5 then
+    popup_accent = { common.color "#2979ff" }  -- dark blue on light bg
+  end
+end
+
 local autocomplete = {}
 
 autocomplete.map = {}
@@ -451,12 +479,32 @@ local function get_suggestions_rect(av)
   if x + max_width > core.root_view.size.x then
     x = (av.size.x + av.position.x) - max_width
   end
+  if x < 0 then x = 0 end
+
+  local box_h = max_items * (th + style.padding.y) + style.padding.y
+  local box_y = y - style.padding.y
+
+  -- If the box would overflow past the bottom of the view, flip it above
+  -- the cursor line instead.
+  local view_bottom = av.position.y + av.size.y
+  local flip = false
+  if box_y + box_h > view_bottom then
+    local above_y = y - style.padding.y - av:get_line_height() - box_h
+    if above_y >= av.position.y then
+      box_y = above_y
+      flip = true
+    else
+      -- Not enough room above either: clamp to the view bottom and let
+      -- the overflow be clipped / scrolled.
+      box_y = math.max(av.position.y, view_bottom - box_h)
+    end
+  end
 
   return
     x,
-    y - style.padding.y,
+    box_y,
     max_width,
-    max_items * (th + style.padding.y) + style.padding.y,
+    box_h,
     has_icons
 end
 
@@ -550,22 +598,39 @@ local function draw_description_box(text, av, sx, sy, sw, sh)
 
   local height = #lines * font:get_height()
 
+  -- Clamp description box within the view vertically so it doesn't
+  -- overflow past the top or bottom of the DocView.
+  local desc_h = height + style.padding.y * 2
+  local desc_y = sy
+  local view_top = av.position.y
+  local view_bottom = av.position.y + av.size.y
+  if desc_y + desc_h > view_bottom then
+    desc_y = view_bottom - desc_h
+  end
+  if desc_y < view_top then
+    desc_y = view_top
+  end
+
   -- draw background rect
   renderer.draw_rect(
     x,
-    sy,
+    desc_y,
     width + style.padding.x * 2,
-    height + style.padding.y * 2,
-    style.background3
+    desc_h,
+    popup_bg
   )
 
+  -- draw a subtle border (top + bottom accent lines)
+  renderer.draw_rect(x, desc_y, width + style.padding.x * 2, 1, popup_accent)
+
   -- draw text
+  local ty = desc_y + style.padding.y
   for _, line in pairs(lines) do
     common.draw_text(
-      font, style.text, line, "left",
-      x + style.padding.x, y, width, lh
+      font, popup_text, line, "left",
+      x + style.padding.x, ty, width, lh
     )
-    y = y + lh
+    ty = ty + lh
   end
 end
 
@@ -578,7 +643,7 @@ local function draw_suggestions_box(av)
 
   -- draw background rect
   local rx, ry, rw, rh, has_icons = get_suggestions_rect(av)
-  renderer.draw_rect(rx, ry, rw, rh, style.background3)
+  renderer.draw_rect(rx, ry, rw, rh, popup_bg)
 
   -- draw text
   local font = av:get_font()
@@ -594,6 +659,11 @@ local function draw_suggestions_box(av)
     end
     local s = suggestions[i]
 
+    -- Draw selection background for the highlighted item
+    if i == suggestions_idx then
+      renderer.draw_rect(rx, y - style.padding.y / 2, rw, lh, popup_sel_bg)
+    end
+
     local icon_l_padding, icon_r_padding = 0, 0
 
     if has_icons then
@@ -603,7 +673,7 @@ local function draw_suggestions_box(av)
         local itext = autocomplete.icons[icon].char
         local icolor = autocomplete.icons[icon].color
         if i == suggestions_idx then
-          icolor = style.accent
+          icolor = popup_accent
         elseif type(icolor) == "string" then
           icolor = style.syntax[icolor]
         end
@@ -621,9 +691,10 @@ local function draw_suggestions_box(av)
       end
     end
 
-    local info_size = style.font:get_width(s.info) + style.padding.x
+    local info_size = (s.info and not hide_info)
+      and (style.font:get_width(s.info) + style.padding.x) or 0
 
-    local color = (i == suggestions_idx) and style.accent or style.text
+    local color = (i == suggestions_idx) and popup_accent or popup_text
     -- Push clip to avoid that the suggestion text gets drawn over suggestion type/icon
     core.push_clip_rect(rx + icon_l_padding + style.padding.x, y,
                         rw - info_size - icon_l_padding - icon_r_padding - style.padding.x, lh)
@@ -636,14 +707,16 @@ local function draw_suggestions_box(av)
     if x_adv > rx + rw - info_size - icon_r_padding then
       local ellipsis_size = font:get_width("…")
       local ell_x = rx + rw - info_size - icon_r_padding - ellipsis_size
-      renderer.draw_rect(ell_x, y, ellipsis_size, lh, style.background3)
+      renderer.draw_rect(ell_x, y, ellipsis_size, lh, popup_bg)
       common.draw_text(font, color, "…", "left", ell_x, y, ellipsis_size, lh)
     end
+    -- Translation: drawn immediately to the right of the word, left-aligned,
+    -- instead of being pushed to the far right edge of the popup.
     if s.info and not hide_info then
-      color = (i == suggestions_idx) and style.text or style.dim
+      color = (i == suggestions_idx) and popup_text or popup_dim
       common.draw_text(
-        style.font, color, s.info, "right",
-        rx, y, rw - icon_r_padding - style.padding.x, lh
+        style.font, color, s.info, "left",
+        x_adv + style.padding.x / 2, y, rw - (x_adv + style.padding.x / 2), lh
       )
     end
     y = y + lh
@@ -658,18 +731,18 @@ local function draw_suggestions_box(av)
     end
   end
 
-  renderer.draw_rect(rx, y, rw, 2, style.caret)
-  renderer.draw_rect(rx, y+2, rw, lh, style.background)
+  renderer.draw_rect(rx, y, rw, 2, popup_accent)
+  renderer.draw_rect(rx, y+2, rw, lh, popup_bg)
   common.draw_text(
     style.font,
-    style.accent,
+    popup_dim,
     "Items",
     "left",
     rx + style.padding.x, y, rw, lh
   )
   common.draw_text(
     style.font,
-    style.accent,
+    popup_accent,
     tostring(suggestions_idx) .. "/" .. tostring(#suggestions),
     "right",
     rx, y, rw - style.padding.x, lh
@@ -699,12 +772,9 @@ local function show_autocomplete()
       reset_suggestions()
     end
 
-    -- scroll if rect is out of bounds of view
-    local _, y, _, h = get_suggestions_rect(av)
-    local limit = av.position.y + av.size.y
-    if y + h > limit then
-      av.scroll.to.y = av.scroll.y + y + h - limit
-    end
+    -- The popup auto-flips above the cursor when there isn't enough room
+    -- below (see get_suggestions_rect), so we no longer force-scroll the
+    -- view to reveal it.
   end
 end
 
