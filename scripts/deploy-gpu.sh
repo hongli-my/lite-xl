@@ -1,29 +1,18 @@
 #!/bin/bash
-# Build + deploy the GPU-enabled Lite XL app to ~/Desktop.
+# Build + deploy the GPU-enabled Lite XL app to ~/Desktop/"Lite XL.app".
 # Usage: bash scripts/deploy-gpu.sh
+#
+# Delegates to scripts/deploy-macos.sh, which installs the bundle with
+# `meson install`.  This script used to rsync data/ over Contents/Resources
+# with --delete, which removed everything meson installs from outside data/
+# (icon.icns, licenses.md, the docs/api stubs) and replaced the configured
+# core/start.lua with the raw template (VERSION = "@PROJECT_VERSION@").
 set -e
 
 cd "$(dirname "$0")/.."
 BUILD=build-static
-APP="$BUILD/Lite XL.app"
 
-echo "=== Building ==="
-ninja -C "$BUILD"
+# start from a fresh bundle so files removed from data/ do not linger
+rm -rf "$BUILD/Lite XL.app"
 
-echo "=== Updating app bundle binary ==="
-cp -f "$BUILD/src/lite-xl" "$APP/Contents/MacOS/lite-xl"
-
-echo "=== Bundling dylibs + signing ==="
-bash scripts/macos-bundle-dylibs.sh "$APP" "$BUILD"
-
-echo "=== Syncing data files into bundle ==="
-# Copy data/ (core, plugins, fonts, colors) into the bundle's Resources.
-# The meson install step does this for a fresh build, but we update the
-# binary in-place with ninja, so the data may be stale.
-rsync -a --delete data/ "$APP/Contents/Resources/"
-
-echo "=== Deploying to ~/Desktop ==="
-rm -rf ~/Desktop/"Lite XL.app"
-cp -R "$APP" ~/Desktop/
-
-echo "=== Done: ~/Desktop/Lite XL.app ==="
+exec bash scripts/deploy-macos.sh -b "$BUILD" -t "$HOME/Desktop/Lite XL.app"
