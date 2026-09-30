@@ -11,6 +11,9 @@ style.accent = { common.color "#e1e1e6" }
 -- search result, hotkeys for context menu and command view
 style.dim = { common.color "#525257" }
 style.divider = { common.color "#202024" } -- Line between nodes
+style.tab_dim = { common.color "#8a8a90" } -- Inactive tab text
+style.tab_hover = { common.color "#3a3a40" } -- Inactive tab hover background
+style.tab_hover_text = { common.color "#ffffff" } -- Inactive tab hover text
 style.selection = { common.color "#48484f" }
 style.line_number = { common.color "#525259" }
 style.line_number2 = { common.color "#83838f" } -- With cursor

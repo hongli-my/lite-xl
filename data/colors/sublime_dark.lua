@@ -31,6 +31,11 @@ style.dim = { common.color "#808080" }
 -- Dividers between panels
 style.divider = { common.color "#d4d4d4" }
 
+-- Inactive tab text, hover background + text
+style.tab_dim = { common.color "#555555" }
+style.tab_hover = { common.color "#d0d0d0" }
+style.tab_hover_text = { common.color "#111111" }
+
 -- Selection and highlights
 style.selection = { common.color "#264f78" }
 style.line_number = { common.color "#858585" }

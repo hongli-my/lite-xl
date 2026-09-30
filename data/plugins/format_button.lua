@@ -61,9 +61,12 @@ function DocView:draw_format_button()
     background[4] = 255
     text_color = style.accent
   else
-    background = { table.unpack(style.background3) }
+    -- dark background matching the editor (the button floats over the editor),
+    -- with the accent colour for the label instead of the unreadable light
+    -- text on light background
+    background = { table.unpack(style.background) }
     background[4] = button_alpha
-    text_color = style.text
+    text_color = style.accent
   end
 
   renderer.draw_rect(x - border_width, y - border_width,

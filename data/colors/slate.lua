@@ -1,5 +1,6 @@
--- Fork default theme: Monokai palette with the light sidebar from
--- sublime_dark (this used to live in the user module as colors/monokai.lua).
+-- Fork default theme: Monokai palette with a light sidebar (Sublime Text 2
+-- "Monokai + light chrome" look).  The context menu is drawn dark so its
+-- light text stays readable over the light chrome.
 --
 -- Loaded as the default by data/core/fork_defaults.lua.  To go back to the
 -- upstream colours from the user module:
@@ -11,11 +12,17 @@ local common = require "core.common"
 -- Editor (DocView) - Monokai dark background
 style.background = { common.color "#272822" }
 
--- TreeView sidebar - light background like Sublime Text
+-- TreeView sidebar / tab bar / status bar - light background like Sublime Text
 style.background2 = { common.color "#efefef" }
 
 -- Command view / other panels - light
 style.background3 = { common.color "#f0f0f0" }
+
+-- Context menu - dark so its light text stays readable against the light chrome
+style.contextmenu_background = { common.color "#272822" }
+
+-- Tooltip (full path shown when hovering a tree item) - dark for the same reason
+style.tooltip_background = { common.color "#272822" }
 
 -- Text colors
 style.text = { common.color "#d4d4d4" }
@@ -25,6 +32,11 @@ style.dim = { common.color "#808080" }
 
 -- Dividers between panels
 style.divider = { common.color "#d4d4d4" }
+
+-- Inactive tab text, hover background + text
+style.tab_dim = { common.color "#555555" }
+style.tab_hover = { common.color "#d0d0d0" }
+style.tab_hover_text = { common.color "#111111" }
 
 -- Selection and highlights
 style.selection = { common.color "#49483e" }
@@ -63,11 +75,11 @@ style.syntax["normal"] = { common.color "#f8f8f2" }
 style.syntax["symbol"] = { common.color "#f8f8f2" }
 style.syntax["comment"] = { common.color "#75715e" }
 style.syntax["keyword"] = { common.color "#f92672" }     -- local function end if
-style.syntax["keyword2"] = { common.color "#f92672" }    -- self int float
+style.syntax["keyword2"] = { common.color "#66d9ef" }    -- self int float
 style.syntax["number"] = { common.color "#ae81ff" }
 style.syntax["literal"] = { common.color "#ae81ff" }     -- true false nil
 style.syntax["string"] = { common.color "#e6db74" }
-style.syntax["operator"] = { common.color "#f92672" }    -- = + - / < >
+style.syntax["operator"] = { common.color "#f8f8f2" }    -- = + - / < >
 style.syntax["function"] = { common.color "#a6e22e" }
 
 -- Log levels

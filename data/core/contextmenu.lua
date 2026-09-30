@@ -238,7 +238,7 @@ function ContextMenu:draw()
     bh + (border_width * 2),
     style.divider
   )
-  renderer.draw_rect(bx, by, bw, bh, style.background3)
+  renderer.draw_rect(bx, by, bw, bh, style.contextmenu_background or style.background3)
 
   for i, item, x, y, w, h in self:each_item() do
     if item == DIVIDER then

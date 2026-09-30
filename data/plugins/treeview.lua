@@ -371,7 +371,7 @@ function TreeView:draw_tooltip()
   local bx, by = x - tooltip_border, y - tooltip_border
   local bw, bh = w + 2 * tooltip_border, h + 2 * tooltip_border
   renderer.draw_rect(bx, by, bw, bh, replace_alpha(style.text, self.tooltip.alpha))
-  renderer.draw_rect(x, y, w, h, replace_alpha(style.background2, self.tooltip.alpha))
+  renderer.draw_rect(x, y, w, h, replace_alpha(style.tooltip_background or style.background2, self.tooltip.alpha))
   common.draw_text(style.font, replace_alpha(style.text, self.tooltip.alpha), text, "center", x, y, w, h)
 end
 

@@ -71,7 +71,7 @@ local system_fonts = is_macos and {
   "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
   "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
 }
-local cjk = first_font(system_fonts, 15 * SCALE)
+local cjk = first_font(system_fonts, 14 * SCALE)
 
 -- Colour emoji: enabled on macOS only.  Apple Color Emoji is an sbix bitmap
 -- font that the renderer handles directly (see FT_LOAD_COLOR in
@@ -81,21 +81,24 @@ local cjk = first_font(system_fonts, 15 * SCALE)
 local emoji = is_macos and first_font({
   "/System/Library/Fonts/Apple Color Emoji.ttc",
   "/Library/Fonts/Apple Color Emoji.ttc",
-}, 15 * SCALE)
+}, 14 * SCALE)
 
 ---Builds a font group: the bundled monospace/UI font plus the optional emoji
 ---and CJK fallbacks.  Colour emoji glyphs are drawn at their own bitmap size,
 ---so the emoji font is loaded at the same size as the text to keep it on the
 ---line (a larger size overlaps the neighbouring lines).
 local function font_group(primary_file, size)
-  local group = { renderer.font.load(fonts_dir .. primary_file, size) }
+  -- grayscale + full hinting render crisper than the default subpixel on
+  -- Retina/high-DPI screens (subpixel adds coloured fringes there).
+  local group = { renderer.font.load(fonts_dir .. primary_file, size,
+    { antialiasing = "grayscale", hinting = "full" }) }
   if emoji then table.insert(group, emoji) end
   if cjk then table.insert(group, cjk) end
   return renderer.font.group(group)
 end
 
-style.font = font_group("/FiraSans-Regular.ttf", 15 * SCALE)
-style.code_font = font_group("/JetBrainsMono-Regular.ttf", 15 * SCALE)
+style.font = font_group("/FiraSans-Regular.ttf", 14 * SCALE)
+style.code_font = font_group("/JetBrainsMono-Regular.ttf", 14 * SCALE)
 -- the welcome screen uses a copy of the UI font: keep the fallbacks
 style.big_font = style.font:copy(46 * SCALE)
 

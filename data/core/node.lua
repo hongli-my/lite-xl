@@ -534,9 +534,9 @@ function Node:draw_tab_title(view, font, is_active, is_hovered, x, y, w, h)
       end
     end
   end
-  local color = style.dim
+  local color = style.tab_dim or style.dim
   if is_active then color = style.text end
-  if is_hovered then color = style.text end
+  if is_hovered then color = style.tab_hover_text or style.text end
   common.draw_text(font, color, text, align, x, y, w, h)
 end
 
@@ -556,6 +556,12 @@ function Node:draw_tab_borders(view, is_active, is_hovered, x, y, w, h, standalo
     renderer.draw_rect(x, y, w, ds, style.divider)
     renderer.draw_rect(x + w, y, ds, h, style.divider)
     renderer.draw_rect(x - ds, y, ds, h, style.divider)
+    -- Accent line along the top of the active tab (Sublime-style).  Colour
+    -- and height are theme-tunable via style.tab_accent / style.tab_accent_size.
+    renderer.draw_rect(x, y, w, style.tab_accent_size or ds, style.tab_accent or style.accent)
+  elseif is_hovered and style.tab_hover then
+    -- subtle hover feedback for inactive tabs
+    renderer.draw_rect(x + ds, y, w - ds, h, style.tab_hover)
   end
   return x + ds, y, w - ds*2, h
 end
