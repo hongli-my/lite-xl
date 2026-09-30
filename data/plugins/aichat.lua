@@ -40,6 +40,8 @@ config.plugins.aichat = common.merge({
 
 local json = require "core.json"
 local util = require "core.util"
+local syntax = require "core.syntax"
+local tokenizer = require "core.tokenizer"
 -- Local aliases for the shared helpers in core.util; keeps the many call sites
 -- unchanged while removing the per-plugin copies.
 local blend, with_alpha = util.blend, util.with_alpha
@@ -151,25 +153,73 @@ local function parse_table_aligns(sep_row)
   return aligns
 end
 
+-- Closing punctuation must not start a line (it sticks to the previous char).
+local NO_BREAK_BEFORE = {}
+for _, ch in ipairs({ "，", "。", "、", "；", "：", "！", "？", "）", "》", "」",
+  "』", "】", "”", "’", "…", "·" }) do NO_BREAK_BEFORE[ch] = true end
+
+-- Split a non-space run into wrap units: ASCII/Latin runs stay together (a
+-- word), every wide char (CJK, fullwidth punctuation: UTF-8 lead >= 0xE0) is
+-- a unit of its own.  Chinese has no spaces, so without this a whole sentence
+-- was one unbreakable token that jumped to the next line as a block.
+local function split_wrap_units(piece)
+  local units, run = {}, ""
+  local p = 1
+  while p <= #piece do
+    local nxt = utf8_next(piece, p)
+    local ch = piece:sub(p, nxt - 1)
+    if piece:byte(p) >= 0xE0 then
+      if #run > 0 then units[#units + 1] = { text = run }; run = "" end
+      units[#units + 1] = { text = ch, wide = true }
+    else
+      run = run .. ch
+    end
+    p = nxt
+  end
+  if #run > 0 then units[#units + 1] = { text = run } end
+  return units
+end
+
 local function wrap_segments(segs, max_width)
-  -- tokenise on whitespace, keeping the trailing space attached to its token;
-  -- a token continues into the next segment when it did not end on a space
+  -- tokenise on whitespace (and between wide chars), keeping trailing spaces
+  -- attached to their token; a token continues into the next segment when it
+  -- did not end on a space
   local tokens = {}
+  local function add_piece(tok, text, seg)
+    tok.pieces[#tok.pieces + 1] = { text = text, seg = seg }
+    tok.w = tok.w + seg.font:get_width(text)
+  end
   for _, seg in ipairs(segs) do
     local text = seg.text
+    -- whitespace at the start of a segment (" world" after **bold**) belongs
+    -- to the previous token; it used to be skipped, gluing the words together
+    local lead = text:match("^%s+")
+    if lead and tokens[#tokens] then
+      add_piece(tokens[#tokens], lead, seg)
+      tokens[#tokens].open = false
+    end
     local p = 1
     while p <= #text do
       local sp, ep = text:find("%S+%s*", p)
       if not sp then break end
-      local last = tokens[#tokens]
-      if not (last and last.open) then
-        last = { pieces = {}, w = 0 }
-        tokens[#tokens + 1] = last
+      for _, u in ipairs(split_wrap_units(text:sub(sp, ep))) do
+        local last = tokens[#tokens]
+        local join
+        if not last then
+          join = false
+        elseif u.text:match("^%s+$") or NO_BREAK_BEFORE[u.text] then
+          join = true
+        else
+          join = last.open and not (last.wide or u.wide)
+        end
+        if not join then
+          last = { pieces = {}, w = 0 }
+          tokens[#tokens + 1] = last
+        end
+        add_piece(last, u.text, seg)
+        last.open = not u.text:match("%s$")
+        last.wide = u.wide
       end
-      local piece = text:sub(sp, ep)
-      last.pieces[#last.pieces + 1] = { text = piece, seg = seg }
-      last.w = last.w + seg.font:get_width(piece)
-      last.open = not piece:match("%s$")
       p = ep + 1
     end
   end
@@ -302,6 +352,27 @@ local function parse_link_at(text, i)
   return { label = (label ~= "") and label or url, url = url }, p + 1
 end
 
+local function is_word_byte(b)
+  return b ~= nil and ((b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122))
+end
+
+-- Closing "_" / "__" that is not followed by a word char, or nil.  With the
+-- CommonMark intraword rule this keeps snake_case identifiers literal
+-- ("draw_round_rect" rendered as draw*round*rect before).
+local function find_closing_underscore(text, from, delim)
+  local p = from
+  while true do
+    local s = text:find(delim, p, true)
+    if not s then return nil end
+    if not is_word_byte(text:byte(s + #delim)) then return s end
+    p = s + 1
+  end
+end
+
+-- ASCII URL characters (RFC 3986) minus parentheses: stops at CJK text and
+-- fullwidth punctuation, which used to be swallowed into the link.
+local URL_CHARS = "^[%w%-%._~:/%?#@!%$&'%*%+,;=%%]+"
+
 local function parse_md_inline(text, base_color, base_font)
   local segments = {}
   local i, n = 1, #text
@@ -325,7 +396,7 @@ local function parse_md_inline(text, base_color, base_font)
       i = link_next
     -- bare URL
     elseif text:sub(i, i + 7):match("^https?://") or text:sub(i, i + 3) == "www." then
-      local url = text:match("^[^%s]+", i):gsub("[%.,;:!%)%]]+$", "")
+      local url = (text:match(URL_CHARS, i) or text:sub(i, i)):gsub("[%.,;:!%?'%*]+$", "")
       flush()
       segments[#segments + 1] = {
         text = url, font = base_font,
@@ -335,9 +406,15 @@ local function parse_md_inline(text, base_color, base_font)
       }
       i = i + #url
     -- **bold** or __bold__
-    elseif (c == 42 and text:byte(i + 1) == 42) or (c == 95 and text:byte(i + 1) == 95) then
+    elseif (c == 42 and text:byte(i + 1) == 42)
+        or (c == 95 and text:byte(i + 1) == 95 and not is_word_byte(text:byte(i - 1))) then
       local delim = text:sub(i, i + 1)
-      local close = text:find(delim, i + 2, true)
+      local close
+      if c == 95 then
+        close = find_closing_underscore(text, i + 2, delim)
+      else
+        close = text:find(delim, i + 2, true)
+      end
       if close then
         flush()
         segments[#segments + 1] = {
@@ -389,8 +466,8 @@ local function parse_md_inline(text, base_color, base_font)
         pending = pending .. "*"; i = i + 1
       end
     -- _italic_
-    elseif c == 95 then
-      local close = text:find("_", i + 1, true)
+    elseif c == 95 and not is_word_byte(text:byte(i - 1)) then
+      local close = find_closing_underscore(text, i + 1, "_")
       if close and close > i + 1 then
         flush()
         segments[#segments + 1] = {
@@ -412,6 +489,105 @@ local function parse_md_inline(text, base_color, base_font)
   return segments
 end
 
+-------------------------------------------------------------------------------
+-- Syntax highlighting for fenced code blocks.
+-- Reuses the editor's own tokenizer and the language_* plugins, so code in the
+-- chat is coloured exactly like code in the editor (style.syntax[...]).
+-------------------------------------------------------------------------------
+
+-- Fence tags that do not match a file extension of a bundled syntax.
+local LANG_ALIAS = {
+  javascript = "js", typescript = "js", ts = "js", jsx = "js", tsx = "js",
+  node = "js", jsonc = "json",
+  python = "py", python3 = "py", py3 = "py",
+  bash = "sh", shell = "sh", zsh = "sh", console = "sh", shellscript = "sh",
+  ["c++"] = "cpp", cxx = "cpp", cc = "cpp", hpp = "cpp",
+  markdown = "md", golang = "go", htm = "html", svg = "xml",
+  conf = "ini", cfg = "ini",
+}
+
+-- Only positive lookups are cached: a language plugin loaded later (e.g. from
+-- the user module) must still be picked up.
+local code_syntax_cache = {}
+
+---Syntax for a fence info string ("lua", "Python", "sql title=x", ...), or nil.
+local function code_syntax(lang)
+  if not lang then return nil end
+  local key = lang:lower():match("^[%w_+#%.%-]+")
+  if not key then return nil end
+  if code_syntax_cache[key] then return code_syntax_cache[key] end
+  local syn = syntax.get("code." .. (LANG_ALIAS[key] or key))
+  if syn == syntax.plain_text_syntax then
+    syn = nil
+    for _, s in ipairs(syntax.items) do
+      if s.name and s.name:lower() == key then syn = s; break end
+    end
+  end
+  if syn then code_syntax_cache[key] = syn end
+  return syn
+end
+
+---Tokenize one code line into coloured runs { {text=, color=}, ... }.
+---`state` carries multi-line constructs (block comments, long strings) over
+---to the next line; returns the runs and the new state.
+local function highlight_code_line(syn, line, state)
+  local normal = style.syntax["normal"] or style.text
+  if not syn or line == "" then
+    return { { text = line, color = normal } }, state
+  end
+  -- the language patterns expect the trailing newline an editor line has
+  local ok, toks, new_state = pcall(tokenizer.tokenize, syn, line .. "\n", state)
+  if not ok or type(toks) ~= "table" then
+    return { { text = line, color = normal } }, state
+  end
+  local runs = {}
+  for _, ttype, ttext in tokenizer.each_token(toks) do
+    ttext = ttext:gsub("\n", "")
+    if #ttext > 0 then
+      local color = style.syntax[ttype] or normal
+      local last = runs[#runs]
+      if last and last.color == color then
+        last.text = last.text .. ttext
+      else
+        runs[#runs + 1] = { text = ttext, color = color }
+      end
+    end
+  end
+  if #runs == 0 then runs[1] = { text = "", color = normal } end
+  return runs, new_state
+end
+
+---Hard-wrap coloured runs at character boundaries (code keeps its
+---indentation, so the whitespace-based wrap used for prose does not fit).
+local function wrap_code_runs(runs, font, max_w)
+  local total = 0
+  for _, r in ipairs(runs) do total = total + font:get_width(r.text) end
+  if total <= max_w then return { runs } end
+  local lines, cur, cur_w = {}, {}, 0
+  for _, r in ipairs(runs) do
+    local p = 1
+    while p <= #r.text do
+      local nxt = utf8_next(r.text, p)
+      local ch = r.text:sub(p, nxt - 1)
+      local w = font:get_width(ch)
+      if cur_w > 0 and cur_w + w > max_w then
+        lines[#lines + 1] = cur
+        cur, cur_w = {}, 0
+      end
+      local last = cur[#cur]
+      if last and last.color == r.color then
+        last.text = last.text .. ch
+      else
+        cur[#cur + 1] = { text = ch, color = r.color }
+      end
+      cur_w = cur_w + w
+      p = nxt
+    end
+  end
+  if #cur > 0 then lines[#lines + 1] = cur end
+  return lines
+end
+
 -- Layout markdown text into render lines.  Each render line is:
 --   { segments, h, sp, mt, mb, is_code_block, is_code_bar, is_header,
 --     is_table_rule, table_w, indent, bg, is_quote }
@@ -421,8 +597,14 @@ local function layout_md(text, max_width)
   local pad_x = style.padding.x
   local lh = math.floor(ai_font:get_height() * 1.32)
   local code_lh = math.floor(md_code_font:get_height() * 1.3)
-  local code_bg = with_alpha(style.text, 26)
-  local code_bar_bg = with_alpha(style.text, 44)
+  -- Code blocks get a solid background a step darker than the editor (a step
+  -- lighter on light themes): syntax colours are tuned for style.background,
+  -- and a translucent light wash washed them out.  The header bar is a shade
+  -- lighter than the body so language tag + copy button read as a title bar.
+  local black = { 0, 0, 0, 255 }
+  local code_bg = util.is_dark() and blend(style.background, black, 0.28)
+    or blend(style.background, black, 0.05)
+  local code_bar_bg = blend(code_bg, style.text, 0.1)
   local table_head_bg = with_alpha(style.text, 34)
   local quote_color = blend(style.text, style.dim or style.text, 0.45)
   -- Whitespace scale: paragraphs and blocks breathe, lines inside one stay tight.
@@ -597,15 +779,27 @@ local function layout_md(text, max_width)
   local code_bar_idx
   local code_lines
   local last_code_idx
+  local code_syn     -- syntax of the open block (nil: no highlighting)
+  local code_state   -- tokenizer state carried from line to line
 
   -- Emit one line of a fenced block.  The bar is emitted when the block opens so
   -- a copy button is available even without a language tag; it is dropped again
   -- if the block turns out to be empty (see the closing fence).
   local function emit_code_line(code_line)
     local avail_w = max_width - code_indent - pad_x
-    for _, wline in ipairs(wrap_text(code_line, md_code_font, avail_w)) do
-      add_rline({ { text = wline, font = md_code_font, color = style.text } },
-        code_lh,
+    -- tabs are expanded for display only; the copy button keeps the original
+    local shown = code_line:gsub("\t", "    ")
+    local runs
+    runs, code_state = highlight_code_line(code_syn, shown, code_state)
+    for _, wruns in ipairs(wrap_code_runs(runs, md_code_font, avail_w)) do
+      local segs = {}
+      for _, r in ipairs(wruns) do
+        segs[#segs + 1] = { text = r.text, font = md_code_font, color = r.color }
+      end
+      if #segs == 0 then
+        segs[1] = { text = "", font = md_code_font, color = style.text }
+      end
+      add_rline(segs, code_lh,
         { is_code_block = true, bg = code_bg, indent = code_indent,
           mt = (last_code_idx == nil) and code_pad_y or 0 })
       last_code_idx = #rlines
@@ -635,12 +829,14 @@ local function layout_md(text, max_width)
         end
         in_code_block = false
         code_lang, code_bar_idx, code_lines, last_code_idx = nil, nil, nil, nil
+        code_syn, code_state = nil, nil
         pending_gap = math.max(pending_gap, para_gap)  -- gap after the block
       else
         in_code_block = true
         code_lang = (info ~= "") and info or nil
         code_lines = {}
         last_code_idx = nil
+        code_syn, code_state = code_syntax(code_lang), nil
         -- the gap belongs in front of the block, not between bar and code
         pending_gap = math.max(pending_gap, para_gap)
         add_rline({ { text = code_lang or " ", font = ai_font, color = style.dim } },
@@ -734,6 +930,53 @@ local function draw_spinner(cx, cy, radius, color)
   end
 end
 
+-- Rounded rectangle built from axis-aligned rects (the renderer has no
+-- round-rect primitive): the corner rows are 1px spans inset along a circle,
+-- so the corners are actually round instead of chamfered.  No two rects
+-- overlap, so translucent colours do not stack.
+local function draw_round_rect(x, y, w, h, r, color)
+  x, y, w, h = math.floor(x), math.floor(y), math.floor(w), math.floor(h)
+  if w <= 0 or h <= 0 then return end
+  r = math.floor(math.min(r or 0, w / 2, h / 2))
+  if r < 1 then
+    renderer.draw_rect(x, y, w, h, color)
+    return
+  end
+  renderer.draw_rect(x, y + r, w, h - r * 2, color)
+  for i = 0, r - 1 do
+    local dy = r - i - 0.5
+    local inset = math.floor(r - math.sqrt(math.max(0, r * r - dy * dy)) + 0.5)
+    renderer.draw_rect(x + inset, y + i, w - inset * 2, 1, color)
+    renderer.draw_rect(x + inset, y + h - 1 - i, w - inset * 2, 1, color)
+  end
+end
+
+-- Rounded box with a 1px border: border colour underneath, fill inset by 1px.
+local function draw_card(x, y, w, h, r, fill, border)
+  draw_round_rect(x, y, w, h, r, border)
+  draw_round_rect(x + 1, y + 1, w - 2, h - 2, math.max(0, r - 1), fill)
+end
+
+-- Panel palette.  Everything is derived from the theme by blending towards
+-- style.text (the contrast colour), so the panel works on dark and light
+-- themes alike.  style.divider is deliberately NOT used inside the panel: on
+-- themes with a light sidebar it is a light grey that cut bright lines
+-- through the dark panel.
+local BLACK = { 0, 0, 0, 255 }
+local WHITE = { 255, 255, 255, 255 }
+local function ai_palette()
+  local bg = blend(style.background, style.background2, 0.05)
+  local text = style.text
+  return {
+    bg        = bg,
+    header    = blend(bg, text, 0.035),
+    line      = blend(bg, text, 0.12),
+    card      = blend(bg, text, 0.07),
+    card_line = blend(bg, text, 0.16),
+    input     = util.is_dark() and blend(bg, BLACK, 0.22) or blend(bg, WHITE, 0.7),
+  }
+end
+
 
 -------------------------------------------------------------------------------
 -- AIView: the chat panel.
@@ -759,7 +1002,7 @@ function AIView:new()
   self._dirty = true
   self._layout_key = nil
   self._wrapped = {}
-  self.input_height = math.floor(style.font:get_height() * 3 + style.padding.y * 2)
+  self._send_hover = false
   -- pi-bridge session cache: working_dir -> session_id
   self._sessions = {}
   self._stream_proc = nil
@@ -800,14 +1043,59 @@ function AIView:set_target_size(axis, value)
 end
 
 function AIView:header_height()
-  return style.font:get_height() + style.padding.y * 2
+  return math.floor(style.font:get_height() + style.padding.y * 2.4)
+end
+
+-- Input box geometry: a rounded card with up to three text lines, and a footer
+-- row holding the key hint and the send/stop button.  Shared by draw(), the
+-- caret / IME placement and the send-button hit test so they never drift.
+local INPUT_LINES = 3
+
+local function input_metrics()
+  local pad = style.padding
+  local lh = style.font:get_height()
+  return {
+    lh = lh,
+    margin = math.floor(pad.x * 0.6),       -- card inset from the panel edge
+    ipx = math.floor(pad.x * 0.8),          -- card inner padding, horizontal
+    ipy = math.floor(pad.y * 0.9),          -- card inner padding, vertical
+    gap = math.floor(4 * SCALE),            -- text area -> footer row
+    btn_h = lh + math.floor(6 * SCALE),
+  }
+end
+
+function AIView:get_input_height()
+  local m = input_metrics()
+  return m.margin * 2 + m.ipy + m.lh * INPUT_LINES + m.gap + m.btn_h
+    + math.floor(m.ipy * 0.7)
+end
+
+function AIView:input_layout()
+  local m = input_metrics()
+  local ih = self:get_input_height()
+  local input_y = self.position.y + self.size.y - ih
+  local cx, cy = self.position.x + m.margin, input_y + m.margin
+  local cw, ch = self.size.x - m.margin * 2, ih - m.margin * 2
+  local text_x, text_y = cx + m.ipx, cy + m.ipy
+  local text_h = m.lh * INPUT_LINES
+  local label = self.streaming and "停止" or "发送"
+  local btn_w = style.font:get_width("停止") + math.floor(style.padding.x * 1.6)
+  local bx = cx + cw - math.floor(m.ipx * 0.6) - btn_w
+  local by = text_y + text_h + m.gap
+  return {
+    input_y = input_y, input_h = ih,
+    card = { cx, cy, cw, ch },
+    text_x = text_x, text_y = text_y, text_w = cw - m.ipx * 2, text_h = text_h,
+    btn = { bx, by, btn_w, m.btn_h }, btn_label = label,
+    lh = m.lh,
+  }
 end
 
 function AIView:message_area()
   local x = self.position.x
   local y = self.position.y + self:header_height()
   local w = self.size.x
-  local h = self.size.y - self:header_height() - self.input_height
+  local h = self.size.y - self:header_height() - self:get_input_height()
   return x, y, w, math.max(0, h)
 end
 
@@ -859,29 +1147,78 @@ end
 -- Compact role label drawn above a message.  Assistant is the default voice in
 -- a chat panel, so it gets none: an all-caps "ASSISTANT" line on top of every
 -- reply was pure noise and cost a full line of height each time.
-local ROLE_LABEL = { user = "你", system = "系统", error = "错误" }
+-- User messages and errors are drawn as rounded cards; the card itself marks
+-- "your turn", so only errors keep a text label.
+local ROLE_LABEL = { error = "错误" }
 
+local function is_card_role(role)
+  return role == "user" or role == "error"
+end
+
+-- Padding between a card's top edge and its first line.
+local function card_inset()
+  return math.floor(style.padding.y * 0.9)
+end
+
+-- Extra horizontal inset of the text inside a card.
+local function card_text_inset()
+  return math.floor(style.padding.x * 0.4)
+end
+
+-- Height reserved above the message content: card padding plus the label.
 local function role_label_height(role, lh)
-  if not ROLE_LABEL[role] then return 0 end
-  return lh + math.floor(style.padding.y * 0.5)
+  local h = is_card_role(role) and card_inset() or 0
+  if ROLE_LABEL[role] then h = h + lh + math.floor(style.padding.y * 0.4) end
+  return h
 end
 
 -- Wrapped render lines of a single message.  Markdown for everything the user
 -- or the agent writes — user messages carry the "[当前文件] …" header and the
 -- selected-code fence injected by build_message, so they need it too.  Only
--- system notices stay plain.
+-- system notices stay plain (and dim: they are status, not conversation).
 local function message_rlines(msg, font, lh, text_w)
   if msg.role == "system" then
     local rlines = {}
     for _, line in ipairs(wrap_text(msg.content, font, text_w)) do
       rlines[#rlines + 1] = {
-        segments = { { text = line, font = font, color = style.text } },
-        h = lh, indent = 0,
+        segments = { { text = line, font = font, color = style.dim } },
+        h = math.floor(lh * 1.25), indent = 0,
       }
     end
     return rlines
   end
-  return layout_md(msg.content, text_w)
+  if not is_card_role(msg.role) then
+    return layout_md(msg.content, text_w)
+  end
+
+  local inset = card_text_inset()
+  local inner_w = text_w - inset * 2
+  local rlines = {}
+  local body = msg.content
+  -- The "[当前文件] path" header added by build_message becomes a file chip
+  -- instead of a bracketed line of plain text.
+  local path, rest = body:match("^%[当前文件%] ([^\n]*)\n*(.*)$")
+  if path then
+    local label = util.truncate_to_width(ai_font, path, inner_w - CODE_CHIP_PAD * 2)
+    rlines[1] = {
+      segments = { {
+        text = label, font = ai_font, color = style.dim,
+        pad = CODE_CHIP_PAD, bg = with_alpha(style.text, 22),
+      } },
+      h = math.floor(ai_font:get_height() * 1.32), indent = 0,
+    }
+    body = rest
+  end
+  if body:match("%S") then
+    local md = layout_md(body, inner_w)
+    if path and md[1] then
+      md[1].sp = math.max(md[1].sp or 0, math.floor(style.padding.y * 0.5))
+    end
+    for _, rl in ipairs(md) do rlines[#rlines + 1] = rl end
+  end
+  if #rlines == 0 then return layout_md(msg.content, inner_w) end
+  for _, rl in ipairs(rlines) do rl.indent = (rl.indent or 0) + inset end
+  return rlines
 end
 
 
@@ -902,7 +1239,8 @@ function AIView:layout_messages()
   self._dirty = false
 
   local wrapped = {}
-  local y = 0
+  -- breathing room between the header and the first message
+  local y = math.floor(style.padding.y * 0.9)
   local font = ai_font
   local lh = font:get_height()
   -- gap between messages: without it consecutive blocks ran together and the
@@ -925,6 +1263,7 @@ function AIView:layout_messages()
       role = msg.role, rlines = rlines, y = y + gap,
       h = label_h + content_h + style.padding.y,
       label_h = label_h, gap = gap,
+      inset = is_card_role(msg.role) and card_inset() or 0,
       is_empty = not msg.content:match("%S"),
     }
     y = y + gap + wrapped[i].h
@@ -1171,12 +1510,36 @@ end
 -- Handle clicks on the header "新对话" button and text selection in the
 -- message area; everything else delegates to the default View handler
 -- (scrollbar etc.).
+local function in_rect(px, py, rx, ry, rw, rh)
+  return px >= rx and px < rx + rw and py >= ry and py < ry + rh
+end
+
+-- Send / stop button in the input footer.  Hidden (not clickable) when there
+-- is nothing to send and nothing to stop.
+function AIView:_send_btn_active()
+  return self.streaming or self.input:match("%S") ~= nil
+end
+
+function AIView:_over_send_btn(x, y)
+  local L = self:input_layout()
+  return self:_send_btn_active() and in_rect(x, y, table.unpack(L.btn))
+end
+
 function AIView:on_mouse_pressed(button, x, y, clicks)
   if button == "left" then
-    local nbx, nby, nbw, nbh = self:new_btn_rect()
-    if x >= nbx - math.floor(4 * SCALE) and x < nbx + nbw + math.floor(4 * SCALE)
-       and y >= nby - math.floor(2 * SCALE) and y < nby + nbh + math.floor(2 * SCALE) then
+    if in_rect(x, y, self:new_btn_rect()) then
       self:new_session()
+      return true
+    end
+    if self:_over_send_btn(x, y) then
+      core.set_active_view(self)
+      self:submit()
+      return true
+    end
+    -- a click anywhere in the input card focuses the input
+    local L = self:input_layout()
+    if in_rect(x, y, table.unpack(L.card)) then
+      core.set_active_view(self)
       return true
     end
     -- Copy button: must win over the drag-to-select handler below.
@@ -1199,13 +1562,17 @@ function AIView:on_mouse_pressed(button, x, y, clicks)
 end
 
 function AIView:on_mouse_moved(x, y, dx, dy)
-  local nbx, nby, nbw, nbh = self:new_btn_rect()
-  local over = x >= nbx - math.floor(4 * SCALE) and x < nbx + nbw + math.floor(4 * SCALE)
-       and y >= nby - math.floor(2 * SCALE) and y < nby + nbh + math.floor(2 * SCALE)
+  local over = in_rect(x, y, self:new_btn_rect())
   if over ~= self._new_btn_hover then
     self._new_btn_hover = over
     core.redraw = true
   end
+  local over_send = self:_over_send_btn(x, y)
+  if over_send ~= self._send_hover then
+    self._send_hover = over_send
+    core.redraw = true
+  end
+  if over_send then over = true end
   if self._selecting then
     self._sel_end = self:_hit_test_msg(x, y)
     core.redraw = true
@@ -1250,6 +1617,7 @@ end
 
 function AIView:on_mouse_left()
   self._new_btn_hover = false
+  self._send_hover = false
   self._selecting = false
   self._copy_hover = nil
   self._link_hover = nil
@@ -1293,25 +1661,57 @@ function AIView:_caret_line_info()
   return 1, 1, lines[1] or ""
 end
 
--- Mirrors the logic in _draw_caret but returns coordinates instead of drawing.
-function AIView:_caret_screen_pos()
-  local x, y, w, h = self.position.x, self.position.y, self.size.x, self.size.y
-  local pad = style.padding
-  local lh = style.font:get_height()
-  local input_y = y + h - self.input_height
-  local itext_x = x + pad.x
-  local itext_y = input_y + pad.y
-  -- account for streaming spinner offset
-  if self.streaming then
-    local spinner_r = math.floor(7 * SCALE)
-    itext_x = itext_x + spinner_r * 2 + math.floor(6 * SCALE)
+-- Visual rows of the input: logical lines soft-wrapped to `width` (at the last
+-- space when there is one, otherwise at a character boundary, which also
+-- covers CJK).  Every row keeps the byte offset it starts at, so the caret is
+-- placed on exactly the row that is drawn — drawing word-wrapped text while
+-- placing the caret on logical lines put it on the wrong row.
+function AIView:_input_rows(width)
+  local font = style.font
+  local rows = {}
+  local lines, starts = self:_input_lines()
+  for li, line in ipairs(lines) do
+    local base = starts[li]
+    if #line == 0 then rows[#rows + 1] = { text = "", start = base } end
+    local p = 1
+    while p <= #line do
+      local q, w, last_space = p, 0, nil
+      while q <= #line do
+        local nxt = utf8_next(line, q)
+        local ch = line:sub(q, nxt - 1)
+        local cw = font:get_width(ch)
+        if w + cw > width and q > p then break end
+        w = w + cw
+        if ch == " " then last_space = nxt end
+        q = nxt
+      end
+      if q <= #line and last_space and last_space > p then q = last_space end
+      rows[#rows + 1] = { text = line:sub(p, q - 1), start = base + p - 1 }
+      p = q
+    end
   end
-  local line_idx, col = self:_caret_line_info()
-  local lines = self:_input_lines()
-  local before = (lines[line_idx] or ""):sub(1, col - 1)
-  local cx = itext_x + style.font:get_width(before)
-  local cy = itext_y + (line_idx - 1) * lh
-  return cx, cy, lh
+  return rows
+end
+
+-- Rows, the caret's row and x offset, and the first row to show (the box
+-- scrolls so the caret row stays visible).
+function AIView:_input_view(width)
+  local rows = self:_input_rows(width)
+  local crow = 1
+  for i, r in ipairs(rows) do
+    if r.start <= self.caret then crow = i end
+  end
+  local row = rows[crow]
+  local cx = style.font:get_width(row.text:sub(1, math.max(0, self.caret - row.start)))
+  local first = math.max(1, crow - INPUT_LINES + 1)
+  return rows, crow, cx, first
+end
+
+-- Screen position of the input caret (used for the IME candidate window).
+function AIView:_caret_screen_pos()
+  local L = self:input_layout()
+  local _, crow, cx, first = self:_input_view(L.text_w)
+  return L.text_x + cx, L.text_y + (crow - first) * L.lh, L.lh
 end
 
 -- Set the IME candidate window location to the input caret position.
@@ -1503,15 +1903,15 @@ function AIView:new_session()
 end
 
 -- Rect of the "新对话" button in the header (right-aligned).
+-- Rect of the "新对话" pill button, vertically centred in the header.
 function AIView:new_btn_rect()
   local font = style.font
   local label = "＋ 新对话"
-  local lw = font:get_width(label)
   local pad = style.padding
-  local bx = self.position.x + self.size.x - pad.x - lw
-  local by = self.position.y + pad.y
-  local bw = lw
-  local bh = font:get_height()
+  local bw = font:get_width(label) + math.floor(pad.x * 1.2)
+  local bh = font:get_height() + math.floor(6 * SCALE)
+  local bx = self.position.x + self.size.x - math.floor(pad.x * 0.7) - bw
+  local by = self.position.y + math.floor((self:header_height() - bh) / 2)
   return bx, by, bw, bh, label
 end
 
@@ -2015,17 +2415,102 @@ end
 -------------------------------------------------------------------------------
 -- Drawing
 -------------------------------------------------------------------------------
-function AIView:_input_wrapped(width)
-  return wrap_text(self.input, style.font, width)
+-- Header: accent dot + bold title + status (backend name, or a spinner while
+-- a reply streams in), and the "新对话" pill on the right.
+function AIView:_draw_header(P)
+  local x, y, w = self.position.x, self.position.y, self.size.x
+  local font = style.font
+  local lh = font:get_height()
+  local pad = style.padding
+  local hh = self:header_height()
+  local accent = style.accent or style.text
+
+  renderer.draw_rect(x, y, w, hh, P.header)
+  renderer.draw_rect(x, y + hh - 1, w, 1, P.line)
+
+  local nbx, nby, nbw, nbh, nlabel = self:new_btn_rect()
+  local hx = x + math.floor(pad.x * 0.9)
+  local dot = math.floor(8 * SCALE)
+  draw_round_rect(hx, y + math.floor((hh - dot) / 2), dot, dot, math.floor(dot / 2),
+    self.streaming and COLOR_OK or accent)
+  hx = hx + dot + math.floor(7 * SCALE)
+
+  core.push_clip_rect(x, y, math.max(0, nbx - x - math.floor(6 * SCALE)), hh)
+  local title = "AI 助手"
+  renderer.draw_text(md_bold_font, title, hx,
+    y + math.floor((hh - md_bold_font:get_height()) / 2), style.text)
+  hx = hx + md_bold_font:get_width(title) + math.floor(10 * SCALE)
+  local ty = y + math.floor((hh - lh) / 2)
+  if self.streaming then
+    local r = math.floor(5 * SCALE)
+    draw_spinner(hx + r, y + math.floor(hh / 2), r, COLOR_OK)
+    renderer.draw_text(font, "生成中…", hx + r * 2 + math.floor(6 * SCALE), ty, COLOR_OK)
+  else
+    renderer.draw_text(font, config.plugins.aichat.backend or "pibridge", hx, ty, style.dim)
+  end
+  core.pop_clip_rect()
+
+  local hover = self._new_btn_hover
+  draw_card(nbx, nby, nbw, nbh, math.floor(nbh / 2),
+    hover and blend(P.header, accent, 0.16) or P.header,
+    hover and blend(P.header, accent, 0.6) or P.card_line)
+  common.draw_text(font, hover and accent or style.text, nlabel, "center",
+    nbx, nby, nbw, nbh)
 end
 
-function AIView:_draw_caret(x, y, width, lh)
-  local line_idx, col = self:_caret_line_info()
-  local lines = self:_input_lines()
-  local before = (lines[line_idx] or ""):sub(1, col - 1)
-  local cx = x + style.font:get_width(before)
-  local cy = y + (line_idx - 1) * lh
-  renderer.draw_rect(cx, cy, style.caret_width, lh, style.caret or style.text)
+-- Input: rounded card (accent border while focused), up to INPUT_LINES rows of
+-- text that scroll with the caret, a key hint and the send / stop button.
+function AIView:_draw_input(P)
+  local L = self:input_layout()
+  local font = style.font
+  local lh = L.lh
+  local accent = style.accent or style.text
+  local focused = core.active_view == self
+
+  renderer.draw_rect(self.position.x, L.input_y, self.size.x, L.input_h, P.bg)
+  local cx, cy, cw, ch = table.unpack(L.card)
+  draw_card(cx, cy, cw, ch, math.floor(8 * SCALE), P.input,
+    focused and blend(P.input, accent, 0.7) or P.card_line)
+
+  core.push_clip_rect(L.text_x, L.text_y, L.text_w + style.caret_width, L.text_h)
+  local rows, crow, caret_x, first = self:_input_view(L.text_w)
+  if self.input == "" and not self.ime_status then
+    renderer.draw_text(font, "问点什么…（会附带当前文件名）", L.text_x, L.text_y, style.dim)
+  else
+    for i = first, math.min(#rows, first + INPUT_LINES - 1) do
+      renderer.draw_text(font, rows[i].text, L.text_x, L.text_y + (i - first) * lh, style.text)
+    end
+  end
+  -- blink the caret (reuses lite-xl's core.blink_* system, same condition as
+  -- DocView:draw): visible for the first half of each blink_period.
+  if focused then
+    local T = config.blink_period or 0.8
+    if config.disable_blink or (core.blink_timer - core.blink_start) % T < T / 2 then
+      renderer.draw_rect(L.text_x + caret_x, L.text_y + (crow - first) * lh,
+        style.caret_width, lh, style.caret or style.text)
+    end
+  end
+  core.pop_clip_rect()
+
+  local bx, by, bw, bh = table.unpack(L.btn)
+  local hint = self.streaming and "Enter 停止生成" or "Enter 发送 · Shift+Enter 换行"
+  core.push_clip_rect(L.text_x, by, math.max(0, bx - L.text_x - math.floor(6 * SCALE)), bh)
+  renderer.draw_text(font, hint, L.text_x, by + math.floor((bh - lh) / 2),
+    with_alpha(style.dim, 200))
+  core.pop_clip_rect()
+
+  local fill, tcol
+  if self.streaming then
+    fill = with_alpha(COLOR_ERROR, self._send_hover and 255 or 215)
+    tcol = WHITE
+  elseif self:_send_btn_active() then
+    fill = with_alpha(accent, self._send_hover and 255 or 225)
+    tcol = style.background
+  else
+    fill, tcol = P.card, style.dim
+  end
+  draw_round_rect(bx, by, bw, bh, math.floor(bh / 2), fill)
+  common.draw_text(font, tcol, L.btn_label, "center", bx, by, bw, bh)
 end
 
 function AIView:draw()
@@ -2035,42 +2520,19 @@ function AIView:draw()
 
   local x, y, w, h = self.position.x, self.position.y, self.size.x, self.size.y
   local font = style.font
-  local lh = font:get_height()
   local pad = style.padding
+  local P = ai_palette()
 
-  -- background: use the dark editor background (NOT style.background2, which is
-  -- the light treeview sidebar in some themes e.g. monokai → light bg + light
-  -- text = invisible messages). Blend a touch toward background2 so the panel
-  -- reads as subtly distinct from the editor behind it.
-  local panel_bg = blend(style.background, style.background2, 0.05)
-  renderer.draw_rect(x, y, w, h, panel_bg)
-
-  -- header
-  local hh = self:header_height()
-  common.draw_text(font, style.dim, "AI Chat",
-    "left", x + pad.x, y + pad.y, w - pad.x * 2, lh)
-  -- "新对话" button (right-aligned in header)
-  local nbx, nby, nbw, nbh, nlabel = self:new_btn_rect()
-  if self._new_btn_hover then
-    renderer.draw_rect(nbx - math.floor(4 * SCALE), nby - math.floor(2 * SCALE),
-      nbw + math.floor(8 * SCALE), nbh + math.floor(4 * SCALE),
-      with_alpha(style.accent or style.text, 40))
-  end
-  renderer.draw_text(font, nlabel, nbx, nby,
-    self._new_btn_hover and (style.accent or style.text) or style.dim)
-  if self.streaming then
-    -- streaming indicator sits left of the new-session button
-    local sw = font:get_width("● 生成中… (Enter 停止)")
-    common.draw_text(font, COLOR_OK, "● 生成中… (Enter 停止)",
-      "right", x + pad.x, y + pad.y, w - pad.x * 2 - nbw - math.floor(12 * SCALE), lh)
-  end
-  renderer.draw_rect(x, y + hh - style.divider_size, w, style.divider_size, style.divider)
+  -- background: the dark editor background (NOT style.background2, which is
+  -- the light treeview sidebar in some themes → light bg + light text =
+  -- invisible messages), nudged a touch so the panel reads as its own surface.
+  renderer.draw_rect(x, y, w, h, P.bg)
+  self:_draw_header(P)
 
   -- message area
   local msg_x, msg_y, msg_w, msg_h = self:message_area()
   core.push_clip_rect(msg_x, msg_y, msg_w, msg_h)
   local offset_y = msg_y - self.scroll.y
-  local strip_w = math.max(2, math.floor(3 * SCALE))
   -- Normalize selection range for highlight drawing.
   local ns, ne
   if self._sel_start and self._sel_end
@@ -2081,40 +2543,25 @@ function AIView:draw()
   for blk_idx, blk in ipairs(self._wrapped) do
     local block_y = offset_y + blk.y
     if block_y + blk.h >= msg_y and block_y <= msg_y + msg_h then
-      -- Hairline between turns, drawn in the gap above a "你" block: with the
-      -- role labels gone from assistant replies this is what makes the turn
-      -- boundary readable at a glance.
-      if blk.role == "user" and blk.gap > 0 then
-        renderer.draw_rect(msg_x + pad.x, block_y - math.floor(blk.gap * 0.5),
-          msg_w - pad.x * 2, style.divider_size, style.divider)
+      -- Your messages and errors are cards; assistant replies stay flat on
+      -- the panel so the (much longer) answers read as the main content.
+      local is_card = is_card_role(blk.role)
+      if is_card then
+        local card_x, card_w = msg_x + math.floor(pad.x * 0.5), msg_w - pad.x
+        if blk.role == "error" then
+          draw_card(card_x, block_y, card_w, blk.h, math.floor(6 * SCALE),
+            blend(P.bg, COLOR_ERROR, 0.1), blend(P.bg, COLOR_ERROR, 0.5))
+        else
+          draw_card(card_x, block_y, card_w, blk.h, math.floor(6 * SCALE),
+            P.card, P.card_line)
+        end
       end
-      -- subtle per-message bubble: user messages get a faint selection tint,
-      -- errors a faint red wash; assistant/system stay clean for contrast.
-      local bubble
-      if blk.role == "user" then
-        bubble = with_alpha(style.selection or style.background, 70)
-      elseif blk.role == "error" then
-        bubble = with_alpha(COLOR_ERROR, 28)
-      end
-      if bubble then
-        renderer.draw_rect(msg_x + math.floor(pad.x * 0.5), block_y + 1,
-          msg_w - pad.x, math.max(0, blk.h - 2), bubble)
-      end
-      local role_color
-      if blk.role == "user" then role_color = style.accent
-      elseif blk.role == "error" then role_color = COLOR_ERROR
-      else role_color = style.dim end
-      -- The strip marks the blocks that are not plain agent output (your turn,
-      -- an error).  Assistant replies get neither strip nor label.
-      if blk.role == "user" or blk.role == "error" then
-        renderer.draw_rect(msg_x, block_y + 2, strip_w, math.max(0, blk.h - 4), role_color)
-      end
-      local cum_y = block_y
       local label = ROLE_LABEL[blk.role]
-      if label and blk.label_h > 0 then
-        renderer.draw_text(font, label, msg_x + pad.x, block_y, role_color)
-        cum_y = block_y + blk.label_h
+      if label then
+        renderer.draw_text(font, label, msg_x + pad.x + card_text_inset(),
+          block_y + (blk.inset or 0), COLOR_ERROR)
       end
+      local cum_y = block_y + blk.label_h
       if self.streaming and blk.role == "assistant" and blk.is_empty then
         local first = blk.rlines[1]
         renderer.draw_text(font, "▍", msg_x + pad.x,
@@ -2132,16 +2579,30 @@ function AIView:draw()
           -- abut exactly — no overlap (no stacked alpha), no seam.
           if rline.bg then
             local bg_x, bg_w = msg_x + math.floor(pad.x * 0.5), msg_w - pad.x
-            if rline.table_w then bg_x, bg_w = msg_x + pad.x, rline.table_w end
-            renderer.draw_rect(bg_x, cum_y + (rline.sp or 0), bg_w,
-              math.max(1, (rline.mt or 0) + rline.h + (rline.mb or 0)),
-              rline.bg)
+            if is_card then
+              -- keep code blocks inside the card border
+              local ci = math.floor(pad.x * 0.3)
+              bg_x, bg_w = bg_x + ci, bg_w - ci * 2
+            end
+            if rline.table_w then
+              bg_x, bg_w = msg_x + pad.x + (is_card and card_text_inset() or 0), rline.table_w
+            end
+            local bg_y = cum_y + (rline.sp or 0)
+            local bg_h = math.max(1, (rline.mt or 0) + rline.h + (rline.mb or 0))
+            renderer.draw_rect(bg_x, bg_y, bg_w, bg_h, rline.bg)
+            -- accent strip down the left edge of a fenced block: the rects of
+            -- bar + body lines abut, so the strips join into one line that
+            -- ties the block together
+            if rline.is_code_block then
+              renderer.draw_rect(bg_x, bg_y, math.max(2, math.floor(2 * SCALE)),
+                bg_h, with_alpha(style.accent or style.text, 170))
+            end
           end
           -- table header rule
           if rline.is_table_rule then
-            renderer.draw_rect(msg_x + pad.x, ly,
+            renderer.draw_rect(msg_x + pad.x + (rline.indent or 0), ly,
               rline.table_w or (msg_w - pad.x * 2),
-              math.max(1, math.floor(1 * SCALE)), style.divider)
+              math.max(1, math.floor(1 * SCALE)), P.card_line)
           end
           -- blockquote left bar
           if rline.is_quote then
@@ -2154,8 +2615,8 @@ function AIView:draw()
             if seg_pad > 0 and seg.bg then
               local chip_h = math.min(rline.h,
                 seg.font:get_height() + math.floor(4 * SCALE))
-              renderer.draw_rect(sx + (seg.off or 0), ly + math.floor((rline.h - chip_h) / 2),
-                seg_advance(seg), chip_h, seg.bg)
+              draw_round_rect(sx + (seg.off or 0), ly + math.floor((rline.h - chip_h) / 2),
+                seg_advance(seg), chip_h, math.floor(3 * SCALE), seg.bg)
             end
             -- selection highlight (drawn before text so text sits on top)
             if ns then
@@ -2194,7 +2655,7 @@ function AIView:draw()
             local label = just and COPY_LABEL_DONE or COPY_LABEL
             local color = just and COLOR_OK
               or (hovered and (style.accent or style.text) or style.dim)
-            renderer.draw_rect(bx, by, bw, bh,
+            draw_round_rect(bx, by, bw, bh, math.floor(4 * SCALE),
               with_alpha(style.text, hovered and 46 or 24))
             renderer.draw_text(ai_font, label,
               bx + math.floor((bw - ai_font:get_width(label)) / 2),
@@ -2207,49 +2668,7 @@ function AIView:draw()
   end
   core.pop_clip_rect()
 
-  -- input box: recessed (pure dark editor bg) so it reads as a distinct zone
-  -- below the slightly-lighter message area.
-  local input_y = y + h - self.input_height
-  renderer.draw_rect(x, input_y, w, self.input_height, style.background)
-  renderer.draw_rect(x, input_y, w, style.divider_size, style.divider)
-
-  local itext_x = x + pad.x
-  local itext_y = input_y + pad.y
-  local itext_w = w - pad.x * 2
-
-  -- Animated spinner at the left of the input box while streaming; shifts
-  -- the text/placeholder right so they don't overlap.
-  if self.streaming then
-    local spinner_r = math.floor(7 * SCALE)
-    local spinner_cx = itext_x + spinner_r
-    local spinner_cy = itext_y + math.floor(lh / 2)
-    draw_spinner(spinner_cx, spinner_cy, spinner_r, style.accent)
-    local spinner_total = spinner_r * 2 + math.floor(6 * SCALE)
-    itext_x = itext_x + spinner_total
-    itext_w = itext_w - spinner_total
-  end
-
-  if self.input == "" then
-    common.draw_text(font, style.dim,
-      "输入消息…  Enter: 发送/停止  Shift+Enter: 换行",
-      "left", itext_x, itext_y, itext_w, lh)
-  else
-    local lines = self:_input_wrapped(itext_w)
-    for j, line in ipairs(lines) do
-      renderer.draw_text(font, line, itext_x, itext_y + (j - 1) * lh, style.text)
-    end
-  end
-
-  -- blink the caret (reuses lite-xl's core.blink_* system, same condition as
-  -- DocView:draw): visible for the first half of each blink_period.
-  if core.active_view == self then
-    local T = config.blink_period or 0.8
-    if config.disable_blink
-       or (core.blink_timer - core.blink_start) % T < T / 2 then
-      self:_draw_caret(itext_x, itext_y, itext_w, lh)
-    end
-  end
-
+  self:_draw_input(P)
   self:draw_scrollbar()
 end
 
@@ -2353,20 +2772,6 @@ end
 local function fab_hit_test(x, y)
   local bx, by, bs = fab_rect()
   return x >= bx and x < bx + bs and y >= by and y < by + bs
-end
-
--- Rounded rectangle built from axis-aligned rects only (renderer has no
--- round-rect primitive): chamfer the four corners, leaving the corner pixels
--- transparent so the content behind shows through for a soft rounded look.
-local function draw_round_rect(x, y, w, h, radius, color)
-  radius = math.min(radius, math.floor(w / 2), math.floor(h / 2))
-  if radius < 1 then
-    renderer.draw_rect(x, y, w, h, color)
-    return
-  end
-  renderer.draw_rect(x, y + radius, w, h - radius * 2, color)
-  renderer.draw_rect(x + radius, y, w - radius * 2, radius, color)
-  renderer.draw_rect(x + radius, y + h - radius, w - radius * 2, radius, color)
 end
 
 local function draw_fab()
