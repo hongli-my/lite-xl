@@ -2723,6 +2723,22 @@ command.add(nil, {
     if ai_view and ai_view.visible then core.set_active_view(ai_view) end
   end,
   ["aichat:abort"] = function() if ai_view then ai_view:abort_stream() end end,
+  -- External entry point for quick actions: send a prefilled prompt (with the
+  -- current file/selection context built by build_message) without the caller
+  -- needing access to the local ai_view.  Used by context-menu quick actions.
+  -- Stays silent when the panel is streaming so a misclick cannot pile on.
+  ["aichat:ask"] = function(prompt)
+    if not ai_view or not prompt or prompt == "" then return end
+    if ai_view.streaming then return end
+    -- Build the message while the editor still has focus (build_message reads
+    -- the active DocView / its selection), then reveal the panel.
+    local msg = ai_view:build_message(prompt)
+    ai_view.visible = true
+    ai_view:ensure_mounted()
+    ai_view:_send(msg)
+    core.set_active_view(ai_view)
+    core.redraw = true
+  end,
 })
 
 command.add(function()
