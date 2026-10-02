@@ -122,16 +122,10 @@ void renwin_show_window(RenWindow *ren) {
 }
 
 void renwin_update_rects(RenWindow *ren, RenRect *rects, int count) {
-#ifdef LITE_USE_GPU_RENDERER
-  /* GPU backend takes over presentation: upload the software surface to a
-   * GPU texture and blit it to the swapchain. Falls through to the SDL
-   * renderer / surface path if the GPU state isn't attached. */
-  if (ren->gpu_state) {
-    RenSurface rs = renwin_get_surface(ren);
-    gpu_present_surface(ren, rs.surface, rects, count);
-    return;
-  }
-#endif
+  /* When the GPU backend is attached, rencache_end_frame presents the frame
+   * itself (gpu_end_frame blits the render target to the swapchain) and never
+   * reaches this function.  Getting here means the SDL renderer / window
+   * surface path owns the frame. */
 #ifdef LITE_USE_SDL_RENDERER
   const int scale = ren->rensurface.scale;
   for (int i = 0; i < count; i++) {

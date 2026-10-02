@@ -82,17 +82,23 @@ typedef struct {
   SDL_GPUBuffer *vbuf_gpu;
   Uint32 vbuf_gpu_size;
 
-  /* Transfer buffer for the fallback present path (gpu_present_surface).
-   * NOT used by the GPU rencache path. Lazily created on first present. */
-  SDL_GPUTransferBuffer *surf_xfer;
-  Uint32 surf_xfer_size;
+  /* Staging buffer for DRAW_IMAGE.  Deliberately separate from the glyph
+   * upload buffer: resizing a transfer buffer retires it, and a blit recorded
+   * earlier in the same frame would then be reading memory it no longer owns.
+   * Two buffers mean the image path and the atlas path can never do that to
+   * each other. */
+  SDL_GPUTransferBuffer *image_xfer;
+  Uint32 image_xfer_size;
 
   /* Cached texture for DRAW_IMAGE (grown if a larger image is drawn).
-   * last_img caches the surface pointer to skip re-uploading when the
-   * same image is redrawn (e.g. markdown preview dirty-redraw). */
+   * The cache key is the surface plus the pixel buffer it owns and its size,
+   * so an entry can never be reused for a different image that happens to be
+   * allocated at the same address (see gpu_draw_image). */
   SDL_GPUTexture *image_tex;
   int image_tex_w, image_tex_h;
   SDL_Surface *last_img;
+  void *last_img_pixels;
+  int last_img_w, last_img_h;
 
   /* Current command buffer (valid between begin/end_frame). */
   SDL_GPUCommandBuffer *cmd;
@@ -400,8 +406,9 @@ void gpu_window_detach(RenWindow *ren) {
   if (s->image_tex)   SDL_ReleaseGPUTexture(g_ctx.device, s->image_tex);
   /* last_img is a borrowed pointer (owned by rencache), just clear it. */
   s->last_img = NULL;
+  s->last_img_pixels = NULL;
   if (s->vbuf_xfer)   SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->vbuf_xfer);
-  if (s->surf_xfer)   SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->surf_xfer);
+  if (s->image_xfer)  SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->image_xfer);
   if (s->vbuf_gpu)    SDL_ReleaseGPUBuffer(g_ctx.device, s->vbuf_gpu);
   if (s->draws)       SDL_free(s->draws);
   SDL_ReleaseWindowFromGPUDevice(g_ctx.device, ren->window);
@@ -415,7 +422,10 @@ void gpu_window_resize(RenWindow *ren) {
   SDL_WaitForGPUIdle(g_ctx.device);
   if (s->target_tex) { SDL_ReleaseGPUTexture(g_ctx.device, s->target_tex); s->target_tex = NULL; }
   s->target_w = s->target_h = 0;
-  /* vbuf_xfer is size-independent, keep it. */
+  /* vbuf_xfer is size-independent, keep it.  The image texture survives a
+   * resize, but drop the cache key so the next draw re-uploads into it. */
+  s->last_img = NULL;
+  s->last_img_pixels = NULL;
 }
 
 /* Ensure the render-target texture + vertex transfer buffer exist for the
@@ -596,6 +606,18 @@ void gpu_atlas_destroy_texture(void *tex) {
     SDL_ReleaseGPUTexture(g_ctx.device, (SDL_GPUTexture *)tex);
 }
 
+/* Forget pending uploads that read from a surface the caller is about to
+ * destroy (font_clear_glyph_cache).  A stale entry would be dereferenced the
+ * next time the list is flushed. */
+void gpu_atlas_forget_surface(SDL_Surface *surf) {
+  int n = 0;
+  for (int i = 0; i < g_upload_count; i++) {
+    if (g_uploads[i].surf == surf) continue;
+    g_uploads[n++] = g_uploads[i];
+  }
+  g_upload_count = n;
+}
+
 void gpu_atlas_mark_dirty(void *tex, SDL_Surface *surf,
                           int x, int y, int w, int h, int fmt) {
   if (!tex || !surf || w <= 0 || h <= 0) return;
@@ -661,27 +683,49 @@ static void copy_atlas_region(Uint8 *dst, int dst_pitch,
   }
 }
 
+/* Grow-only (re)allocation of a staging transfer buffer.  Callers must run
+ * this *before* recording any blit that reads the buffer: resizing retires the
+ * old buffer, and a copy that is already sitting in this frame's command buffer
+ * would then be reading memory that no longer belongs to it. */
+static bool ensure_xfer(SDL_GPUTransferBuffer **buf, Uint32 *cap, Uint32 size) {
+  if (*buf && *cap >= size) return true;
+  Uint32 want = *cap > size ? *cap : size;   /* never shrink */
+  if (*buf) {
+    SDL_ReleaseGPUTransferBuffer(g_ctx.device, *buf);
+    *buf = NULL;
+  }
+  SDL_GPUTransferBufferCreateInfo bci = {0};
+  bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+  bci.size = want;
+  *buf = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
+  *cap = *buf ? want : 0;
+  return *buf != NULL;
+}
+
 /* Upload all pending dirty atlas regions. Called from gpu_end_frame before
- * the render pass. Each dirty entry gets its own transfer buffer (small,
- * transient — only new glyphs per frame). */
+ * the render pass. The staging buffer is sized to the largest region first, so
+ * it is never resized while blits are already recorded. The pending list holds
+ * pointers borrowed from the font glyph caches, so it is dropped as a whole if
+ * the upload cannot be set up at all rather than kept across frames. */
 static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
   if (g_upload_count == 0) return;
+  Uint32 max_size = 0;
+  for (int i = 0; i < g_upload_count; i++) {
+    int bpp = (g_uploads[i].fmt == 0) ? 1 : 4;
+    Uint32 size = (Uint32)(g_uploads[i].dirty.w * g_uploads[i].dirty.h * bpp);
+    if (size > max_size) max_size = size;
+  }
+  if (!ensure_xfer(&g_atlas_xfer, &g_atlas_xfer_size, max_size)) {
+    fprintf(stderr, "gpu: atlas staging buffer (%u bytes) failed: %s\n",
+            (unsigned)max_size, SDL_GetError());
+    g_upload_count = 0;
+    return;
+  }
   SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
   if (!cp) { g_upload_count = 0; return; }
   for (int i = 0; i < g_upload_count; i++) {
     AtlasUpload *u = &g_uploads[i];
     int bpp = (u->fmt == 0) ? 1 : 4;
-    Uint32 size = (Uint32)(u->dirty.w * u->dirty.h * bpp);
-    /* Grow the shared atlas transfer buffer if needed. */
-    if (size > g_atlas_xfer_size) {
-      if (g_atlas_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
-      SDL_GPUTransferBufferCreateInfo bci = {0};
-      bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-      bci.size = size;
-      g_atlas_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
-      g_atlas_xfer_size = size;
-      if (!g_atlas_xfer) { g_atlas_xfer_size = 0; continue; }
-    }
     Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
     if (mapped) {
       copy_atlas_region(mapped, u->dirty.w * bpp, u->surf, &u->dirty, u->fmt);
@@ -760,10 +804,16 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   int dw = rect.width * ss, dh = rect.height * ss;
   int iw = img->w, ih = img->h;
 
-  /* Upload only when the surface pointer changes. rencache reuses the
-   * same SDL_Surface object across frames, so pointer equality means the
-   * image content hasn't changed and we can skip the convert+upload. */
-  if (img != s->last_img) {
+  /* Upload only when the image changes.  rencache reuses the same SDL_Surface
+   * across frames, so an unchanged one can skip the convert+upload -- but the
+   * surface pointer alone is not a safe cache key: the address of a freed
+   * surface is routinely reused by the next allocation, which would then be
+   * drawn from the stale texture.  Its pixel buffer, size and the presence of
+   * the texture are part of the key as well. */
+  bool unchanged = (img == s->last_img && img->pixels == s->last_img_pixels &&
+                    iw == s->last_img_w && ih == s->last_img_h &&
+                    s->image_tex != NULL);
+  if (!unchanged) {
     SDL_Surface *rgba = SDL_ConvertSurface(img, SDL_PIXELFORMAT_RGBA32);
     if (!rgba) return;
     iw = rgba->w; ih = rgba->h;
@@ -786,18 +836,13 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
     }
     if (!s->image_tex) { SDL_DestroySurface(rgba); return; }
 
-    /* Upload image data via the shared atlas transfer buffer. */
+    /* Upload image data via the image staging buffer. */
     Uint32 size = (Uint32)(iw * ih) * 4;
-    if (size > g_atlas_xfer_size) {
-      if (g_atlas_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
-      SDL_GPUTransferBufferCreateInfo bci = {0};
-      bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-      bci.size = size;
-      g_atlas_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
-      g_atlas_xfer_size = size;
-      if (!g_atlas_xfer) { g_atlas_xfer_size = 0; SDL_DestroySurface(rgba); return; }
+    if (!ensure_xfer(&s->image_xfer, &s->image_xfer_size, size)) {
+      SDL_DestroySurface(rgba);
+      return;
     }
-    Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
+    Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, s->image_xfer, true);
     if (mapped) {
       int row_bytes = iw * 4;
       if (rgba->pitch == row_bytes) {
@@ -809,12 +854,12 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
           d += row_bytes; p += rgba->pitch;
         }
       }
-      SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+      SDL_UnmapGPUTransferBuffer(g_ctx.device, s->image_xfer);
     }
     SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
     if (cp) {
       SDL_GPUTextureTransferInfo tsrc = {0};
-      tsrc.transfer_buffer = g_atlas_xfer;
+      tsrc.transfer_buffer = s->image_xfer;
       tsrc.offset = 0;
       tsrc.pixels_per_row = (Uint32)iw;
       tsrc.rows_per_layer = (Uint32)ih;
@@ -828,6 +873,9 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
     }
     SDL_DestroySurface(rgba);
     s->last_img = img;
+    s->last_img_pixels = img->pixels;
+    s->last_img_w = iw;
+    s->last_img_h = ih;
   }
   if (!s->image_tex) return;
 
@@ -1018,92 +1066,6 @@ void gpu_end_frame(RenWindow *ren) {
   s->cmd = NULL;
   s->vbuf_used = 0;
   s->draws_count = 0;
-}
-
-/*----------------------------------------------------------------------------
- * Present path (Stage 1 / 2a): upload the CPU software surface into the GPU
- * render target, then blit the target to the swapchain. This is called from
- * renwin_update_rects every frame. The Stage 2 rencache GPU draw path is not
- * wired in yet (see rencache.c), so this is the active present path.
- *--------------------------------------------------------------------------*/
-bool gpu_present_surface(RenWindow *ren, SDL_Surface *surface,
-                         RenRect *rects, int count) {
-  (void)rects; (void)count;
-  if (!g_ctx.device || !ren || !ren->gpu_state || !surface) return false;
-  GpuWindowState *s = ren->gpu_state;
-  int w = surface->w, h = surface->h;
-  if (w <= 0 || h <= 0) return false;
-  if (!ensure_resources(s, w, h)) return false;
-
-  SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(g_ctx.device);
-  if (!cmd) return false;
-
-  /* Lazily create the surface upload transfer buffer (fallback path only). */
-  Uint32 surf_bytes = (Uint32)(w * h) * 4;
-  if (!s->surf_xfer || s->surf_xfer_size < surf_bytes) {
-    if (s->surf_xfer) SDL_ReleaseGPUTransferBuffer(g_ctx.device, s->surf_xfer);
-    SDL_GPUTransferBufferCreateInfo sbci = {0};
-    sbci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    sbci.size = surf_bytes;
-    s->surf_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &sbci);
-    s->surf_xfer_size = s->surf_xfer ? surf_bytes : 0;
-    if (!s->surf_xfer) { SDL_SubmitGPUCommandBuffer(cmd); return false; }
-  }
-
-  /* Upload surface pixels -> render target texture. */
-  if (s->surf_xfer) {
-    void *smapped = SDL_MapGPUTransferBuffer(g_ctx.device, s->surf_xfer, true);
-    if (smapped) {
-      int row_bytes = w * 4;
-      if (surface->pitch == row_bytes) {
-        SDL_memcpy(smapped, surface->pixels, (size_t)row_bytes * h);
-      } else {
-        Uint8 *dst = smapped; const Uint8 *src = surface->pixels;
-        for (int y = 0; y < h; y++) {
-          SDL_memcpy(dst, src, row_bytes);
-          dst += row_bytes; src += surface->pitch;
-        }
-      }
-      SDL_UnmapGPUTransferBuffer(g_ctx.device, s->surf_xfer);
-    }
-    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
-    if (cp) {
-      SDL_GPUTextureTransferInfo tsrc = {0};
-      tsrc.transfer_buffer = s->surf_xfer;
-      tsrc.offset = 0;
-      tsrc.pixels_per_row = (Uint32)w;
-      tsrc.rows_per_layer = (Uint32)h;
-      SDL_GPUTextureRegion tdst = {0};
-      tdst.texture = s->target_tex;
-      tdst.w = (Uint32)w;
-      tdst.h = (Uint32)h;
-      tdst.d = 1;
-      SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
-      SDL_EndGPUCopyPass(cp);
-    }
-  }
-
-  /* Blit render target -> swapchain. */
-  SDL_GPUTexture *swapchain = NULL;
-  Uint32 sw = 0, sh = 0;
-  if (SDL_WaitAndAcquireGPUSwapchainTexture(cmd, ren->window, &swapchain,
-                                             &sw, &sh) && swapchain) {
-    SDL_GPUBlitInfo info = {0};
-    info.source.texture = s->target_tex;
-    info.source.w = (Uint32)w;
-    info.source.h = (Uint32)h;
-    info.destination.texture = swapchain;
-    info.destination.w = sw;
-    info.destination.h = sh;
-    info.load_op = SDL_GPU_LOADOP_CLEAR;
-    info.clear_color = (SDL_FColor){0, 0, 0, 1};
-    info.filter = SDL_GPU_FILTER_NEAREST;
-    info.cycle = true;
-    SDL_BlitGPUTexture(cmd, &info);
-  }
-
-  SDL_SubmitGPUCommandBuffer(cmd);
-  return true;
 }
 
 #endif /* LITE_USE_GPU_RENDERER */

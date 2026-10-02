@@ -48,13 +48,13 @@ Lua (api/renderer.c)  — 不动
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `src/gpu_renderer.c` | 1092 | GPU 后端核心 |
-| `src/gpu_renderer.h` | 95 | 公开接口 |
+| `src/gpu_renderer.c` | 1071 | GPU 后端核心 |
+| `src/gpu_renderer.h` | 97 | 公开接口 |
 | `src/gpu_shaders.msl` | 137 | MSL shader 源码 |
 | `src/gpu_shaders_msl.h` | 146 | 自动生成的 C 字符串头 |
 | `scripts/msl-to-header.py` | 35 | .msl → .h 转换器 |
-| `scripts/deploy-gpu.sh` | 23 | 部署到 .app bundle |
-| **合计** | **1528** | |
+| `scripts/deploy-gpu.sh` | 18 | 部署到 .app bundle |
+| **合计** | **1504** | |
 
 ## 构建
 

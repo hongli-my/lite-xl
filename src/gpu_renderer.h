@@ -59,6 +59,10 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color, RenRect clip);
 void *gpu_atlas_create_texture(int w, int h, int fmt);
 void gpu_atlas_destroy_texture(void *tex);
 
+/* Drop queued uploads that still reference a glyph atlas surface which is
+ * about to be destroyed (font_clear_glyph_cache). */
+void gpu_atlas_forget_surface(SDL_Surface *surf);
+
 /* Mark a sub-region of an atlas texture dirty. The corresponding CPU surface
  * region will be uploaded (with format conversion) at the next gpu_end_frame.
  * Safe to call during begin_frame..end_frame (just records into a list). */
@@ -79,13 +83,11 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
 
 /* Draw an image (SDL_Surface) into a rectangle. The surface is converted to
  * RGBA32 and uploaded to a cached GPU texture, then drawn as a textured quad
- * using the text pipeline in color mode (standard SRC-over alpha blend). */
+ * using the text pipeline in color mode (standard SRC-over alpha blend).
+ * The caller must keep the surface (and the pixel buffer it owns) alive until
+ * the frame is replayed -- see reference_for_frame in src/api/renderer.c. */
 void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
                     RenRect rect, RenRect clip);
-
-/* Legacy Stage 1 entry, kept for the non-GPU rencache path fallback. */
-bool gpu_present_surface(RenWindow *ren, SDL_Surface *surface,
-                         RenRect *rects, int count);
 
 #endif /* LITE_USE_GPU_RENDERER */
 

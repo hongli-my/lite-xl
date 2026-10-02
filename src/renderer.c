@@ -454,6 +454,10 @@ static void font_clear_glyph_cache(RenFont* font) {
     for (int atlas_idx = 0; atlas_idx < font->glyphs.natlas[glyph_format_idx]; atlas_idx++) {
       GlyphAtlas *atlas = &font->glyphs.atlas[glyph_format_idx][atlas_idx];
       for (int surface_idx = 0; surface_idx < atlas->nsurface; surface_idx++) {
+#ifdef LITE_USE_GPU_RENDERER
+        // a queued GPU upload may still point at this surface
+        gpu_atlas_forget_surface(atlas->surfaces[surface_idx]);
+#endif
         SDL_DestroySurface(atlas->surfaces[surface_idx]);
       }
 #ifdef LITE_USE_GPU_RENDERER

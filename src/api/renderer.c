@@ -13,8 +13,11 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "../stb_image.h"
 
-// a reference index to a table that stores the fonts
-static int RENDERER_FONT_REF = LUA_NOREF;
+// Reference to a table that pins the fonts and images used by the current
+// frame.  rencache only records commands and replays them in
+// rencache_end_frame, so anything a command holds a raw pointer to must stay
+// alive until then (see reference_for_frame).
+static int RENDERER_FRAME_REF = LUA_NOREF;
 
 static int font_get_options(
   lua_State *L,
@@ -335,9 +338,9 @@ static int f_end_frame(UNUSED lua_State *L) {
   assert(window != NULL);
   rencache_end_frame(window);
   ren_set_target_window(NULL);
-  // clear the font reference table
+  // drop the references held for this frame
   lua_newtable(L);
-  lua_rawseti(L, LUA_REGISTRYINDEX, RENDERER_FONT_REF);
+  lua_rawseti(L, LUA_REGISTRYINDEX, RENDERER_FRAME_REF);
   return 0;
 }
 
@@ -371,21 +374,28 @@ static int f_draw_rect(lua_State *L) {
   return 0;
 }
 
-static int f_draw_text(lua_State *L) {
-  RenFont* fonts[FONT_FALLBACK_MAX];
-  font_retrieve(L, fonts, 1);
-
-  // stores a reference to this font to the reference table
-  lua_rawgeti(L, LUA_REGISTRYINDEX, RENDERER_FONT_REF);
-  if (lua_istable(L, -1))
-  {
-    lua_pushvalue(L, 1);
+// Keeps the object at `idx` alive until the end of the frame.  The draw calls
+// below only record commands; those commands hold raw pointers (a RenFont
+// pack, an SDL_Surface*) that rencache dereferences when it replays the frame.
+// Without this, a temporary object -- `renderer.draw_image(renderer.image.load(p), x, y)`
+// is the easy way to write one -- can be collected while its pointer is still
+// sitting in the command buffer.  f_end_frame drops the whole table.
+static void reference_for_frame(lua_State *L, int idx) {
+  lua_rawgeti(L, LUA_REGISTRYINDEX, RENDERER_FRAME_REF);
+  if (lua_istable(L, -1)) {
+    lua_pushvalue(L, idx);
     lua_pushboolean(L, 1);
     lua_rawset(L, -3);
   } else {
-    fprintf(stderr, "warning: failed to reference count fonts\n");
+    fprintf(stderr, "warning: failed to reference count objects\n");
   }
   lua_pop(L, 1);
+}
+
+static int f_draw_text(lua_State *L) {
+  RenFont* fonts[FONT_FALLBACK_MAX];
+  font_retrieve(L, fonts, 1);
+  reference_for_frame(L, 1);
 
   size_t len;
   const char *text = luaL_checklstring(L, 2, &len);
@@ -456,6 +466,8 @@ static int f_image_get_size(lua_State *L) {
 static int f_draw_image(lua_State *L) {
   SDL_Surface **img = luaL_checkudata(L, 1, API_TYPE_IMAGE);
   if (!*img) return luaL_error(L, "invalid image");
+  // the command buffer keeps the SDL_Surface* until the frame is replayed
+  reference_for_frame(L, 1);
   double x = luaL_checknumber(L, 2);
   double y = luaL_checknumber(L, 3);
   double w = luaL_optnumber(L, 4, 0);
@@ -506,9 +518,9 @@ static const luaL_Reg imageLib[] = {
 };
 
 int luaopen_renderer(lua_State *L) {
-  // gets a reference on the registry to store font data
+  // registry slot for the per-frame reference table (fonts + images)
   lua_newtable(L);
-  RENDERER_FONT_REF = luaL_ref(L, LUA_REGISTRYINDEX);
+  RENDERER_FRAME_REF = luaL_ref(L, LUA_REGISTRYINDEX);
 
   luaL_newlib(L, lib);
   luaL_newmetatable(L, API_TYPE_FONT);
