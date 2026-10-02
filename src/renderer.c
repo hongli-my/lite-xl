@@ -220,7 +220,18 @@ static unsigned int font_get_glyph_id(RenFont *font, unsigned int codepoint) {
 }
 
 #define FONT_IS_SUBPIXEL(F) ((F)->antialiasing == FONT_ANTIALIASING_SUBPIXEL)
-#define FONT_BITMAP_COUNT(F) ((F)->antialiasing == FONT_ANTIALIASING_SUBPIXEL ? SUBPIXEL_BITMAPS_CACHED : 1)
+// Number of horizontal offsets a glyph is cached at (sub-pixel positioning).
+// It is independent of sub-pixel *antialiasing*: rasterizing a grayscale
+// glyph at FONT_BITMAP_COUNT offsets is what keeps the pen position from
+// being snapped to whole pixels, which on a 1x display is very visible on a
+// monospace grid -- JetBrains Mono advances 8.41 px at 14 px, so whole-pixel
+// placement makes the cells alternate between 8 and 9 px.  Antialiasing
+// "none" (mono) has a single bitmap and is placed on whole pixels anyway.
+#define FONT_BITMAP_COUNT(F) ((F)->antialiasing == FONT_ANTIALIASING_NONE ? 1 : SUBPIXEL_BITMAPS_CACHED)
+// Bytes per pixel inside a glyph bitmap: an LCD bitmap carries R, G and B
+// separately, everything else is a single coverage value.  This is *not* the
+// number of cached offsets -- see FONT_BITMAP_COUNT.
+#define FONT_CHANNELS(F) (FONT_IS_SUBPIXEL(F) ? 3 : 1)
 #define SLOT_BITMAP_TYPE(B) ((B).pixel_mode == FT_PIXEL_MODE_LCD ? EGlyphFormatSubpixel : (B).pixel_mode == FT_PIXEL_MODE_BGRA ? EGlyphFormatColor : EGlyphFormatGrayscale)
 
 static inline SDL_PixelFormat glyphformat_to_pixelformat(ERenGlyphFormat format, int *depth) {
@@ -361,15 +372,16 @@ static SDL_Surface *font_load_glyph_bitmap(RenFont *font, unsigned int glyph_id,
     return NULL;
 
   // For LCD subpixel, FreeType returns bitmap.width as 3x the pixel width (RGB channels laid out
-  // horizontally), so we divide by FONT_BITMAP_COUNT(=3). But BGRA color bitmaps (Apple Color
+  // horizontally), so we divide by the channel count. But BGRA color bitmaps (Apple Color
   // Emoji sbix) are 1 pixel = 4 bytes with width already in pixels — must NOT divide.
   unsigned int glyph_width = (slot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA)
     ? slot->bitmap.width
-    : slot->bitmap.width / FONT_BITMAP_COUNT(font);
+    : slot->bitmap.width / FONT_CHANNELS(font);
   // FT_PIXEL_MODE_MONO uses 1 bit per pixel packed bitmap
   if (slot->bitmap.pixel_mode == FT_PIXEL_MODE_MONO) glyph_width *= 8;
   // BGRA uses 4 bytes/pixel; memcpy below copies glyph_width * bytes_per_pixel bytes.
-  // For grayscale/LCD glyph_width already equals byte count (1 byte/px after FONT_BITMAP_COUNT division).
+  // For grayscale/LCD glyph_width already equals the byte count (1 byte/px
+  // after the LCD channel division).
   int bytes_per_pixel = (slot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA) ? 4 : 1;
 
   metric->x1 = glyph_width;
@@ -425,8 +437,8 @@ static RenFont *font_group_get_glyph(RenFont **fonts, unsigned int codepoint, in
     // use the first font that has representation for the glyph ID, but for whitespaces always use the first font
     if (glyph_id || is_whitespace(codepoint)) break;
   }
-  // load the glyph if it is not loaded
-  subpixel_idx = FONT_IS_SUBPIXEL(font) ? subpixel_idx : 0;
+  // load the glyph if it is not loaded; mono fonts have no offsets to pick
+  if (FONT_BITMAP_COUNT(font) == 1) subpixel_idx = 0;
   GlyphMetric *m = font_load_glyph_metric(font, glyph_id, subpixel_idx);
   // try the box drawing character (0x25A1) if the requested codepoint is not a whitespace, and we cannot load the .notdef glyph
   if ((!m || !m->flags) && codepoint != 0x25A1 && !is_whitespace(codepoint))

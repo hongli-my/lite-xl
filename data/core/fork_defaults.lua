@@ -87,18 +87,32 @@ local emoji = is_macos and first_font({
 ---and CJK fallbacks.  Colour emoji glyphs are drawn at their own bitmap size,
 ---so the emoji font is loaded at the same size as the text to keep it on the
 ---line (a larger size overlaps the neighbouring lines).
-local function font_group(primary_file, size)
-  -- grayscale + full hinting render crisper than the default subpixel on
-  -- Retina/high-DPI screens (subpixel adds coloured fringes there).
-  local group = { renderer.font.load(fonts_dir .. primary_file, size,
-    { antialiasing = "grayscale", hinting = "full" }) }
+---@param opts table|nil Rendering options (antialiasing/hinting/...).
+local function font_group(primary_file, size, opts)
+  local group = { renderer.font.load(fonts_dir .. primary_file, size, opts) }
   if emoji then table.insert(group, emoji) end
   if cjk then table.insert(group, cjk) end
   return renderer.font.group(group)
 end
 
-style.font = font_group("/FiraSans-Regular.ttf", 14 * SCALE)
-style.code_font = font_group("/JetBrainsMono-Regular.ttf", 14 * SCALE)
+-- Grayscale beats subpixel on a Retina panel (subpixel adds coloured fringes
+-- there), but "full" hinting only pays off once the glyphs are big enough:
+-- FreeType's auto-hinter grid-fits every glyph, and at the 14 px a 1x display
+-- gets (a non-HiDPI window surface means SCALE stays 1) that nudges about
+-- half of the characters by a whole pixel inside their cell and inflates the
+-- curves.  Measured on JetBrains Mono at 14 px: 21 of 46 ASCII glyphs move
+-- their ink by >= 0.5 px with hinting=full, 0 with hinting=slight.  A
+-- proportional UI face hides that in its uneven advances, a monospace cell
+-- has nowhere to hide it -- hence slight for the code font and full for the
+-- UI font, where it survives as extra crispness.
+-- (JetBrains Mono's 8.41 px advance still means the cell pitch alternates
+-- 8/9 px because grayscale gets no subpixel positioning; a 15 * SCALE code
+-- font has a whole-pixel 9 px advance if that ever becomes annoying.)
+local UI_FONT_OPTS   = { antialiasing = "grayscale", hinting = "full" }
+local CODE_FONT_OPTS = { antialiasing = "grayscale", hinting = "slight" }
+
+style.font = font_group("/FiraSans-Regular.ttf", 14 * SCALE, UI_FONT_OPTS)
+style.code_font = font_group("/JetBrainsMono-Regular.ttf", 14 * SCALE, CODE_FONT_OPTS)
 -- the welcome screen uses a copy of the UI font: keep the fallbacks
 style.big_font = style.font:copy(46 * SCALE)
 
