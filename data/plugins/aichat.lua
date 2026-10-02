@@ -2513,9 +2513,38 @@ function AIView:_draw_input(P)
   common.draw_text(font, tcol, L.btn_label, "center", bx, by, bw, bh)
 end
 
+-- The wrapped layout bakes colours (system text, the file chip, headings,
+-- links) and font metrics into its segments, and layout_messages only rebuilds
+-- an entry when its text, its role or the wrap width changes.  So changing the
+-- theme (core.reload_module("colors.*")) or the font has to invalidate the
+-- cache explicitly, otherwise the panel keeps drawing the old look until the
+-- next message arrives.  The signature is a few tens of bytes of numbers built
+-- once per frame while the panel is visible.
+local function appearance_signature()
+  local parts = {
+    string.format("%.2f/%.2f", ai_font:get_size(), ai_font:get_height()),
+    string.format("%d/%d", style.padding.x, style.padding.y),
+  }
+  for _, name in ipairs({ "text", "dim", "accent", "background", "background2", "selection" }) do
+    local c = style[name]
+    if c then
+      parts[#parts + 1] = string.format("%d,%d,%d,%d", c[1], c[2], c[3], c[4] or 255)
+    end
+  end
+  return table.concat(parts, "|")
+end
+
 function AIView:draw()
   if not self.visible then return end
   if self.size.x < 1 or self.size.y < 1 then return end
+  -- theme/font changed since the layout was computed: throw it away so the
+  -- rebuilt segments pick up the new colours and metrics
+  local signature = appearance_signature()
+  if signature ~= self._appearance_signature then
+    self._appearance_signature = signature
+    self._layout_cache = nil
+    self._dirty = true
+  end
   self:layout_messages()
 
   local x, y, w, h = self.position.x, self.position.y, self.size.x, self.size.y

@@ -134,26 +134,39 @@ config.plugins.autocomplete = common.merge({
 -- when the editor is dark (slate theme: bg3 = #f0f0f0, text = #d4d4d4).  Pick
 -- text colors that contrast with the popup background, not the editor.
 -------------------------------------------------------------------------------
-local popup_bg     = style.background3
-local popup_text   = style.text
-local popup_dim    = style.dim
-local popup_accent = style.accent
-local popup_sel_bg = style.selection
-
 -- Detect whether the popup background is light or dark, then choose readable
 -- text colors.  Luminance threshold: > 0.5 = light background.
 local function luminance(c)
   return (c[1] * 0.299 + c[2] * 0.587 + c[3] * 0.114) / 255
 end
 
-if luminance(popup_bg) > 0.5 then
-  -- Light popup background: use dark text
-  popup_text   = { common.color "#333333" }
-  popup_dim    = { common.color "#888888" }
-  popup_sel_bg = { common.color "#d6ebff" }
-  if luminance(popup_accent) > 0.5 then
-    popup_accent = { common.color "#2979ff" }  -- dark blue on light bg
+-- The palette is derived from the theme, so it cannot be built once at load
+-- time: core.reload_module("colors.something") replaces the style entries while
+-- this plugin stays loaded, and a table cached from load time would keep the
+-- old colours until the editor restarts.  Recompute when any of the entries it
+-- reads is replaced -- comparing five table references per draw is cheap.
+local popup_palette_cache = {}
+
+local function popup_palette()
+  local bg, text, dim = style.background3, style.text, style.dim
+  local accent, sel = style.accent, style.selection
+  local c = popup_palette_cache
+  if c.bg == bg and c.text == text and c.dim == dim
+     and c.accent == accent and c.sel == sel then
+    return c
   end
+  c.bg, c.text, c.dim, c.accent, c.sel = bg, text, dim, accent, sel
+  c.ptext, c.pdim, c.paccent, c.psel = text, dim, accent, sel
+  if luminance(bg) > 0.5 then
+    -- Light popup background: use dark text
+    c.ptext = { common.color "#333333" }
+    c.pdim  = { common.color "#888888" }
+    c.psel  = { common.color "#d6ebff" }
+    if luminance(accent) > 0.5 then
+      c.paccent = { common.color "#2979ff" }  -- dark blue on light bg
+    end
+  end
+  return c
 end
 
 local autocomplete = {}
@@ -561,6 +574,7 @@ local function draw_description_box(text, av, sx, sy, sw, sh)
 
   local font = desc_font
   local lh = font:get_height()
+  local pp = popup_palette()
   local y = sy + style.padding.y
   local x = sx + sw + style.padding.x / 4
   local width = 0
@@ -617,17 +631,17 @@ local function draw_description_box(text, av, sx, sy, sw, sh)
     desc_y,
     width + style.padding.x * 2,
     desc_h,
-    popup_bg
+    pp.bg
   )
 
   -- draw a subtle border (top + bottom accent lines)
-  renderer.draw_rect(x, desc_y, width + style.padding.x * 2, 1, popup_accent)
+  renderer.draw_rect(x, desc_y, width + style.padding.x * 2, 1, pp.paccent)
 
   -- draw text
   local ty = desc_y + style.padding.y
   for _, line in pairs(lines) do
     common.draw_text(
-      font, popup_text, line, "left",
+      font, pp.ptext, line, "left",
       x + style.padding.x, ty, width, lh
     )
     ty = ty + lh
@@ -640,10 +654,11 @@ local function draw_suggestions_box(av)
   end
 
   local ah = config.plugins.autocomplete.max_height
+  local pp = popup_palette()
 
   -- draw background rect
   local rx, ry, rw, rh, has_icons = get_suggestions_rect(av)
-  renderer.draw_rect(rx, ry, rw, rh, popup_bg)
+  renderer.draw_rect(rx, ry, rw, rh, pp.bg)
 
   -- draw text
   local font = av:get_font()
@@ -661,7 +676,7 @@ local function draw_suggestions_box(av)
 
     -- Draw selection background for the highlighted item
     if i == suggestions_idx then
-      renderer.draw_rect(rx, y - style.padding.y / 2, rw, lh, popup_sel_bg)
+      renderer.draw_rect(rx, y - style.padding.y / 2, rw, lh, pp.psel)
     end
 
     local icon_l_padding, icon_r_padding = 0, 0
@@ -673,7 +688,7 @@ local function draw_suggestions_box(av)
         local itext = autocomplete.icons[icon].char
         local icolor = autocomplete.icons[icon].color
         if i == suggestions_idx then
-          icolor = popup_accent
+          icolor = pp.paccent
         elseif type(icolor) == "string" then
           icolor = style.syntax[icolor]
         end
@@ -694,7 +709,7 @@ local function draw_suggestions_box(av)
     local info_size = (s.info and not hide_info)
       and (style.font:get_width(s.info) + style.padding.x) or 0
 
-    local color = (i == suggestions_idx) and popup_accent or popup_text
+    local color = (i == suggestions_idx) and pp.paccent or pp.ptext
     -- Push clip to avoid that the suggestion text gets drawn over suggestion type/icon
     core.push_clip_rect(rx + icon_l_padding + style.padding.x, y,
                         rw - info_size - icon_l_padding - icon_r_padding - style.padding.x, lh)
@@ -707,13 +722,13 @@ local function draw_suggestions_box(av)
     if x_adv > rx + rw - info_size - icon_r_padding then
       local ellipsis_size = font:get_width("…")
       local ell_x = rx + rw - info_size - icon_r_padding - ellipsis_size
-      renderer.draw_rect(ell_x, y, ellipsis_size, lh, popup_bg)
+      renderer.draw_rect(ell_x, y, ellipsis_size, lh, pp.bg)
       common.draw_text(font, color, "…", "left", ell_x, y, ellipsis_size, lh)
     end
     -- Translation: drawn immediately to the right of the word, left-aligned,
     -- instead of being pushed to the far right edge of the popup.
     if s.info and not hide_info then
-      color = (i == suggestions_idx) and popup_text or popup_dim
+      color = (i == suggestions_idx) and pp.ptext or pp.pdim
       common.draw_text(
         style.font, color, s.info, "left",
         x_adv + style.padding.x / 2, y, rw - (x_adv + style.padding.x / 2), lh
@@ -731,18 +746,18 @@ local function draw_suggestions_box(av)
     end
   end
 
-  renderer.draw_rect(rx, y, rw, 2, popup_accent)
-  renderer.draw_rect(rx, y+2, rw, lh, popup_bg)
+  renderer.draw_rect(rx, y, rw, 2, pp.paccent)
+  renderer.draw_rect(rx, y+2, rw, lh, pp.bg)
   common.draw_text(
     style.font,
-    popup_dim,
+    pp.pdim,
     "Items",
     "left",
     rx + style.padding.x, y, rw, lh
   )
   common.draw_text(
     style.font,
-    popup_accent,
+    pp.paccent,
     tostring(suggestions_idx) .. "/" .. tostring(#suggestions),
     "right",
     rx, y, rw - style.padding.x, lh
