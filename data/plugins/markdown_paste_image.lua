@@ -9,6 +9,7 @@ local common = require "core.common"
 local command = require "core.command"
 local keymap = require "core.keymap"
 local config = require "core.config"
+local process = require "core.process"
 
 -- Debug: confirm plugin loaded
 core.log_quiet("markdown_paste_image plugin loaded, PLATFORM=%s", PLATFORM or "nil")
@@ -88,54 +89,67 @@ local function find_pngpaste()
   return "pngpaste" -- last resort
 end
 
+-- Quotes one argument for /bin/sh, which io.popen() below runs the helper
+-- through.  Lua's %q is *Lua* quoting: it leaves $ and backticks alone, so
+-- string.format("%q", path) inside a double-quoted shell word would run
+-- "/tmp/x$(cmd).png" as a command -- and the path comes from the document's
+-- filename.  Single quotes disable every expansion; the only character that
+-- needs care is the quote itself.
+local function shell_quote(s)
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+-- Size of a file on disk, or nil when it is not there.  Used to confirm that a
+-- clipboard helper really wrote the image.
+local function saved_file_size(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local size = f:seek("end")
+  f:close()
+  return size
+end
+
 -- Try to save clipboard image using pngpaste (macOS) or xclip (Linux)
 -- Returns true on success, false if no image or failed
 local function save_clipboard_image(dest_path)
   if PLATFORM == "macOS" or PLATFORM == "Mac OS X" then
     local pngpaste = find_pngpaste()
     core.log("Using pngpaste: %s", pngpaste)
-    -- Use pngpaste: if clipboard has no image, it exits with error
-    local cmd = string.format('%s %q 2>/dev/null; echo $?', pngpaste, dest_path)
-    local handle = io.popen(cmd)
-    if not handle then
-      core.log("io.popen failed for pngpaste")
+    -- pngpaste exits non-zero when the clipboard holds no image.  It is started
+    -- with an argument vector (no shell), so the destination path cannot be
+    -- interpreted as shell syntax; both streams are discarded since only the
+    -- exit status matters.
+    local ok, proc = pcall(process.start, { pngpaste, dest_path },
+      { stdout = process.REDIRECT_DISCARD, stderr = process.REDIRECT_DISCARD })
+    if not ok or not proc then
+      core.log("could not start pngpaste: %s", pngpaste)
       return false
     end
-    local result = handle:read("*a")
-    handle:close()
-    core.log("pngpaste output: [%s]", result or "nil")
-    local exit_code = result:match("(%d+)%s*$")
+    local exit_code = proc:wait(10)
     core.log("pngpaste exit code: %s", tostring(exit_code))
-    if exit_code == "0" then
-      -- Verify file was actually created and has content
-      local f = io.open(dest_path, "rb")
-      if f then
-        local size = f:seek("end")
-        f:close()
+    if exit_code == 0 then
+      local size = saved_file_size(dest_path)
+      if size then
         core.log("Image saved, size=%d", size)
         return size > 0
-      else
-        core.log("File not found after pngpaste: %s", dest_path)
       end
+      core.log("File not found after pngpaste: %s", dest_path)
     end
     return false
 
   elseif PLATFORM == "Linux" then
+    -- xclip writes the PNG to stdout, which is redirected into the file.
     local cmd = string.format(
-      'xclip -selection clipboard -t image/png -o > %q 2>/dev/null; echo $?',
-      dest_path
+      'xclip -selection clipboard -t image/png -o > %s 2>/dev/null; echo $?',
+      shell_quote(dest_path)
     )
     local handle = io.popen(cmd)
     if not handle then return false end
     local result = handle:read("*a")
     handle:close()
     if result:match("^0") then
-      local f = io.open(dest_path, "rb")
-      if f then
-        local size = f:seek("end")
-        f:close()
-        return size > 0
-      end
+      local size = saved_file_size(dest_path)
+      return size ~= nil and size > 0
     end
     return false
   end
@@ -186,7 +200,7 @@ end, {
     -- Ensure image directory exists
     local image_dir = get_image_dir(doc.abs_filename)
     core.log("image_dir: %s", image_dir)
-    os.execute(string.format('mkdir -p %q', image_dir))
+    common.mkdirp(image_dir)
 
     -- Try to save clipboard image
     local filename = generate_image_filename()

@@ -155,10 +155,15 @@ local MAX_MEASURED_COLUMNS = 4096
 function DocView:get_visible_content_width()
   local minline, maxline = self:get_visible_line_range()
   local _, indent_size = self.doc:get_indent_info()
+  local font = self:get_font()
   -- Quantize the window so that small scroll movements reuse the cached value.
   local limit = math.ceil((self.scroll.x + self.size.x * 2) / 128) * 128
-  local key = string.format("%d:%d:%d:%d:%d:%s:%d",
-    self.doc:get_change_id(), minline, maxline, SCALE, indent_size, self.font, limit)
+  -- `self.font` is only the name of the font in `style` ("code_font"), so the
+  -- size has to be part of the key as well: with ctrl+wheel / the scale plugin
+  -- the same font object is resized and the cached width would stay stale.
+  local key = string.format("%d:%d:%d:%d:%d:%s:%.2f:%d",
+    self.doc:get_change_id(), minline, maxline, SCALE, indent_size, self.font,
+    font:get_size(), limit)
   if self.visible_content_width_key == key then
     return self.visible_content_width
   end
@@ -171,10 +176,10 @@ function DocView:get_visible_content_width()
   -- A conservative lower bound of a glyph's advance, used both to derive the
   -- number of columns to measure and to estimate very long lines.
   local min_char_width = math.max(math.min(
-    self:get_font():get_width("i"),
-    self:get_font():get_width("l"),
-    self:get_font():get_width("."),
-    self:get_font():get_width(" ")), SCALE)
+    font:get_width("i"),
+    font:get_width("l"),
+    font:get_width("."),
+    font:get_width(" ")), SCALE)
   local max_columns = math.ceil(math.max(limit - gutter_width, 0) / min_char_width) + 1
   for i = minline, maxline do
     local line = self.doc.lines[i]

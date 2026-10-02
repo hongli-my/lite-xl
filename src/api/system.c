@@ -182,8 +182,9 @@ static void push_win32_error(lua_State *L, DWORD rc) {
 ** always queued by then (while the window is in fullscreen it arrives after
 ** the key events), and the editor would exit instead of closing a tab.
 ** Remember when a cmd+w key event was seen and drop quit events that follow
-** it closely. A quit the user really asked for (cmd+q, the window button) is
-** never preceded by cmd+w. */
+** it closely.  The marker is cleared as soon as any other key is pressed, so a
+** quit the user really asked for -- cmd+q, or a click on the window button --
+** is not swallowed: those involve input of their own. */
 #define CMD_W_QUIT_IGNORE_MS 1000
 static Uint64 last_cmd_w_ticks = 0;
 
@@ -279,6 +280,12 @@ top:
       if (event_is_cmd_w(&e)) {
         last_cmd_w_ticks = SDL_GetTicks();
         SDL_FlushEvent(SDL_EVENT_QUIT);
+      } else {
+        /* Any other key means the user did something else since the cmd+w, so
+        ** a quit that arrives now is the one they asked for.  Without this,
+        ** quitting within CMD_W_QUIT_IGNORE_MS of closing a tab (cmd+q right
+        ** after cmd+w) took a second attempt. */
+        last_cmd_w_ticks = 0;
       }
 #endif
       lua_pushstring(L, "keypressed");
