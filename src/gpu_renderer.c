@@ -234,11 +234,15 @@ static SDL_GPUGraphicsPipeline *make_rect_pipeline(void) {
 
 static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
   /* Same vertex layout as rect (float2 pos + float2 texcoord, 16 bytes).
-   * Blend is ENABLED with premultiplied alpha: shader outputs
+   * Blend is ENABLED with premultiplied alpha: the fragment shader outputs
    *   (color.rgb * coverage, coverage)
-   * and blend does: result = src + dst * (1 - src.a)
-   *   = color.rgb * coverage + dst.rgb * (1 - coverage)
-   * which matches the CPU grayscale formula exactly. */
+   * so the colour source factor must be ONE -- SRC_ALPHA would multiply the
+   * coverage in a second time (color.rgb * coverage^2), which washes out
+   * every antialiased edge.  With ONE:
+   *   result = src + dst * (1 - src.a)
+   *          = color.rgb * coverage + dst.rgb * (1 - coverage)
+   * which matches the CPU grayscale formula exactly.  The rect pipeline keeps
+   * SRC_ALPHA because lite_rect_fragment outputs straight alpha. */
   static const SDL_GPUVertexBufferDescription vbuf_desc = {
     .slot = 0,
     .pitch = sizeof(GpuVertex),
@@ -252,8 +256,8 @@ static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
       .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 8 },
   };
   SDL_GPUColorTargetBlendState blend = {0};
-  blend.enable_blend = true;  /* premultiplied alpha */
-  blend.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+  blend.enable_blend = true;  /* premultiplied alpha: colour factor is ONE */
+  blend.src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
   blend.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
   blend.color_blend_op = SDL_GPU_BLENDOP_ADD;
   blend.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
