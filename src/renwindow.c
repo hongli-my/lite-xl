@@ -18,7 +18,17 @@ static int query_surface_scale(RenWindow *ren) {
 
 static void setup_renderer(RenWindow *ren, int w, int h) {
   /* Note that w and h here should always be in pixels and obtained from
-     a call to SDL_GetWindowSizeInPixels(). */
+   * a call to SDL_GetWindowSizeInPixels(). */
+  /* When the SDL_gpu device owns the window, do NOT attach an SDL_Renderer:
+   * on macOS both would add their own CAMetalLayer subview to the window.
+   * The renderer's layer is never drawn into (the GPU path presents itself),
+   * leaving a black layer stacked under the live one. */
+#ifdef LITE_USE_GPU_RENDERER
+  if (ren->gpu_state) {
+    ren->rensurface.scale = query_surface_scale(ren);
+    return;
+  }
+#endif
   if (!ren->renderer) {
     ren->renderer = SDL_CreateRenderer(ren->window, NULL);
   }

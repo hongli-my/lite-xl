@@ -292,6 +292,13 @@ static SDL_Surface *font_allocate_glyph_surface(RenFont *font, FT_GlyphSlot slot
     SDL_PixelFormat format = glyphformat_to_pixelformat(glyph_format, &depth);
     atlas->surfaces = check_alloc(SDL_realloc(atlas->surfaces, sizeof(SDL_Surface *) * (atlas->nsurface + 1)));
     atlas->surfaces[atlas->nsurface] = check_alloc(SDL_CreateSurface(atlas->width, GLYPHS_PER_ATLAS * h, format));
+    /* Zero the surface: the GPU path uploads dirty regions that may span
+     * gaps between glyph bands (regions merged per texture), and any
+     * uninitialized bytes there would be uploaded and sampled as garbage
+     * coverage, rendering affected glyphs as solid blocks. */
+    if (atlas->surfaces[atlas->nsurface])
+      SDL_memset(atlas->surfaces[atlas->nsurface]->pixels, 0,
+                 (size_t)atlas->surfaces[atlas->nsurface]->pitch * atlas->surfaces[atlas->nsurface]->h);
 #ifdef LITE_USE_GPU_RENDERER
     atlas->gpu_tex = check_alloc(SDL_realloc(atlas->gpu_tex, sizeof(void*) * (atlas->nsurface + 1)));
     atlas->gpu_tex[atlas->nsurface] = gpu_atlas_create_texture(atlas->width, GLYPHS_PER_ATLAS * h, glyph_format);
@@ -428,6 +435,18 @@ static inline int is_whitespace(unsigned int codepoint) {
   return (codepoint >= 0x9 && codepoint <= 0xD) || (codepoint >= 0x2000 && codepoint <= 0x200A);
 }
 
+/* Combining codepoints that modify the preceding glyph and render as nothing
+ * on their own: variation selectors (FE00-FE0F), zero-width joiner (200D)
+ * and combining enclosing keycap (20E3).  They regularly follow emoji in
+ * CJK text; a fallback font (e.g. Apple Color Emoji) may report a glyph for
+ * them whose bitmap is empty, which would otherwise draw the "missing
+ * glyph" solid box for every occurrence. */
+static inline int is_zero_width_modifier(unsigned int codepoint) {
+  return (codepoint >= 0xFE00 && codepoint <= 0xFE0F)
+      || codepoint == 0x200D
+      || codepoint == 0x20E3;
+}
+
 static RenFont *font_group_get_glyph(RenFont **fonts, unsigned int codepoint, int subpixel_idx, SDL_Surface **surface, GlyphMetric **metric) {
   if (subpixel_idx < 0) subpixel_idx += SUBPIXEL_BITMAPS_CACHED;
   RenFont *font = NULL;
@@ -441,7 +460,8 @@ static RenFont *font_group_get_glyph(RenFont **fonts, unsigned int codepoint, in
   if (FONT_BITMAP_COUNT(font) == 1) subpixel_idx = 0;
   GlyphMetric *m = font_load_glyph_metric(font, glyph_id, subpixel_idx);
   // try the box drawing character (0x25A1) if the requested codepoint is not a whitespace, and we cannot load the .notdef glyph
-  if ((!m || !m->flags) && codepoint != 0x25A1 && !is_whitespace(codepoint))
+  if ((!m || !m->flags) && codepoint != 0x25A1 && !is_whitespace(codepoint)
+      && !is_zero_width_modifier(codepoint))
     return font_group_get_glyph(fonts, 0x25A1, subpixel_idx, surface, metric);
   if (metric && m) *metric = m;
   if (surface && m)
@@ -731,7 +751,7 @@ double ren_draw_text(RenSurface *rs, RenFont **fonts, const char *text, size_t l
     int start_x = floor(pen_x) + metric->bitmap_left;
     int end_x = metric->x1 + start_x; // x0 is assumed to be 0
     int glyph_end = metric->x1, glyph_start = 0;
-    if (!font_surface && !is_whitespace(codepoint))
+    if (!font_surface && !is_whitespace(codepoint) && !is_zero_width_modifier(codepoint))
       ren_draw_rect(rs, (RenRect){ start_x + 1, y, font->space_advance - 1, ren_font_group_get_height(fonts) }, color);
     if (!is_whitespace(codepoint) && font_surface && color.a > 0 && end_x >= clip.x && start_x < clip_end_x) {
       uint8_t* source_pixels = font_surface->pixels;
@@ -861,13 +881,13 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
     int end_x = metric->x1 + start_x;
 
     /* Missing glyph box (same as CPU path) */
-    if (!font_surface && !is_whitespace(codepoint)) {
+    if (!font_surface && !is_whitespace(codepoint) && !is_zero_width_modifier(codepoint)) {
       if (batch_count > 0) {
         gpu_draw_text_quads(ren, batch_tex, batch, batch_count, color, batch_mode, clip_phys);
         batch_count = 0;
       }
-      gpu_draw_rect(ren, (RenRect){ start_x + 1, y,
-        (int)font->space_advance - 1, font_height }, color, clip);
+      gpu_draw_rect(ren, (RenRect){ (start_x + 1) / surface_scale, y / surface_scale,
+        ((int)font->space_advance - 1) / surface_scale, font_height / surface_scale }, color, clip);
     }
 
     if (!is_whitespace(codepoint) && font_surface && color.a > 0) {
@@ -909,14 +929,14 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
     if(!last) last = font;
     else if(font != last || text == end) {
       double local_pen_x = text == end ? pen_x + adv : pen_x;
-      int ux = (int)last_pen_x;
-      int uw = (int)(local_pen_x - last_pen_x);
-      int uy = y + (last->height - 1) * surface_scale;
-      int uh = last->underline_thickness * surface_scale;
+      int ux = (int)last_pen_x / surface_scale;
+      int uw = (int)(local_pen_x - last_pen_x) / surface_scale;
+      int uy = (y + (last->height - 1) * surface_scale) / surface_scale;
+      int uh = last->underline_thickness;
       if (underline)
         gpu_draw_rect(ren, (RenRect){ ux, uy, uw, uh }, color, clip);
       if (strikethrough)
-        gpu_draw_rect(ren, (RenRect){ ux, y + last->height * surface_scale / 2, uw, uh }, color, clip);
+        gpu_draw_rect(ren, (RenRect){ ux, (y + last->height * surface_scale / 2) / surface_scale, uw, uh }, color, clip);
       last = font;
       last_pen_x = pen_x;
     }
@@ -1061,14 +1081,16 @@ RenWindow* ren_create(SDL_Window *win) {
   RenWindow* window_renderer = SDL_calloc(1, sizeof(RenWindow));
 
   window_renderer->window = win;
-  renwin_init_surface(window_renderer);
-  renwin_init_command_buf(window_renderer);
-  renwin_clip_to_surface(window_renderer);
 
 #ifdef LITE_USE_GPU_RENDERER
-  /* Claim the window for GPU presentation. If this fails we keep running on
-   * the SDL renderer / surface fallback (renwin_update_rects checks
-   * gpu_state before using the GPU path). */
+  /* Claim the window for GPU presentation FIRST. When the GPU device owns
+   * the window we must not also attach an SDL_Renderer: on macOS both add
+   * their own CAMetalLayer subview to the window, and the renderer's layer
+   * is never drawn into (the GPU path presents itself), leaving a black
+   * layer stacked under the live one that can surface during high-frequency
+   * presents.  If this fails we keep running on the SDL renderer / surface
+   * fallback (renwin_update_rects checks gpu_state before using the GPU
+   * path). */
   gpu_window_attach(window_renderer);
   /* Show the window here (not in rencache_end_frame) to avoid a reentrancy
    * deadlock: SDL_ShowWindow can synchronously deliver window events that
@@ -1078,6 +1100,9 @@ RenWindow* ren_create(SDL_Window *win) {
     renwin_show_window(window_renderer);
 #endif
 
+  renwin_init_surface(window_renderer);
+  renwin_init_command_buf(window_renderer);
+  renwin_clip_to_surface(window_renderer);
   ren_add_window(window_renderer);
   return window_renderer;
 }

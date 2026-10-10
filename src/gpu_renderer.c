@@ -377,7 +377,10 @@ void gpu_free(void) {
 /*----------------------------------------------------------------------------
  * Per-window state
  *--------------------------------------------------------------------------*/
-static const Uint32 VBUF_MAX_VERTS = 1 << 16; /* 65536 verts = ~1MB */
+static const Uint32 VBUF_MAX_VERTS = 1 << 20; /* 1M verts = ~16MB; a maximized
+  window of long lines needs ~700k verts (110k glyphs x 6) and the overflow
+  path silently dropped text batches, leaving selection rects over
+  undrawn-looking "black" regions */
 
 bool gpu_window_attach(RenWindow *ren) {
   if (!g_ctx.device || !ren || !ren->window) return false;
@@ -703,37 +706,52 @@ static bool ensure_xfer(SDL_GPUTransferBuffer **buf, Uint32 *cap, Uint32 size) {
 }
 
 /* Upload all pending dirty atlas regions. Called from gpu_end_frame before
- * the render pass. The staging buffer is sized to the largest region first, so
- * it is never resized while blits are already recorded. The pending list holds
- * pointers borrowed from the font glyph caches, so it is dropped as a whole if
- * the upload cannot be set up at all rather than kept across frames. */
+ * the render pass. All regions are packed into the staging transfer buffer
+ * at distinct byte offsets during a single map, and each recorded upload
+ * reads its own offset: the GPU replays the copy pass only after the CPU has
+ * finished filling the buffer, so entries must not share storage. Rows are
+ * packed tightly (pitch = w * bpp) to match the pixels_per_row the GPU reads.
+ * The pending list holds pointers borrowed from the font glyph caches, so it
+ * is dropped as a whole if the upload cannot be set up at all rather than
+ * kept across frames. */
 static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
   if (g_upload_count == 0) return;
-  Uint32 max_size = 0;
-  for (int i = 0; i < g_upload_count; i++) {
+
+  Uint32 offsets[64];
+  int n = g_upload_count < 64 ? g_upload_count : 64;
+  Uint32 total = 0;
+  for (int i = 0; i < n; i++) {
     int bpp = (g_uploads[i].fmt == 0) ? 1 : 4;
     Uint32 size = (Uint32)(g_uploads[i].dirty.w * g_uploads[i].dirty.h * bpp);
-    if (size > max_size) max_size = size;
+    size = (size + 3u) & ~3u;   /* Metal requires 4-byte-aligned offsets */
+    if (total + size < total) { /* overflow */ n = i; break; }
+    offsets[i] = total;
+    total += size;
   }
-  if (!ensure_xfer(&g_atlas_xfer, &g_atlas_xfer_size, max_size)) {
+
+  if (!ensure_xfer(&g_atlas_xfer, &g_atlas_xfer_size, total)) {
     fprintf(stderr, "gpu: atlas staging buffer (%u bytes) failed: %s\n",
-            (unsigned)max_size, SDL_GetError());
+            (unsigned)total, SDL_GetError());
     g_upload_count = 0;
     return;
   }
-  SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
-  if (!cp) { g_upload_count = 0; return; }
-  for (int i = 0; i < g_upload_count; i++) {
+
+  Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
+  if (!mapped) { g_upload_count = 0; return; }
+  for (int i = 0; i < n; i++) {
     AtlasUpload *u = &g_uploads[i];
     int bpp = (u->fmt == 0) ? 1 : 4;
-    Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, g_atlas_xfer, true);
-    if (mapped) {
-      copy_atlas_region(mapped, u->dirty.w * bpp, u->surf, &u->dirty, u->fmt);
-      SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
-    }
+    copy_atlas_region(mapped + offsets[i], u->dirty.w * bpp, u->surf, &u->dirty, u->fmt);
+  }
+  SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
+
+  SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+  if (!cp) { g_upload_count = 0; return; }
+  for (int i = 0; i < n; i++) {
+    AtlasUpload *u = &g_uploads[i];
     SDL_GPUTextureTransferInfo tsrc = {0};
     tsrc.transfer_buffer = g_atlas_xfer;
-    tsrc.offset = 0;
+    tsrc.offset = offsets[i];
     tsrc.pixels_per_row = (Uint32)u->dirty.w;
     tsrc.rows_per_layer = (Uint32)u->dirty.h;
     SDL_GPUTextureRegion tdst = {0};
@@ -746,7 +764,7 @@ static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
     SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
   }
   SDL_EndGPUCopyPass(cp);
-  g_uploads_last = g_upload_count;
+  g_uploads_last = n;
   g_upload_count = 0;
 }
 
@@ -969,7 +987,7 @@ void gpu_end_frame(RenWindow *ren) {
     tgt.texture = s->target_tex;
     tgt.load_op = s->need_clear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
     tgt.store_op = SDL_GPU_STOREOP_STORE;
-    tgt.clear_color = (SDL_FColor){0, 0, 0, 1};
+    tgt.clear_color = (SDL_FColor){0, 0, 0, 0};
     tgt.cycle = false;
     s->need_clear = false;
     s->pass = SDL_BeginGPURenderPass(s->cmd, &tgt, 1, NULL);
@@ -1031,7 +1049,7 @@ void gpu_end_frame(RenWindow *ren) {
     info.destination.w = sw;
     info.destination.h = sh;
     info.load_op = SDL_GPU_LOADOP_CLEAR;
-    info.clear_color = (SDL_FColor){0, 0, 0, 1};
+    info.clear_color = (SDL_FColor){0, 0, 0, 0};
     info.filter = SDL_GPU_FILTER_NEAREST;
     info.cycle = true;
     SDL_BlitGPUTexture(s->cmd, &info);
@@ -1066,6 +1084,7 @@ void gpu_end_frame(RenWindow *ren) {
   s->cmd = NULL;
   s->vbuf_used = 0;
   s->draws_count = 0;
+
 }
 
 #endif /* LITE_USE_GPU_RENDERER */
