@@ -310,8 +310,12 @@ function View:update()
   end
 
   self:clamp_scroll_position()
-  self:move_towards(self.scroll, "x", self.scroll.to.x, 0.3, "scroll")
-  self:move_towards(self.scroll, "y", self.scroll.to.y, 0.3, "scroll")
+  -- Sublime-like glide: the default rate eases over ~250ms instead of
+  -- snapping in ~130ms.  Scrollbar dragging bypasses this (scroll.y is set
+  -- directly when animate_drag_scroll is off).
+  local rate = config.scroll_animation_rate or 0.3
+  self:move_towards(self.scroll, "x", self.scroll.to.x, rate, "scroll")
+  self:move_towards(self.scroll, "y", self.scroll.to.y, rate, "scroll")
   if not self.scrollable then return end
   self:update_scrollbar()
 end

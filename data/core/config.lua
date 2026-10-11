@@ -29,6 +29,15 @@ config.message_timeout = 5
 ---@type number
 config.mouse_wheel_scroll = 50 * SCALE
 
+---The easing rate of scroll animation: the fraction of the remaining
+---distance covered per frame.  Lower values glide longer (Sublime-like
+---inertia); higher values snap sooner.  Also applies to caret-driven
+---scrolling (scroll_to_line / scroll_to_make_visible).
+---
+---Defaults to 0.14 (about 250ms to settle).
+---@type number
+config.scroll_animation_rate = 0.14
+
 ---Enables/disables transitions when scrolling with the scrollbar.
 ---When enabled, the scrollbar will have inertia and slowly move towards the cursor.
 ---Otherwise, the scrollbar will immediately follow the cursor.

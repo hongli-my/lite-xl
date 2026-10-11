@@ -89,10 +89,11 @@ config.plugins.findbar = common.merge({
   -- editing".
   keep_selection_on_close = false,
   -- highlight colours are derived from style.selection so that they follow the
-  -- colour scheme; these are the alpha components
-  fill_alpha = 55,
-  border_alpha = 150,
-  current_fill_alpha = 110,
+  -- colour scheme; these are the alpha components.  Other matches are faint,
+  -- the current one strong (Sublime's two-tier scheme)
+  fill_alpha = 35,
+  border_alpha = 100,
+  current_fill_alpha = 140,
 }, config.plugins.findbar)
 
 ---Blends `b` into `a` by `t` (opaque RGBA), for panel colours that follow the
@@ -1278,13 +1279,19 @@ local function draw_highlights(dv)
   local lh = dv:get_line_height()
   local border = math.max(1, common.round(1 * SCALE))
   local current = state.current
-  local fill, edge, current_fill = {}, {}, {}
+  -- Sublime's scheme: every match gets a faint fill with a hairline, the
+  -- current one a strong fill with a bright border, so the eye locks onto it
+  -- without hunting
+  local fill, edge, current_fill, current_edge = {}, {}, {}, {}
   for i = 1, 4 do
-    fill[i], edge[i], current_fill[i] = style.selection[i], style.selection[i], style.selection[i]
+    fill[i], edge[i] = style.selection[i], style.selection[i]
+    current_fill[i], current_edge[i] = style.selection[i], style.text[i]
   end
   fill[4] = cfg.fill_alpha
   edge[4] = cfg.border_alpha
   current_fill[4] = cfg.current_fill_alpha
+  current_edge[4] = 230
+  local current_border = border + math.max(1, common.round(0.5 * SCALE))
 
   for line = minline, maxline do
     local text = dv.doc.lines[line]
@@ -1302,10 +1309,12 @@ local function draw_highlights(dv)
           if w > 0 then
             local is_current = current and current.line == line and current.col == s
             renderer.draw_rect(x, y, w, lh, is_current and current_fill or fill)
-            renderer.draw_rect(x, y, w, border, edge)
-            renderer.draw_rect(x, y + lh - border, w, border, edge)
-            renderer.draw_rect(x, y, border, lh, edge)
-            renderer.draw_rect(x + w - border, y, border, lh, edge)
+            local bcol, bw = is_current and current_edge or edge,
+                             is_current and current_border or border
+            renderer.draw_rect(x, y, w, bw, bcol)
+            renderer.draw_rect(x, y + lh - bw, w, bw, bcol)
+            renderer.draw_rect(x, y, bw, lh, bcol)
+            renderer.draw_rect(x + w - bw, y, bw, lh, bcol)
           end
         end
         col = e + 1
