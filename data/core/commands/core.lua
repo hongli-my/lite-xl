@@ -215,6 +215,14 @@ command.add(nil, {
 
   ["core:find-command"] = function()
     local commands = command.get_all_valid()
+    -- match on the prettified names so the hit highlight lines up with what
+    -- is drawn
+    local prettified, lookup = {}, {}
+    for _, name in ipairs(commands) do
+      local p = command.prettify_name(name)
+      prettified[#prettified + 1] = p
+      lookup[p] = name
+    end
     core.command_view:enter("Do Command", {
       submit = function(text, item)
         if item then
@@ -223,12 +231,13 @@ command.add(nil, {
       end,
       suggest = function(text)
         local res = {}
-        local matched = common.fuzzy_match(commands, text)
-        for i, name in ipairs(matched) do
+        local matched = common.fuzzy_match_with_recents_highlighted(prettified, {}, text)
+        for i, m in ipairs(matched) do
           res[i] = {
-            text = command.prettify_name(name),
-            info = keymap.get_binding(name),
-            command = name,
+            text = m.text,
+            hits = m.hits,
+            info = keymap.get_binding(lookup[m.text]),
+            command = lookup[m.text],
           }
         end
         return res
