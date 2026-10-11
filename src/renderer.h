@@ -50,6 +50,7 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
 #endif
 
 void ren_draw_rect(RenSurface *rs, RenRect rect, RenColor color);
+void ren_draw_rounded_rect(RenSurface *rs, RenRect rect, RenColor color, int radius);
 void ren_draw_image(RenSurface *rs, SDL_Surface *img, RenRect rect);
 
 int video_init(void);

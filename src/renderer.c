@@ -986,6 +986,37 @@ void ren_draw_rect(RenSurface *rs, RenRect rect, RenColor color) {
 }
 
 
+/* Software fallback for rounded rectangles: the body is two full slabs, the
+ * corners are quarter-circle staircases of one-logical-pixel strips.  Only
+ * used when the GPU renderer is off; the GPU path draws the SDF directly. */
+void ren_draw_rounded_rect(RenSurface *rs, RenRect rect, RenColor color,
+                           int radius) {
+  if (color.a == 0) { return; }
+  if (radius <= 0) { ren_draw_rect(rs, rect, color); return; }
+  int w = rect.width, h = rect.height;
+  if (radius * 2 > w) radius = w / 2;
+  if (radius * 2 > h) radius = h / 2;
+  if (radius < 1) { ren_draw_rect(rs, rect, color); return; }
+
+  RenRect body_v = { rect.x + radius, rect.y, w - 2 * radius, h };
+  RenRect body_h = { rect.x, rect.y + radius, w, h - 2 * radius };
+  ren_draw_rect(rs, body_v, color);
+  ren_draw_rect(rs, body_h, color);
+
+  for (int k = 0; k < radius; k++) {
+    int d = radius - k - 1;
+    double dd = (double)d + 0.5;
+    int span = (int)(sqrt((double)radius * radius - dd * dd) + 0.5);
+    if (span < 1) span = 1;
+    if (span > radius) span = radius;
+    ren_draw_rect(rs, (RenRect){ rect.x, rect.y + k, span, 1 }, color);
+    ren_draw_rect(rs, (RenRect){ rect.x + w - span, rect.y + k, span, 1 }, color);
+    ren_draw_rect(rs, (RenRect){ rect.x, rect.y + h - k - 1, span, 1 }, color);
+    ren_draw_rect(rs, (RenRect){ rect.x + w - span, rect.y + h - k - 1, span, 1 }, color);
+  }
+}
+
+
 void ren_draw_image(RenSurface *rs, SDL_Surface *img, RenRect rect) {
   if (!img) return;
 

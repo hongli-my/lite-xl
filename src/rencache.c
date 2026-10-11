@@ -34,7 +34,7 @@
 #define CMD_BUF_INIT_SIZE (1024 * 512)
 #define COMMAND_BARE_SIZE offsetof(Command, command)
 
-enum CommandType { SET_CLIP, DRAW_TEXT, DRAW_RECT, DRAW_IMAGE };
+enum CommandType { SET_CLIP, DRAW_TEXT, DRAW_RECT, DRAW_ROUNDRECT, DRAW_IMAGE };
 
 typedef struct {
   enum CommandType type;
@@ -63,6 +63,12 @@ typedef struct {
   RenRect rect;
   RenColor color;
 } DrawRectCommand;
+
+typedef struct {
+  RenRect rect;
+  RenColor color;
+  int radius;
+} DrawRoundRectCommand;
 
 typedef struct {
   RenRect rect;
@@ -197,6 +203,24 @@ void rencache_draw_rect(RenWindow *window_renderer, RenRect rect, RenColor color
   if (cmd) {
     cmd->rect = rect;
     cmd->color = color;
+  }
+}
+
+void rencache_draw_rounded_rect(RenWindow *window_renderer, RenRect rect,
+                                RenColor color, int radius) {
+  if (rect.width == 0 || rect.height == 0 || !rects_overlap(last_clip_rect, rect)) {
+    return;
+  }
+  if (radius > 0) {
+    DrawRoundRectCommand *cmd = push_command(window_renderer, DRAW_ROUNDRECT,
+                                             sizeof(DrawRoundRectCommand));
+    if (cmd) {
+      cmd->rect = rect;
+      cmd->color = color;
+      cmd->radius = radius;
+    }
+  } else {
+    rencache_draw_rect(window_renderer, rect, color);
   }
 }
 
@@ -339,6 +363,7 @@ void rencache_end_frame(RenWindow *window_renderer) {
         while (next_command(window_renderer, &cmd)) {
           SetClipCommand *ccmd = (SetClipCommand*)&cmd->command;
           DrawRectCommand *rcmd = (DrawRectCommand*)&cmd->command;
+          DrawRoundRectCommand *rrcmd = (DrawRoundRectCommand*)&cmd->command;
           DrawTextCommand *tcmd = (DrawTextCommand*)&cmd->command;
           switch (cmd->type) {
             case SET_CLIP:
@@ -346,6 +371,10 @@ void rencache_end_frame(RenWindow *window_renderer) {
               break;
             case DRAW_RECT:
               gpu_draw_rect(window_renderer, rcmd->rect, rcmd->color, current_clip);
+              break;
+            case DRAW_ROUNDRECT:
+              gpu_draw_rounded_rect(window_renderer, rrcmd->rect, rrcmd->color,
+                                    rrcmd->radius, current_clip);
               break;
             case DRAW_TEXT:
               ren_font_group_set_tab_size(tcmd->fonts, tcmd->tab_size);
@@ -379,6 +408,7 @@ void rencache_end_frame(RenWindow *window_renderer) {
     while (next_command(window_renderer, &cmd)) {
       SetClipCommand *ccmd = (SetClipCommand*)&cmd->command;
       DrawRectCommand *rcmd = (DrawRectCommand*)&cmd->command;
+      DrawRoundRectCommand *rrcmd = (DrawRoundRectCommand*)&cmd->command;
       DrawTextCommand *tcmd = (DrawTextCommand*)&cmd->command;
       switch (cmd->type) {
         case SET_CLIP:
@@ -386,6 +416,9 @@ void rencache_end_frame(RenWindow *window_renderer) {
           break;
         case DRAW_RECT:
           ren_draw_rect(&rs, rcmd->rect, rcmd->color);
+          break;
+        case DRAW_ROUNDRECT:
+          ren_draw_rounded_rect(&rs, rrcmd->rect, rrcmd->color, rrcmd->radius);
           break;
         case DRAW_TEXT:
           ren_font_group_set_tab_size(tcmd->fonts, tcmd->tab_size);

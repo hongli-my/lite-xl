@@ -61,6 +61,62 @@ lite_rect_fragment(RectVertexOut in [[stage_in]],
 }
 
 /*=============================================================================
+ * Stage 2a': rounded rectangle (SDF, antialiased)
+ *
+ * Same vertex layout as the plain rect (position + float2), but the second
+ * attribute carries LOCAL pixel coordinates inside the quad (not normalized
+ * texcoords).  The fragment shader evaluates a rounded-box signed distance
+ * and fades the edge over one pixel, giving true analytic antialiasing.
+ * Fragment uniform: color.rgba, then (radius, width, height, unused).
+ * Output is premultiplied; the pipeline blends with ONE / 1-SRC_ALPHA.
+ *===========================================================================*/
+
+typedef struct {
+  float2 position [[attribute(0)]];
+  float2 local [[attribute(1)]];
+} RRectVertexIn;
+
+typedef struct {
+  float4 position [[position]];
+  float2 local;
+} RRectVertexOut;
+
+typedef struct {
+  float4 viewport;
+} RRectVertexUniform;
+
+vertex RRectVertexOut
+lite_rrect_vertex(RRectVertexIn in [[stage_in]],
+                  constant RRectVertexUniform &u [[buffer(0)]])
+{
+  RRectVertexOut out;
+  float x = (in.position.x / u.viewport.x) * 2.0 - 1.0;
+  float y = 1.0 - (in.position.y / u.viewport.y) * 2.0;
+  out.position = float4(x, y, 0.0, 1.0);
+  out.local = in.local;
+  return out;
+}
+
+typedef struct {
+  float4 color;  /* straight alpha */
+  float4 shape;  /* x = corner radius (px), y = quad width (px),
+                    z = quad height (px), w unused */
+} RRectFragmentUniform;
+
+fragment float4
+lite_rrect_fragment(RRectVertexOut in [[stage_in]],
+                    constant RRectFragmentUniform &u [[buffer(0)]])
+{
+  float2 half_size = float2(u.shape.y, u.shape.z) * 0.5;
+  float r = min(u.shape.x, min(half_size.x, half_size.y));
+  float2 q = abs(in.local - half_size) - (half_size - float2(r));
+  float sd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+  float coverage = saturate(0.5 - sd);   /* 1px antialiased edge */
+  /* Premultiplied output: blend does result = src + dst*(1-alpha). */
+  return float4(u.color.rgb * coverage, coverage);
+}
+
+/*=============================================================================
  * Stage 2b: textured glyph rendering
  *
  * Uses premultiplied-alpha blending instead of Metal framebuffer fetch.

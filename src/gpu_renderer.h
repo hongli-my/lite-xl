@@ -53,6 +53,11 @@ void gpu_end_frame(RenWindow *ren);
  * by surface_scale). Straight-alpha color. */
 void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color, RenRect clip);
 
+/* Solid-color rounded rectangle, antialiased via a rounded-box SDF in the
+ * fragment shader. `radius` is in logical units (scaled internally). */
+void gpu_draw_rounded_rect(RenWindow *ren, RenRect rect, RenColor color,
+                           int radius, RenRect clip);
+
 /* Glyph atlas GPU texture lifecycle.
  *   fmt: 0=grayscale, 1=subpixel LCD, 2=color (emoji)
  * Returns an opaque pointer (SDL_GPUTexture* internally). */

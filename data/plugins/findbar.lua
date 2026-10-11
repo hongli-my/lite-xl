@@ -107,29 +107,18 @@ end
 -- it up to device pixels).  Sublime's fields are only slightly rounded.
 local RADIUS = math.max(2, math.floor(2.5 * SCALE))
 
----Fills a rectangle with rounded corners.  The renderer only exposes solid
----rectangles (`renderer.draw_rect`), so the arcs are approximated with one
----pixel-tall strips -- a quarter-circle staircase that reads as smooth at this
----small radius.  `r` is clamped to half the shorter side.
+---Fills a rectangle with rounded corners.  The renderer exposes the native
+---`renderer.draw_rounded_rect` now: on the GPU path it is a rounded-box SDF
+---in the fragment shader (analytically antialiased), on the CPU path it is
+---the same quarter-circle staircase this helper used to draw in Lua.
 local function rounded_rect(x, y, w, h, color, r)
   r = r or RADIUS
-  if r < 1 or w <= 0 or h <= 0 then
+  if not r or r < 1 or w <= 0 or h <= 0 then
     if w > 0 and h > 0 then renderer.draw_rect(x, y, w, h, color) end
     return
   end
   r = math.min(r, w / 2, h / 2)
-  -- the full-height and full-width slabs
-  renderer.draw_rect(x + r, y, w - 2 * r, h, color)
-  renderer.draw_rect(x, y + r, w, h - 2 * r, color)
-  -- the four corner arcs
-  for k = 0, r - 1 do
-    local d = r - k - 0.5
-    local span = math.max(1, math.min(r, math.floor(math.sqrt(r * r - d * d) + 0.5)))
-    renderer.draw_rect(x, y + k, span, 1, color)
-    renderer.draw_rect(x + w - span, y + k, span, 1, color)
-    renderer.draw_rect(x, y + h - k - 1, span, 1, color)
-    renderer.draw_rect(x + w - span, y + h - k - 1, span, 1, color)
-  end
+  renderer.draw_rounded_rect(x, y, w, h, r, color)
 end
 -- Panel colours, in the spirit of Sublime's adaptive skin: the panel is one
 -- small step away from the editor background, the query field is a second,

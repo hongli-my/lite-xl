@@ -8,6 +8,7 @@
 void  rencache_show_debug(bool enable);
 void  rencache_set_clip_rect(RenWindow *window_renderer, RenRect rect);
 void  rencache_draw_rect(RenWindow *window_renderer, RenRect rect, RenColor color);
+void  rencache_draw_rounded_rect(RenWindow *window_renderer, RenRect rect, RenColor color, int radius);
 double rencache_draw_text(RenWindow *window_renderer, RenFont **font, const char *text, size_t len, double x, int y, RenColor color, RenTab tab);
 void  rencache_draw_image(RenWindow *window_renderer, SDL_Surface *surface, double x, double y, double w, double h);
 void  rencache_invalidate(void);
