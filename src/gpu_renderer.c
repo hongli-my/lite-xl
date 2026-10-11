@@ -375,6 +375,12 @@ bool gpu_init(void) {
     return false;
   }
 
+  /* Every failure past this point must release what was created: ren_create
+   * attaches the window whenever g_ctx.device is set, so a half-initialised
+   * context would run the GPU path with NULL pipelines.  gpu_free() zeroes
+   * g_ctx, which sends the window back to the CPU renderer instead. */
+#define GPU_INIT_FAIL() do { gpu_free(); return false; } while (0)
+
   /* Compile shaders from embedded MSL source. */
   size_t code_size = sizeof(gpu_shaders_msl); /* includes trailing NUL */
   g_ctx.rect_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
@@ -393,17 +399,17 @@ bool gpu_init(void) {
   if (!g_ctx.rect_vs || !g_ctx.rect_fs || !g_ctx.text_vs || !g_ctx.text_fs ||
       !g_ctx.rrect_vs || !g_ctx.rrect_fs) {
     fprintf(stderr, "gpu_init: shader compilation failed\n");
-    return false;
+    GPU_INIT_FAIL();
   }
 
   g_ctx.rect_pipeline = make_rect_pipeline();
-  if (!g_ctx.rect_pipeline) return false;
+  if (!g_ctx.rect_pipeline) GPU_INIT_FAIL();
 
   g_ctx.rrect_pipeline = make_rrect_pipeline();
-  if (!g_ctx.rrect_pipeline) return false;
+  if (!g_ctx.rrect_pipeline) GPU_INIT_FAIL();
 
   g_ctx.text_pipeline = make_text_pipeline();
-  if (!g_ctx.text_pipeline) return false;
+  if (!g_ctx.text_pipeline) GPU_INIT_FAIL();
 
   /* Shared sampler for glyph atlas (Stage 2b). */
   SDL_GPUSamplerCreateInfo sci = {0};
@@ -416,7 +422,7 @@ bool gpu_init(void) {
   g_ctx.atlas_sampler = SDL_CreateGPUSampler(g_ctx.device, &sci);
   if (!g_ctx.atlas_sampler) {
     fprintf(stderr, "gpu_init: CreateGPUSampler failed: %s\n", SDL_GetError());
-    return false;
+    GPU_INIT_FAIL();
   }
 
   g_perf_freq = SDL_GetPerformanceFrequency();

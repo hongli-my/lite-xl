@@ -30,3 +30,4 @@ LiteXL*
 subprojects/libpng.wrap
 subprojects/zlib.wrap
 .sdl3-research/
+src/gpu_shaders_msl.h
