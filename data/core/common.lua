@@ -197,6 +197,49 @@ function common.fuzzy_match(haystack, needle, files)
 end
 
 
+---Like `fuzzy_match_items`, but keeps the byte positions of the matched
+---characters so the UI can highlight them.  Returns `{ text = ..., hits = set }`
+---tables sorted by score.
+local function fuzzy_match_items_highlighted(items, needle, files)
+  local res = {}
+  needle = (PLATFORM == "Windows" and files) and needle:gsub('/', PATHSEP) or needle
+  for _, item in ipairs(items) do
+    local key = tostring(item)
+    local score, hits = system.fuzzy_match_hits(key, needle, files)
+    if score then
+      local set = {}
+      if hits then for _, idx in ipairs(hits) do set[idx] = true end end
+      table.insert(res, { key = key, text = item, score = score, hits = set })
+    end
+  end
+  table.sort(res, compare_score)
+  for i, item in ipairs(res) do
+    res[i] = { text = item.text, hits = item.hits }
+  end
+  return res
+end
+
+
+---`fuzzy_match_with_recents` for highlighted suggestions: returns
+---`{ text = ..., hits = set }` tables (hits is nil when the needle is empty).
+---@param haystack string[]
+---@param recents string[]
+---@param needle string
+---@return table[]
+function common.fuzzy_match_with_recents_highlighted(haystack, recents, needle)
+  if needle == "" then
+    -- same ordering as fuzzy_match_with_recents, minus the highlighting
+    local res = {}
+    for i = 2, #recents do table.insert(res, { text = recents[i] }) end
+    if recents[1] then table.insert(res, { text = recents[1] }) end
+    local others = common.fuzzy_match(haystack, "", true)
+    for i = 1, #others do table.insert(res, { text = others[i] }) end
+    return res
+  end
+  return fuzzy_match_items_highlighted(haystack, needle, true)
+end
+
+
 ---Performs fuzzy matching and returns recently used strings if needed.
 ---
 ---If the needle is empty, then a list of recently used strings

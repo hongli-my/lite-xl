@@ -377,6 +377,42 @@ function CommandView:draw_line_gutter(idx, x, y)
 end
 
 
+---UTF-8 char length at byte `pos`.
+local function utf8_char_len(text, pos)
+  local c = text:byte(pos)
+  if not c then return 0 end
+  if c >= 0xF0 then return 4 elseif c >= 0xE0 then return 3 elseif c >= 0xC0 then return 2 end
+  return 1
+end
+
+---Draws `text` with the bytes marked in `hits` bright and the rest dim,
+---sublime-style match highlighting.  Groups consecutive same-style runs so a
+---filename costs a handful of draw calls.
+local function draw_text_with_hits(font, text, hits, x, y)
+  local base, hit_col = style.dim, style.text
+  local run_start, run_hit, cx = 1, nil, x
+  local pos, len = 1, #text
+  while pos <= len do
+    local n = utf8_char_len(text, pos)
+    local char_hit = false
+    for i = pos, math.min(pos + n - 1, len) do
+      if hits[i] then char_hit = true break end
+    end
+    if run_hit == nil then run_hit = char_hit end
+    if char_hit ~= run_hit then
+      local run = text:sub(run_start, pos - 1)
+      common.draw_text(font, run_hit and hit_col or base, run, nil, cx, y, 0, 0)
+      cx = cx + font:get_width(run)
+      run_start, run_hit = pos, char_hit
+    end
+    pos = pos + n
+  end
+  if run_start <= len then
+    common.draw_text(font, run_hit and hit_col or base, text:sub(run_start), nil, cx, y, 0, 0)
+  end
+end
+
+
 local function draw_suggestions_box(self)
   local lh = self:get_suggestion_line_height()
   local dh = style.divider_size
@@ -400,7 +436,11 @@ local function draw_suggestions_box(self)
     local item = self.suggestions[i]
     local color = style.accent
     local y = self.position.y - (i - first + 1) * lh - dh
-    common.draw_text(self:get_font(), color, item.text, nil, x, y, 0, lh)
+    if item.hits and next(item.hits) then
+      draw_text_with_hits(self:get_font(), item.text, item.hits, x, y)
+    else
+      common.draw_text(self:get_font(), color, item.text, nil, x, y, 0, lh)
+    end
 
     if item.info then
       local w = self.size.x - x - style.padding.x

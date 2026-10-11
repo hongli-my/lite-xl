@@ -990,6 +990,41 @@ static int f_fuzzy_match(lua_State *L) {
   return 1;
 }
 
+/* Same greedy matcher as f_fuzzy_match, but also returns the 1-based byte
+ * indexes of the matched characters, so the UI can highlight them. Returns
+ * (score, hits_table); nothing when the pattern does not match. */
+static int f_fuzzy_match_hits(lua_State *L) {
+  size_t strLen, ptnLen;
+  const char *str = luaL_checklstring(L, 1, &strLen);
+  const char *ptn = luaL_checklstring(L, 2, &ptnLen);
+  bool files = lua_gettop(L) > 2 && lua_isboolean(L,3) && lua_toboolean(L, 3);
+  int score = 0, run = 0, increment = files ? -1 : 1;
+  const char* strTarget = files ? str + strLen - 1 : str;
+  const char* ptnTarget = files ? ptn + ptnLen - 1 : ptn;
+  lua_newtable(L);
+  int hits = lua_gettop(L);
+  int n = 0;
+  while (strTarget >= str && ptnTarget >= ptn && *strTarget && *ptnTarget) {
+    while (strTarget >= str && *strTarget == ' ') { strTarget += increment; }
+    while (ptnTarget >= ptn && *ptnTarget == ' ') { ptnTarget += increment; }
+    if (tolower(*strTarget) == tolower(*ptnTarget)) {
+      score += run * 10 - (*strTarget != *ptnTarget);
+      run++;
+      lua_pushinteger(L, (int)(strTarget - str) + 1);
+      lua_rawseti(L, hits, ++n);
+      ptnTarget += increment;
+    } else {
+      score -= 10;
+      run = 0;
+    }
+    strTarget += increment;
+  }
+  if (ptnTarget >= ptn && *ptnTarget) { return 0; }
+  lua_pushinteger(L, score - (int)strLen * 10);
+  lua_pushvalue(L, hits);
+  return 2;
+}
+
 static int f_set_window_opacity(lua_State *L) {
   RenWindow *window_renderer = *(RenWindow**)luaL_checkudata(L, 1, API_TYPE_RENWINDOW);
   double n = luaL_checknumber(L, 2);
@@ -1556,6 +1591,7 @@ static const luaL_Reg lib[] = {
   { "sleep",                 f_sleep                 },
   { "exec",                  f_exec                  },
   { "fuzzy_match",           f_fuzzy_match           },
+  { "fuzzy_match_hits",      f_fuzzy_match_hits      },
   { "set_window_opacity",    f_set_window_opacity    },
   { "load_native_plugin",    f_load_native_plugin    },
   { "path_compare",          f_path_compare          },

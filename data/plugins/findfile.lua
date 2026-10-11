@@ -60,10 +60,10 @@ command.add(nil, {
         complete = true
       end,
       suggest = function(text)
-        if original_files and text == "" then 
+        if original_files and text == "" then
           return original_files
         end
-        original_files = common.fuzzy_match_with_recents(files, core.visited_files, text)
+        original_files = common.fuzzy_match_with_recents_highlighted(files, core.visited_files, text)
         return original_files
       end,
       cancel = function()
