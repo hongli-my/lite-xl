@@ -105,7 +105,15 @@ function Highlighter:tokenize_line(idx, state, resume)
   local res = {}
   res.init_state = state
   res.text = self.doc.lines[idx]
-  res.tokens, res.state, res.resume = tokenizer.tokenize(self.doc.syntax, res.text, state, resume)
+  -- Huge lines (minified code, data dumps) skip the tokenizer: running it
+  -- costs O(line) on every retokenize and dominates the frame time.  They
+  -- render as plain text instead, the same degradation Sublime applies.
+  if #res.text > (config.huge_line_threshold or 64 * 1024) then
+    res.tokens = { "normal", res.text }
+    res.state = state
+  else
+    res.tokens, res.state, res.resume = tokenizer.tokenize(self.doc.syntax, res.text, state, resume)
+  end
   return res
 end
 

@@ -62,6 +62,21 @@ config.force_scrollbar_status = false
 ---@type number
 config.file_size_limit = 10
 
+---Lines longer than this many bytes skip the tokenizer and render as plain
+---text (minified code, data dumps).  Highlighting them costs O(line) per
+---redraw and dominates the frame time.
+---
+---Defaults to 64 * 1024.
+---@type number
+config.huge_line_threshold = 64 * 1024
+
+---Byte distance between the x-offset samples cached for huge lines.
+---Smaller is more precise but builds a larger table.
+---
+---Defaults to 256.
+---@type number
+config.hline_sample_step = 256
+
 ---A list of files and directories to ignore.
 ---Each element is a Lua pattern, where patterns ending with a forward slash
 ---are recognized as directories while patterns ending with an anchor ("$") are

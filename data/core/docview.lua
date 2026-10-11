@@ -17,6 +17,110 @@ function DocView:__tostring() return "DocView" end
 
 DocView.context = "session"
 
+---The UTF-8 char at byte `pos`, as (string, byte length).  Cheap on the hot
+---paths below, which only ever walk a few hundred bytes around a sample point.
+local function utf8_char_at(text, pos)
+  local b = text:byte(pos)
+  if not b then return "", 0 end
+  local n = 1
+  if b >= 0xF0 then n = 4 elseif b >= 0xE0 then n = 3 elseif b >= 0xC0 then n = 2 end
+  return text:sub(pos, pos + n - 1), n
+end
+
+
+---Metrics for a huge line: a table of x-offset samples taken every
+---`config.hline_sample_step` bytes, so that caret placement, mouse hit
+---testing and visible-range drawing are O(1) per query instead of O(line).
+---Built once per line (one `font:get_width` call per sample segment) and
+---invalidated by comparing the line's string identity, exactly like the
+---highlighter does.  Returns nil for normal-sized lines.
+function DocView:get_hline_cache(line)
+  local text = self.doc.lines[line]
+  if not text or #text <= (config.huge_line_threshold or 64 * 1024) then
+    return nil
+  end
+  local mc = self.hline_cache
+  local font = self:get_font()
+  if not mc or mc.text ~= text or mc.font ~= font then
+    local _, indent_size = self.doc:get_indent_info()
+    font:set_tab_size(indent_size)
+    local step = config.hline_sample_step or 256
+    local samples = { 0 }
+    local bytes = { 1 }
+    local pos, xoff = 1, 0
+    local len = #text
+    while pos <= len do
+      local e = pos + step - 1
+      if e > len then
+        e = len
+      else
+        -- snap the segment end forward to a UTF-8 char boundary
+        while e < len do
+          local b = text:byte(e + 1)
+          if not b or b < 0x80 or b >= 0xC0 then break end
+          e = e + 1
+        end
+      end
+      xoff = xoff + font:get_width(text:sub(pos, e), { tab_offset = xoff })
+      samples[#samples + 1] = xoff
+      bytes[#bytes + 1] = e + 1
+      pos = e + 1
+    end
+    mc = { text = text, samples = samples, bytes = bytes, font = font }
+    self.hline_cache = mc
+  end
+  return mc
+end
+
+---Screen x offset of byte position `byte` within a huge line, walking at most
+---one sample segment from the nearest sample.
+function DocView:hline_x_offset(mc, byte)
+  if byte <= 1 then return 0 end
+  local lo, hi = 1, #mc.bytes
+  while lo < hi do
+    local mid = math.floor((lo + hi + 1) / 2)
+    if mc.bytes[mid] <= byte then lo = mid else hi = mid - 1 end
+  end
+  local xoff = mc.samples[lo]
+  local pos = mc.bytes[lo]
+  local font = mc.font
+  while pos < byte do
+    local ch, n = utf8_char_at(mc.text, pos)
+    xoff = xoff + font:get_width(ch, { tab_offset = xoff })
+    pos = pos + n
+  end
+  return xoff
+end
+
+---Inverse of `hline_x_offset`: the byte position at screen offset `x` within a
+---huge line.  With `midpoint` the caret rule applies (a click on the right
+---half of a char lands after it); without it the first char whose glyph run
+---reaches `x` is returned, for drawing.  May return `limit + 1` when `x` is
+---past the end of the line.
+function DocView:hline_byte(mc, x, limit, midpoint)
+  if x <= 0 then return 1 end
+  local lo, hi = 1, #mc.samples
+  while lo < hi do
+    local mid = math.floor((lo + hi + 1) / 2)
+    if mc.samples[mid] <= x then lo = mid else hi = mid - 1 end
+  end
+  local xoff = mc.samples[lo]
+  local pos = mc.bytes[lo]
+  local font = mc.font
+  while pos <= limit do
+    local ch, n = utf8_char_at(mc.text, pos)
+    local w = font:get_width(ch, { tab_offset = xoff })
+    if xoff + w >= x then
+      if not midpoint then return pos end
+      if x <= xoff + w / 2 then return pos end
+      return pos + n
+    end
+    xoff = xoff + w
+    pos = pos + n
+  end
+  return limit + 1
+end
+
 local function move_to_line_offset(dv, line, col, offset)
   local xo = dv.last_x_offset
   if xo.line ~= line or xo.col ~= col then
@@ -282,6 +386,11 @@ end
 
 
 function DocView:get_col_x_offset(line, col)
+  -- huge lines: O(1) via the sample cache instead of walking the whole line
+  local mc = self:get_hline_cache(line)
+  if mc then
+    return self:hline_x_offset(mc, col)
+  end
   local default_font = self:get_font()
   local _, indent_size = self.doc:get_indent_info()
   default_font:set_tab_size(indent_size)
@@ -314,6 +423,12 @@ end
 
 function DocView:get_x_offset_col(line, x)
   local line_text = self.doc.lines[line]
+
+  -- huge lines: sample cache + binary search instead of a linear walk
+  local mc = self:get_hline_cache(line)
+  if mc then
+    return math.min(self:hline_byte(mc, x, #mc.text, true), #line_text)
+  end
 
   local xoffset, i = 0, 1
   local default_font = self:get_font()
@@ -554,7 +669,37 @@ function DocView:draw_line_highlight(x, y)
 end
 
 
+---Draws the visible portion of a huge line in one draw call.  The sample
+---cache locates the first and last visible bytes; everything outside the
+---viewport was previously rasterised for nothing.
+function DocView:draw_huge_line_text(line, x, y, clip_left, clip_right)
+  local text = self.doc.lines[line]
+  if not text then return self:get_line_height() end
+  local last_byte = #text
+  if text:byte(-1) == 10 then last_byte = last_byte - 1 end  -- do not render newline (issue #1164)
+  if last_byte < 1 then return self:get_line_height() end
+  local mc = self:get_hline_cache(line)
+  if not mc then return self:get_line_height() end
+  local b1 = self:hline_byte(mc, clip_left - x, last_byte, false)
+  if b1 > last_byte then return self:get_line_height() end
+  local b2 = math.min(self:hline_byte(mc, clip_right - x, last_byte, false), last_byte)
+  if b2 < b1 then return self:get_line_height() end
+  local xo = self:hline_x_offset(mc, b1)
+  local font = mc.font
+  renderer.draw_text(font, text:sub(b1, b2), x + xo, y + self:get_line_text_y_offset(),
+    style.syntax.normal, { tab_offset = xo })
+  return self:get_line_height()
+end
+
+
 function DocView:draw_line_text(line, x, y)
+  -- huge lines take the sample-cache fast path: tokenised drawing would
+  -- rasterise the whole line for a viewport-sized sliver of it
+  if #self.doc.lines[line] > (config.huge_line_threshold or 64 * 1024) then
+    return self:draw_huge_line_text(line, x, y, self.position.x,
+      self.position.x + self.size.x)
+  end
+
   local default_font = self:get_font()
   local tx, ty = x, y + self:get_line_text_y_offset()
   local last_token = nil
@@ -563,14 +708,24 @@ function DocView:draw_line_text(line, x, y)
   if string.sub(tokens[tokens_count], -1) == "\n" then
     last_token = tokens_count - 1
   end
+  -- clip to the visible area: tokens entirely left of the viewport are
+  -- measured and skipped instead of rasterised, tokens past the right edge
+  -- end the loop (they used to be drawn and thrown away)
+  local clip_left = self.position.x
+  local clip_right = self.position.x + self.size.x
   local start_tx = tx
   for tidx, type, text in self.doc.highlighter:each_token(line) do
     local color = style.syntax[type]
     local font = style.syntax_fonts[type] or default_font
     -- do not render newline, fixes issue #1164
     if tidx == last_token then text = text:sub(1, -2) end
-    tx = renderer.draw_text(font, text, tx, ty, color, {tab_offset = tx - start_tx})
-    if tx > self.position.x + self.size.x then break end
+    local width = font:get_width(text, {tab_offset = tx - start_tx})
+    if tx > clip_right then break end
+    if tx + width >= clip_left then
+      tx = renderer.draw_text(font, text, tx, ty, color, {tab_offset = tx - start_tx})
+    else
+      tx = tx + width
+    end
   end
   return self:get_line_height()
 end
