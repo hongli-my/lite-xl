@@ -107,6 +107,13 @@ end
 -- it up to device pixels).  Sublime's fields are only slightly rounded.
 local RADIUS = math.max(2, math.floor(2.5 * SCALE))
 
+---Vertical padding of a row: Sublime's panel rows are visibly tighter than
+---the editor's default padding would make them.  Defined here because
+---FindField:row_height (below) uses it.
+local function pad_v()
+  return math.max(2, math.floor(style.padding.y * 0.4))
+end
+
 ---Fills a rectangle with rounded corners.  The renderer exposes the native
 ---`renderer.draw_rounded_rect` now: on the GPU path it is a rounded-box SDF
 ---in the fragment shader (analytically antialiased), on the CPU path it is
@@ -509,12 +516,6 @@ end
 ---the forward declaration above (`FindField:draw` calls it before this line).
 function control_width(font, text)
   return font:get_width(text) + style.padding.x * 2
-end
-
----Vertical padding of a row: Sublime's panel rows are visibly tighter than
----the editor's default padding would make them.
-local function pad_v()
-  return math.max(2, math.floor(style.padding.y * 0.4))
 end
 
 ---The match counter as a badge drawn inside the input box (Sublime shows the
