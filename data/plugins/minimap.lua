@@ -66,45 +66,62 @@ local function window_start(dv, m)
   return start, math.min(total, start + window_lines - 1)
 end
 
----Leading indent of a line, in columns (tabs count as indent_size).
-local function indent_cols(text, indent_size)
-  local cols, i, len = 0, 1, #text
-  while i <= len do
-    local c = text:byte(i)
-    if c == 9 then cols = cols + indent_size
-    elseif c == 32 then cols = cols + 1
-    else break end
-    i = i + 1
+---Syntax-coloured blob palette, derived from the theme (token colours dimmed
+---toward the background).  Rebuilt whenever the background changes, which
+---covers theme switches.
+local blob_cache = {}
+local function blob_color(type_)
+  local c = blob_cache[type_]
+  if not c then
+    local src = style.syntax[type_] or style.text
+    c = {
+      style.background[1] + (src[1] - style.background[1]) * 0.55,
+      style.background[2] + (src[2] - style.background[2]) * 0.55,
+      style.background[3] + (src[3] - style.background[3]) * 0.55,
+      255,
+    }
+    blob_cache[type_] = c
   end
-  return cols, i
+  return c
 end
 
 local function draw_minimap(dv)
   local doc = dv.doc
   local m = metrics(dv)
   local first_line, last_line = window_start(dv, m)
-  local _, indent_size = doc:get_indent_info()
-  -- a dimmed, theme-derived blob colour
-  local blob = {
-    style.background[1] + (style.text[1] - style.background[1]) * 0.45,
-    style.background[2] + (style.text[2] - style.background[2]) * 0.45,
-    style.background[3] + (style.text[3] - style.background[3]) * 0.45,
-    255,
-  }
+  if blob_cache.bg ~= style.background[1] then
+    blob_cache = { bg = style.background[1] }
+  end
   local gap = math.max(1, common.round(0.6 * SCALE))
 
   core.push_clip_rect(m.x, m.y, m.w, m.h)
   for line = first_line, last_line do
     local text = doc.lines[line]
     if text and #text > 1 then
-      local cols, body_start = indent_cols(text, indent_size)
-      local content_len = #text - body_start
-      if text:byte(-1) == 10 then content_len = content_len - 1 end
-      local content_cols = math.min(content_len, m.max_cols - cols)
-      if content_cols > 0 then
-        local y = m.y + (line - first_line) * m.lh
-        renderer.draw_rect(m.x + cols * m.colw, y, content_cols * m.colw,
-          m.lh - gap, blob)
+      local y = m.y + (line - first_line) * m.lh
+      local cx = 0
+      for _, type_, tok in doc.highlighter:each_token(line) do
+        if cx < m.max_cols then
+          if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
+          local ws = select(2, tok:find("^%s*")) or 0
+          cx = cx + ws
+          local body = tok:sub(ws + 1)
+          local color = blob_color(type_)
+          -- draw word runs, spaces advance without drawing
+          local p = 1
+          while p <= #body and cx < m.max_cols do
+            local s, e = body:find("%S+", p)
+            if not s then break end
+            cx = cx + (s - p)
+            local seg_cols = math.min(e - s + 1, m.max_cols - cx)
+            if seg_cols > 0 then
+              renderer.draw_rect(m.x + cx * m.colw, y, seg_cols * m.colw,
+                m.lh - gap, color)
+              cx = cx + seg_cols
+            end
+            p = e + 1
+          end
+        end
       end
     end
   end
