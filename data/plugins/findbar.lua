@@ -12,12 +12,18 @@
 --   * every match in the document is highlighted, the current one emphasised;
 --   * a "3/27" counter that updates while you type (the scan runs inline for
 --     normal files, or in a coroutine for huge ones so no frame stalls);
---   * Enter / Shift+Enter walk matches without closing the bar, Esc closes and
---     returns to editing (selection collapsed, highlights dropped);
---   * a second row for the replacement: Replace / Replace All, one at a time
---     with Enter, whole file with cmd+alt+Enter;
+--   * Enter / Shift+Enter walk matches without closing the bar, Esc (or the
+--     × button) closes and returns to editing;
+--   * a second row for the replacement, laid out like Sublime's panel:
+--     Find: [field]      [Find] [Replace]  ×
+--     Replace: [field]   [Find All] [Replace All]
+--     one at a time with Enter or the Replace button, the whole file with
+--     cmd+alt+Enter, and Find All selects every match as a multi-cursor
+--     selection so one edit rewrites all of them;
 --   * case / regex / whole-word toggles that are clickable, have shortcuts and
---     survive a restart (core.storage).
+--     survive a restart (core.storage);
+--   * a history dropdown (▾) next to each field, walking the same history as
+--     option+up/down.
 --
 -- Bindings (cmd on macOS, ctrl elsewhere); see the keymap section at the end:
 --   cmd+f            open the bar / focus the find field, prefilled with the
@@ -50,6 +56,7 @@ local MOD = is_macos and "cmd" or "ctrl"
 -- needs the classes.  Locals, so nothing leaks into the global namespace.
 local state = {}
 local tick, recompile, jump, open_bar, close_bar, toggle, insert_unique, retarget
+local count_badge, control_width -- used by FindField:draw below
 local legacy -- the stock find commands, kept as a fallback
 
 -------------------------------------------------------------------------------
@@ -87,6 +94,74 @@ config.plugins.findbar = common.merge({
   border_alpha = 150,
   current_fill_alpha = 110,
 }, config.plugins.findbar)
+
+---Blends `b` into `a` by `t` (opaque RGBA), for panel colours that follow the
+---theme without hardcoding new ones.
+local function blend(a, b, t)
+  return { a[1] + (b[1] - a[1]) * t,
+           a[2] + (b[2] - a[2]) * t,
+           a[3] + (b[3] - a[3]) * t, 255 }
+end
+
+-- Corner radius for the fields and buttons, in logical units (SCALE multiplies
+-- it up to device pixels).  Sublime's fields are only slightly rounded.
+local RADIUS = math.max(2, math.floor(2.5 * SCALE))
+
+---Fills a rectangle with rounded corners.  The renderer only exposes solid
+---rectangles (`renderer.draw_rect`), so the arcs are approximated with one
+---pixel-tall strips -- a quarter-circle staircase that reads as smooth at this
+---small radius.  `r` is clamped to half the shorter side.
+local function rounded_rect(x, y, w, h, color, r)
+  r = r or RADIUS
+  if r < 1 or w <= 0 or h <= 0 then
+    if w > 0 and h > 0 then renderer.draw_rect(x, y, w, h, color) end
+    return
+  end
+  r = math.min(r, w / 2, h / 2)
+  -- the full-height and full-width slabs
+  renderer.draw_rect(x + r, y, w - 2 * r, h, color)
+  renderer.draw_rect(x, y + r, w, h - 2 * r, color)
+  -- the four corner arcs
+  for k = 0, r - 1 do
+    local d = r - k - 0.5
+    local span = math.max(1, math.min(r, math.floor(math.sqrt(r * r - d * d) + 0.5)))
+    renderer.draw_rect(x, y + k, span, 1, color)
+    renderer.draw_rect(x + w - span, y + k, span, 1, color)
+    renderer.draw_rect(x, y + h - k - 1, span, 1, color)
+    renderer.draw_rect(x + w - span, y + h - k - 1, span, 1, color)
+  end
+end
+-- Panel colours, in the spirit of Sublime's adaptive skin: the panel is one
+-- small step away from the editor background, the query field is a second,
+-- slightly larger step in the same direction and carries a hairline frame.
+-- Both steps go *towards* the text colour, so the bar reads as a panel in a
+-- dark theme and in a light one without hardcoding a colour -- and not as a
+-- near-white stripe across the bottom of a dark editor.
+-- Toggle icons are borderless and half-transparent, and a selected one gets a
+-- chip behind it.
+local colors = {}
+local function refresh_colors()
+  -- Contrast tuned so the panel reads at a glance: the field must be clearly
+  -- lighter than the panel (Sublime's fields are an obvious step up), the
+  -- frames must survive a dark theme.
+  colors.panel  = blend(style.background, style.text, 0.02)
+  colors.frame  = blend(style.background, style.text, 0.38)
+  colors.hover  = blend(style.background, style.text, 0.24)
+  -- the query field is a field, not an inverted widget: only the background
+  -- moves, the query keeps the editor's text and caret colours
+  colors.inner  = blend(style.background, style.text, 0.17)
+  colors.text   = style.text
+  colors.caret  = style.caret
+  -- selected toggle chip, like Sublime's icon_button_highlight
+  colors.chip   = blend(style.background, style.text, 0.30)
+  -- The palette the core's tokenizer draws the query with: the field holds
+  -- plain text, so every token has to resolve to the field's own colour.  Built
+  -- once per colour refresh rather than once per drawn line.
+  colors.syntax = setmetatable({}, { __index = function() return colors.text end })
+  -- The selection band inside the field: a step away from the field colour, so
+  -- it stays visible in a dark and in a light field alike.
+  colors.selection = blend(colors.inner, style.text, 0.22)
+end
 
 local STATE_KEY = "state"
 
@@ -300,6 +375,8 @@ function FindField:new(kind)
   -- CommandView:new() gives us a SingleLineDoc, so pasted newlines are dropped
   CommandView.new(self)
   self.kind = kind
+  -- the "Find:" / "Replace:" prompt, drawn in the gutter like CommandView's
+  self.label = (kind == "find" and "Find:" or "Replace:") .. " "
   self.visible = false
   self.size.y = 0
   -- width of the empty space in front of the query: the row is lined up with
@@ -386,96 +463,282 @@ end
 
 function FindField:draw()
   if self.size.y < 1 then return end
+  refresh_colors()
+  -- Panel background: clearly lighter than the editor, so the bar reads as
+  -- a panel floating above the code rather than a stray line of it.
+  renderer.draw_rect(self.position.x, self.position.y, self.size.x,
+    self.size.y, colors.panel)
+  -- Input-box background, painted under the text: a bright contrasting box with
+  -- a rounded border, like Sublime's find field on a dark panel.  The 1px frame
+  -- is a rounded ring one logical unit larger than the fill.
+  self:layout_controls()
+  local ix, iy, iw, ih, pad = self:field_geometry()
+  rounded_rect(ix - 1, iy - 1, iw + 2, ih + 2, colors.frame, RADIUS + 1)
+  rounded_rect(ix, iy, iw, ih, colors.inner, RADIUS)
+  self.input_box = { x = ix, y = iy, w = iw, h = ih }
   DocView.draw(self)
+  -- field overlay: history chevron + match counter at the right edge (Sublime
+  -- shows both inside the field); masked by a patch of the field colour so
+  -- scrolled text does not run underneath them
+  local font = self:get_font()
+  local lh = self:get_line_height()
+  local ty = iy + (ih - lh) / 2
+  local chev = self.field_controls and self.field_controls[1]
+  if chev and chev.x > ix + pad then
+    local counter_w = control_width(font, "00/000")
+    local mask_w = ix + iw - pad - chev.x
+    core.push_clip_rect(ix, iy, iw, ih)
+    renderer.draw_rect(chev.x + 1, iy + 1, mask_w, ih - 2, colors.inner)
+    renderer.draw_rect(chev.x + 1, iy + 1, 1, ih - 2, colors.frame)
+    common.draw_text(font,
+      self.hovered_control == chev and style.text
+        or blend(style.background, style.text, 0.70),
+      chev.text, "center", chev.x, ty, chev.w, lh)
+    local btext, bcolor = count_badge()
+    if btext and btext ~= "" then
+      common.draw_text(font, bcolor, btext, "right",
+        chev.x + chev.w, ty, counter_w - pad, lh)
+    end
+    core.pop_clip_rect()
+  end
   -- hairline on top of the row, like the status bar has
-  renderer.draw_rect(self.position.x, self.position.y, self.size.x, style.divider_size, style.divider)
+  renderer.draw_rect(self.position.x, self.position.y, self.size.x, style.divider_size, colors.frame)
 end
 
 -------------------------------------------------------------------------------
 -- Controls (the clickable strip in the gutter)
 -------------------------------------------------------------------------------
 
-local function control_width(font, text)
+---Width of a control: the text plus one padding on each side.  Defined against
+---the forward declaration above (`FindField:draw` calls it before this line).
+function control_width(font, text)
   return font:get_width(text) + style.padding.x * 2
 end
 
----Rebuilds `self.controls`, the strip of clickable parts of the row.
+---The match counter as a badge drawn inside the input box (Sublime shows the
+---count there too); "Wrapped" borrows the slot for a moment.  Declared at the
+---top of the file: `FindField:draw` above calls it, and a `local` is only
+---visible after its declaration (the strict-mode check rejects the global).
+function count_badge()
+  local cfg = config.plugins.findbar
+  local text = state.count_text()
+  local color = blend(style.background, style.text, 0.70)
+  if state.err then
+    return "!", style.error, state.err
+  end
+  if state.wrapped_at
+      and system.get_time() - state.wrapped_at < cfg.wrapped_hint_time then
+    local tip = text == "" and "" or (text .. " matches")
+    if tip ~= "" then tip = tip .. ", search wrapped" end
+    return "Wrapped", style.warn, tip
+  end
+  if state.query ~= "" and state.count == 0 and not state.counting then
+    color = style.error
+  end
+  return text, color, "Matches in this file"
+end
+
+---Geometry shared by both rows, so the two input boxes line up exactly like
+---Sublime's panel: one icon column on the left (toggles), one label column
+---("Find:" / "Replace:"), and two button columns plus the close button on the
+---right.  Every width is derived from the font only, so both rows compute the
+---same numbers and the fields get identical insets.
+local layout_cache
+local function shared_layout(font)
+  if layout_cache and layout_cache.font == font then return layout_cache end
+  local gap = math.floor(style.padding.x / 2)
+  local icon_w = math.max(
+    control_width(font, "Aa"), control_width(font, ".*"),
+    control_width(font, "\\b"))
+  local label_w = math.max(font:get_width("Find:"), font:get_width("Replace:"))
+    + style.padding.x
+  layout_cache = {
+    font = font, gap = gap, icon_w = icon_w, label_w = label_w,
+    icons_w = icon_w * 3,
+    col1 = math.max(control_width(font, "Find"), control_width(font, "Find All")),
+    col2 = math.max(control_width(font, "Replace"), control_width(font, "Replace All")),
+    col3 = control_width(font, "×"),
+  }
+  layout_cache.right_w = layout_cache.col1 + layout_cache.col2 + layout_cache.col3 + gap * 2
+  return layout_cache
+end
+
+---Position and size of the input box, shared by `draw` (which paints it) and
+---`layout_controls` (which pins the field overlay to its right edge), so the
+---chevron and the counter always sit exactly on the box.
+function FindField:field_geometry()
+  local pad = style.padding.x / 2
+  local gw = self:get_gutter_width()
+  local ix = self.position.x + gw + pad
+  local iw = self.size.x - gw - (shared_layout(self:get_font()).right_w + pad) - pad
+  local ih = math.max(self.size.y - style.padding.y, self:get_line_height())
+  local iy = self.position.y + (self.size.y - ih) / 2
+  return ix, iy, iw, ih, pad
+end
+
+---Rebuilds `self.controls`, the clickable parts of the row.
 ---
----It is laid out from the right edge (where Sublime puts the find panel's
----buttons) and drawn by `draw_overlay`; `get_right_inset` keeps the text from
----running underneath it.  Called from `get_right_inset`, so the drawing and the
----hit testing always agree.
+---The left side (toggles, chevron) is drawn in the gutter by
+---`draw_line_gutter`; the right side (buttons) by `draw_overlay`.
+---`get_gutter_width` and `get_right_inset` keep the text between them.
+---Called from both getters, so the drawing and the hit testing always agree.
 function FindField:layout_controls()
   local cfg = config.plugins.findbar
   local font = self:get_font()
+  local L = shared_layout(font)
   local controls = {}
+
+  -- left: the toggles and the history chevron, in fixed icon columns; shown
+  -- on both rows, like Sublime's icon column, so the rows stay identical
   local x = 0
-  local function push(text, color, command_name, tooltip, min_width)
-    local w = control_width(font, text)
+  local function push_icon(text, command_name, tooltip, active)
     controls[#controls + 1] = {
-      text = text, color = color, command = command_name,
-      tooltip = tooltip, offset = x, w = math.max(w, min_width or 0),
+      text = text, side = "left", command = command_name, tooltip = tooltip,
+      active = active, x = x, w = L.icon_w,
     }
-    x = x + controls[#controls].w
+    x = x + L.icon_w
   end
+  push_icon("Aa", "findbar:toggle-case", "Case sensitive", cfg.case_sensitive)
+  push_icon(".*", "findbar:toggle-regex", "Regular expression", cfg.regex)
+  push_icon("\\b", "findbar:toggle-word", "Whole word", cfg.whole_word)
 
+  -- right: the buttons, aligned in columns across both rows (Find above
+  -- Find All, Replace above Replace All)
+  x = 0
+  local function push_button(text, command_name, tooltip, col_w)
+    controls[#controls + 1] = {
+      text = text, side = "right", command = command_name, tooltip = tooltip,
+      button = true, x = x, w = col_w,
+    }
+    x = x + col_w + L.gap
+  end
   if self.kind == "find" then
-    push("<", style.dim, "findbar:previous", "Previous match")
-    push(">", style.dim, "findbar:next", "Next match")
-    push("Aa", cfg.case_sensitive and style.accent or style.dim,
-      "findbar:toggle-case", "Case sensitive")
-    push(".*", cfg.regex and style.accent or style.dim,
-      "findbar:toggle-regex", "Regular expression")
-    push("\\b", cfg.whole_word and style.accent or style.dim,
-      "findbar:toggle-word", "Whole word")
-    -- The counter owns a fixed width slot at the right edge, so that neither a
-    -- growing match count nor the "Wrapped" hint moves the buttons around.
-    -- "Wrapped" borrows the slot for a moment (Sublime shows it there too) and
-    -- the count stays visible in the tooltip.
-    local text, color, tip = state.count_text(), style.dim, "Matches in this file"
-    if state.err then
-      text, color, tip = "!", style.error, state.err
-    elseif state.wrapped_at
-        and system.get_time() - state.wrapped_at < cfg.wrapped_hint_time then
-      tip = (text == "" and "" or (text .. " matches"))
-      text, color = "Wrapped", style.warn
-      if tip ~= "" then tip = tip .. ", search wrapped" end
-    elseif state.query ~= "" and state.count == 0 and not state.counting then
-      color = style.error
-    end
-    push(text, color, nil, tip, control_width(font, "00/000"))
-    -- right aligned inside its slot, so that the count growing a digit does not
-    -- push the buttons around
-    controls[#controls].align = "right"
+    push_button("Find", "findbar:next", "Next match (shift+enter for previous)", L.col1)
+    push_button("Replace", "findbar:replace-current", "Replace this match", L.col2)
+    push_button("×", "findbar:escape", "Close the find panel (esc)", L.col3)
   else
-    push("Replace", style.text, "findbar:replace-current", "Replace this match")
-    push("All", style.text, "findbar:replace-all", "Replace every match in the file")
+    push_button("Find All", "findbar:find-all", "Select every match (multi-cursor)", L.col1)
+    push_button("Replace All", "findbar:replace-all", "Replace every match in the file", L.col2)
   end
 
+  -- offsets to absolute coordinates: left ones from the left edge, right ones
+  -- from the strip's right edge
+  local base = self.size.x - style.padding.x / 2 - L.right_w
+  for _, c in ipairs(controls) do
+    if c.side == "left" then
+      c.x = c.x + style.padding.x / 2
+    else
+      c.x = base + c.x
+    end
+  end
   self.controls = controls
-  self.controls_width = x
-  local offset = self.size.x - x
-  for _, c in ipairs(controls) do c.x = offset + c.offset end
+
+  -- field overlay, pinned to the input box's right edge like Sublime's: the
+  -- history chevron (clickable) and a fixed slot for the match counter
+  local ix, iy, iw, ih = self:field_geometry()
+  local counter_w = control_width(font, "00/000")
+  local chev_x = ix + iw - style.padding.x / 2 - counter_w - L.icon_w
+  self.field_controls = {
+    { text = "▾", side = "field", command = "findbar:history-next",
+      tooltip = "Search history (option+up/down)",
+      x = chev_x, y = iy, w = L.icon_w, h = ih },
+  }
 end
 
 ---The buttons live on the right of the row; the text is clipped just before
----them (see the fork's DocView:get_right_inset).
+---them (see the fork's DocView:get_right_inset).  Both rows reserve the same
+---width, so their input boxes end at the same x.
 function FindField:get_right_inset()
   if self.size.y < 1 then return 0 end
   self:layout_controls()
-  return self.controls_width + style.padding.x
+  return shared_layout(self:get_font()).right_w + style.padding.x / 2
 end
 
----No visible gutter, but the row reserves the same width as the line number
----area of the document it belongs to, so that the query starts exactly where
----the code does.  `left_inset` is kept up to date by the engine.
+---The left area: icon column (Aa / .* / \b / ▾) plus the "Find:" / "Replace:"
+---label, or the document's line-number width when that is wider.  Both rows
+---derive it from the same shared numbers, so the fields start at the same x.
 function FindField:get_gutter_width()
-  return self.left_inset or 0, 0
+  local L = shared_layout(self:get_font())
+  local w = style.padding.x / 2 + L.icons_w + L.label_w + style.padding.x
+  if (self.left_inset or 0) > w then w = self.left_inset end
+  return w, 0
 end
 
 ---The inherited CommandView implementation draws a label in the gutter; the bar
 ---draws its own controls instead.
+---The field's palette is its own, not the editor's: the core draws tokens with
+---style.syntax[...] and the caret with style.caret, so both are swapped around
+---the core call while the field is being drawn (the field holds plain text, so
+---every token resolves to one colour).
+function FindField:draw_line_text(line, x, y)
+  if self.size.y < 1 or not colors.syntax then
+    return DocView.draw_line_text(self, line, x, y)
+  end
+  local saved_caret = style.caret
+  style.caret = colors.caret
+  local saved_syntax = style.syntax
+  style.syntax = colors.syntax
+  local ok, w = pcall(DocView.draw_line_text, self, line, x, y)
+  style.syntax = saved_syntax
+  style.caret = saved_caret
+  if not ok then error(w) end
+  return w
+end
+
+---The core paints the caret line's style.line_highlight across the whole row,
+---which would bury the panel and the input-box backgrounds.  Draw only the
+---text (the core body ends with draw_line_text).
+function FindField:draw_line_body(line, x, y)
+  -- Selection inside the input box: painting style.selection here would use the
+  -- editor background's colour, which does not belong on the panel; a band
+  -- derived from the field's own palette reads correctly in both directions.
+  if self.doc:has_selection() and colors.selection and self.input_box then
+    local l1, c1, l2, c2 = self.doc:get_selection(true)
+    if l1 == line and l2 == line then
+      local lh = self:get_line_height()
+      local font = self:get_font()
+      local text = self.doc.lines[line] or ""
+      local x1 = x + (c1 > 1 and font:get_width(text:sub(1, c1 - 1)) or 0)
+      local x2 = x + (c2 > 1 and font:get_width(text:sub(1, c2 - 1)) or 0)
+      renderer.draw_rect(x1, y, math.max(x2 - x1, 1), lh, colors.selection)
+    end
+  end
+  return self:draw_line_text(line, x, y)
+end
+
 function FindField:draw_line_gutter(line, x, y, width)
+  -- the left strip: toggle icons + history chevron, then the "Find:" /
+  -- "Replace:" label right-aligned against the input box, like Sublime's
+  -- label column
+  if self.size.y >= 1 then
+    local font = self:get_font()
+    local lh = self:get_line_height()
+    local ty = y + self:get_line_text_y_offset()
+    local ch = math.min(lh, self.size.y - style.padding.y)
+    local cy = self.position.y + (self.size.y - ch) / 2
+    local gw = self:get_gutter_width()
+    core.push_clip_rect(self.position.x, self.position.y, gw, self.size.y)
+    for _, c in ipairs(self.controls) do
+      if c.side == "left" then
+        local cx = self.position.x + c.x
+        if c.active then
+          -- selected toggle: bright chip behind the icon (Sublime's
+          -- icon_button_highlight) and the icon at full opacity
+          rounded_rect(cx + 1, cy + 1, c.w - 2, ch - 2, colors.chip, RADIUS)
+          common.draw_text(font, style.text, c.text, "center", cx, ty, c.w, lh)
+        elseif self.hovered_control == c then
+          common.draw_text(font, style.text, c.text, "center", cx, ty, c.w, lh)
+        else
+          -- resting: borderless, readable but clearly inactive
+          common.draw_text(font, blend(style.background, style.text, 0.70),
+            c.text, "center", cx, ty, c.w, lh)
+        end
+      end
+    end
+    common.draw_text(font, blend(style.background, style.text, 0.70), self.label,
+      "right", self.position.x, ty, gw - style.padding.x, lh)
+    core.pop_clip_rect()
+  end
   return self:get_line_height()
 end
 
@@ -488,12 +751,22 @@ function FindField:draw_overlay()
   local font = self:get_font()
   local lh = self:get_line_height()
   local ty = self.position.y + style.padding.y + self:get_line_text_y_offset()
+  -- one chip size shared by every control, so the row reads as a toolbar
+  local ch = math.min(lh, self.size.y - style.padding.y)
+  local cy = self.position.y + (self.size.y - ch) / 2
   for _, c in ipairs(self.controls) do
-    local cx = self.position.x + c.x
-    if c.command and self.hovered_control == c then
-      renderer.draw_rect(cx, self.position.y, c.w, self.size.y, style.line_highlight)
+    if c.side == "right" then
+      local cx = self.position.x + c.x
+      if c.button then
+        -- a labelled button ("Find", "Replace All", ...): Sublime frames these
+        -- and keeps the label at full strength, hover just brightens the fill
+        local border = blend(style.background, style.text,
+          self.hovered_control == c and 0.45 or 0.30)
+        rounded_rect(cx - 1, cy, c.w + 2, ch, border, RADIUS + 1)
+        rounded_rect(cx, cy + 1, c.w, ch - 2, colors.inner, RADIUS)
+        common.draw_text(font, style.text, c.text, "center", cx, ty, c.w, lh)
+      end
     end
-    common.draw_text(font, c.color, c.text, c.align or "center", cx, ty, c.w, lh)
   end
 end
 
@@ -502,6 +775,11 @@ function FindField:control_at(x, y)
   for _, c in ipairs(self.controls) do
     local cx = self.position.x + c.x
     if x >= cx and x <= cx + c.w then return c end
+  end
+  -- the field overlay (history chevron) sits inside the input box, on top of
+  -- the text area; it wins over the caret placement
+  for _, c in ipairs(self.field_controls or {}) do
+    if x >= c.x and x <= c.x + c.w and y >= c.y and y <= c.y + c.h then return c end
   end
 end
 
@@ -815,6 +1093,35 @@ local function replace_all()
   return n > 0
 end
 
+---Selects every match at once, as one selection per match -- Sublime's
+---"Find All".  Editing then applies to all of them simultaneously, since the
+---doc's cursor machinery is multi-selection aware.
+local function select_all_matches()
+  local doc, m = state.doc, state.compiled
+  if not doc or not m then return false end
+  local matches, truncated = collect_matches(doc, m, config.plugins.findbar.max_matches)
+  if #matches == 0 then
+    core.error("Find All: no match for %q", state.query)
+    return false
+  end
+  local selections = {}
+  for _, mt in ipairs(matches) do
+    selections[#selections + 1] = mt.line
+    selections[#selections + 1] = mt.col
+    selections[#selections + 1] = mt.line
+    selections[#selections + 1] = mt.col + mt.len
+  end
+  doc.selections = selections
+  doc.last_selection = #matches
+  doc:sanitize_selection()
+  state.current = nil
+  state.anchor_line, state.anchor_col = matches[1].line, matches[1].col
+  if state.target then state.target:scroll_to_line(matches[1].line, true) end
+  core.log("Found %d occurrence(s) of %q%s", #matches, state.query,
+    truncated and " (truncated)" or "")
+  return true
+end
+
 ---Points the engine at the document of the focused view.  Does nothing when a
 ---view that is not a document has the focus (the treeview, the AI panel, one of
 ---our own fields), so the previous target survives a detour through the UI.
@@ -1074,6 +1381,10 @@ command.add(function() return bar_open() end, {
   end,
   ["findbar:replace-all"] = function()
     replace_all()
+    return true
+  end,
+  ["findbar:find-all"] = function()
+    select_all_matches()
     return true
   end,
 })
