@@ -143,6 +143,11 @@ local function refresh_colors()
   colors.caret  = style.caret
   -- selected toggle chip, like Sublime's icon_button_highlight
   colors.chip   = blend(style.background, style.text, 0.30)
+  -- focused input: Sublime brightens the border of the field you type in
+  colors.focus  = blend(style.background, style.text, 0.55)
+  -- buttons: a step between the panel and the field, hovered a step further
+  colors.btn    = blend(style.background, style.text, 0.20)
+  colors.btn_hover = blend(style.background, style.text, 0.26)
   -- The palette the core's tokenizer draws the query with: the field holds
   -- plain text, so every token has to resolve to the field's own colour.  Built
   -- once per colour refresh rather than once per drawn line.
@@ -415,7 +420,7 @@ end
 
 ---The height of one row; the locked node holding this view reads `size.y`.
 function FindField:row_height()
-  return self:get_line_height() + style.padding.y * 2
+  return self:get_line_height() + pad_v() * 2
 end
 
 ---Keeps the caret inside the field.  Same maths as DocView, minus the
@@ -462,7 +467,9 @@ function FindField:draw()
   -- is a rounded ring one logical unit larger than the fill.
   self:layout_controls()
   local ix, iy, iw, ih, pad = self:field_geometry()
-  rounded_rect(ix - 1, iy - 1, iw + 2, ih + 2, colors.frame, RADIUS + 1)
+  -- Sublime brightens the border of the field that has the focus
+  local ring = (core.active_view == self) and colors.focus or colors.frame
+  rounded_rect(ix - 1, iy - 1, iw + 2, ih + 2, ring, RADIUS + 1)
   rounded_rect(ix, iy, iw, ih, colors.inner, RADIUS)
   self.input_box = { x = ix, y = iy, w = iw, h = ih }
   DocView.draw(self)
@@ -504,6 +511,12 @@ function control_width(font, text)
   return font:get_width(text) + style.padding.x * 2
 end
 
+---Vertical padding of a row: Sublime's panel rows are visibly tighter than
+---the editor's default padding would make them.
+local function pad_v()
+  return math.max(2, math.floor(style.padding.y * 0.4))
+end
+
 ---The match counter as a badge drawn inside the input box (Sublime shows the
 ---count there too); "Wrapped" borrows the slot for a moment.  Declared at the
 ---top of the file: `FindField:draw` above calls it, and a `local` is only
@@ -535,7 +548,7 @@ end
 local layout_cache
 local function shared_layout(font)
   if layout_cache and layout_cache.font == font then return layout_cache end
-  local gap = math.floor(style.padding.x / 2)
+  local gap = math.max(4, math.floor(style.padding.x * 0.75))
   local icon_w = math.max(
     control_width(font, "Aa"), control_width(font, ".*"),
     control_width(font, "\\b"))
@@ -560,7 +573,7 @@ function FindField:field_geometry()
   local gw = self:get_gutter_width()
   local ix = self.position.x + gw + pad
   local iw = self.size.x - gw - (shared_layout(self:get_font()).right_w + pad) - pad
-  local ih = math.max(self.size.y - style.padding.y, self:get_line_height())
+  local ih = math.max(self.size.y - pad_v() * 2, self:get_line_height())
   local iy = self.position.y + (self.size.y - ih) / 2
   return ix, iy, iw, ih, pad
 end
@@ -703,7 +716,7 @@ function FindField:draw_line_gutter(line, x, y, width)
     local font = self:get_font()
     local lh = self:get_line_height()
     local ty = y + self:get_line_text_y_offset()
-    local ch = math.min(lh, self.size.y - style.padding.y)
+    local ch = math.min(lh, self.size.y - pad_v() * 2)
     local cy = self.position.y + (self.size.y - ch) / 2
     local gw = self:get_gutter_width()
     core.push_clip_rect(self.position.x, self.position.y, gw, self.size.y)
@@ -741,18 +754,19 @@ function FindField:draw_overlay()
   local lh = self:get_line_height()
   local ty = self.position.y + style.padding.y + self:get_line_text_y_offset()
   -- one chip size shared by every control, so the row reads as a toolbar
-  local ch = math.min(lh, self.size.y - style.padding.y)
+  local ch = math.min(lh, self.size.y - pad_v() * 2)
   local cy = self.position.y + (self.size.y - ch) / 2
   for _, c in ipairs(self.controls) do
     if c.side == "right" then
       local cx = self.position.x + c.x
       if c.button then
         -- a labelled button ("Find", "Replace All", ...): Sublime frames these
-        -- and keeps the label at full strength, hover just brightens the fill
-        local border = blend(style.background, style.text,
-          self.hovered_control == c and 0.45 or 0.30)
+        -- and keeps the label at full strength; hover lightens the fill as
+        -- well as the border, like a real button
+        local hovered = self.hovered_control == c
+        local border = blend(style.background, style.text, hovered and 0.50 or 0.32)
         rounded_rect(cx - 1, cy, c.w + 2, ch, border, RADIUS + 1)
-        rounded_rect(cx, cy + 1, c.w, ch - 2, colors.inner, RADIUS)
+        rounded_rect(cx, cy + 1, c.w, ch - 2, hovered and colors.btn_hover or colors.btn, RADIUS)
         common.draw_text(font, style.text, c.text, "center", cx, ty, c.w, lh)
       end
     end
