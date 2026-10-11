@@ -621,11 +621,16 @@ function TreeView:draw()
   if not self.visible then return end
   self:draw_background(style.background2)
   local _y, _h = self.position.y, self.size.y
+  -- Sublime marks the row of the file currently being edited
+  local active_doc = core.active_view and core.active_view.doc
+  local active_filename = active_doc and active_doc.abs_filename or nil
 
   for item, x,y,w,h in self:each_item() do
     if y + h >= _y and y < _y + _h then
+      local is_active = item == self.selected_item
+        or (active_filename ~= nil and item.abs_filename == active_filename)
       self:draw_item(item,
-        item == self.selected_item,
+        is_active,
         item == self.hovered_item,
         x, y, w, h)
     end

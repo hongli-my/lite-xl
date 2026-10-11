@@ -6,6 +6,16 @@ local Object = require "core.object"
 local EmptyView = require "core.emptyview"
 local View = require "core.view"
 
+---Blends `b` into `a` by `t` (opaque RGBA), for colours derived from the theme.
+local function blend_color(a, b, t)
+  return {
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+    a[3] + (b[3] - a[3]) * t,
+    255,
+  }
+end
+
 ---@class core.node : core.object
 local Node = Object:extend()
 
@@ -575,6 +585,12 @@ function Node:draw_tab(view, is_active, is_hovered, is_close_hovered, x, y, w, h
   if show_close_button then
     local close_style = is_close_hovered and style.text or style.dim
     common.draw_text(style.icon_font, close_style, "C", nil, cx, y, cw, h)
+  elseif not standalone and view.doc and view.doc.is_dirty and view.doc:is_dirty() then
+    -- Sublime's modified-file marker: a small dot in the close slot; hovering
+    -- the tab swaps it for the close button above
+    local dot = math.max(2, common.round(3 * SCALE))
+    renderer.draw_rounded_rect(cx, y + (h - dot) / 2, dot, dot, dot / 2,
+      blend_color(style.background, style.text, 0.65))
   end
   -- Title
   x = x + cpad
