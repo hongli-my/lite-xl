@@ -14,9 +14,10 @@
 --     normal files, or in a coroutine for huge ones so no frame stalls);
 --   * Enter / Shift+Enter walk matches without closing the bar, Esc (or the
 --     × button) closes and returns to editing;
---   * a second row for the replacement, laid out like Sublime's panel:
---     Find: [field]      [Find] [Replace]  ×
---     Replace: [field]   [Find All] [Replace All]
+--   * a second row for the replacement, laid out like Sublime's panel (icon
+--     toggles left of the field, right-aligned button groups, no labels):
+--     [Aa .* \b] [field ▾]      [Find] [Find Prev] [Find All]  ×
+--     [Aa .* \b] [field ▾]      [Replace] [Replace All]
 --     one at a time with Enter or the Replace button, the whole file with
 --     cmd+alt+Enter, and Find All selects every match as a multi-cursor
 --     selection so one edit rewrites all of them;
@@ -108,11 +109,11 @@ end
 -- it up to device pixels).  Sublime's fields are only slightly rounded.
 local RADIUS = math.max(2, math.floor(2.5 * SCALE))
 
----Vertical padding of a row: Sublime's panel rows are visibly tighter than
----the editor's default padding would make them.  Defined here because
----FindField:row_height (below) uses it.
+---Vertical padding of a row.  Must match the editor padding the core draws
+---the query line with (style.padding.y), otherwise the text sits below the
+---input box instead of centred in it.
 local function pad_v()
-  return math.max(2, math.floor(style.padding.y * 0.4))
+  return style.padding.y
 end
 
 ---Fills a rectangle with rounded corners.  The renderer exposes the native
@@ -138,31 +139,42 @@ end
 -- chip behind it.
 local colors = {}
 local function refresh_colors()
-  -- Contrast tuned so the panel reads at a glance: the field must be clearly
-  -- lighter than the panel (Sublime's fields are an obvious step up), the
-  -- frames must survive a dark theme.
-  colors.panel  = blend(style.background, style.text, 0.02)
-  colors.frame  = blend(style.background, style.text, 0.38)
-  colors.hover  = blend(style.background, style.text, 0.24)
-  -- the query field is a field, not an inverted widget: only the background
-  -- moves, the query keeps the editor's text and caret colours
-  colors.inner  = blend(style.background, style.text, 0.17)
-  colors.text   = style.text
-  colors.caret  = style.caret
-  -- selected toggle chip, like Sublime's icon_button_highlight
-  colors.chip   = blend(style.background, style.text, 0.30)
-  -- focused input: Sublime brightens the border of the field you type in
-  colors.focus  = blend(style.background, style.text, 0.55)
-  -- buttons: a step between the panel and the field, hovered a step further
-  colors.btn    = blend(style.background, style.text, 0.20)
-  colors.btn_hover = blend(style.background, style.text, 0.26)
+  -- The panel follows the *chrome* palette (background2, like the status bar
+  -- and the treeview) instead of the editor background, matching Sublime where
+  -- the find panel is light chrome even over a dark editor.  Fields are a
+  -- clear step away from the panel (white-ish on a light theme, lighter on a
+  -- dark one), and the accent is reserved for state: the focused field's ring,
+  -- the active toggle chip and the hovered button.
+  local bg2 = style.background2 or style.background
+  local ctext = style.chrome_text or style.text
+  local white = { 255, 255, 255, 255 }
+  local black = { 0, 0, 0, 255 }
+  local light = (0.299 * bg2[1] + 0.587 * bg2[2] + 0.114 * bg2[3]) > 128
+
+  colors.panel  = bg2
+  -- fields: pure white on the light chrome (Sublime's fields are stark white
+  -- on grey), a clear step away from the panel
+  colors.inner  = light and white or blend(bg2, ctext, 0.16)
+  colors.frame  = light and blend(bg2, black, 0.30) or blend(bg2, ctext, 0.32)
+  colors.hover  = light and blend(bg2, black, 0.10) or blend(bg2, ctext, 0.24)
+  colors.text   = light and blend(bg2, black, 0.85) or style.text
+  colors.caret  = light and colors.text or style.caret
+  colors.dim    = light and blend(bg2, black, 0.45) or blend(bg2, ctext, 0.55)
+  -- selected toggle chip: an accent tint instead of another grey step
+  colors.chip   = blend(bg2, style.accent, light and 0.40 or 0.32)
+  -- focused input: the accent ring marks where the typing goes
+  colors.focus  = style.accent
+  -- buttons: white like the fields, framed; hovered picks up accent
+  colors.btn       = light and white or blend(bg2, ctext, 0.15)
+  colors.btn_hover = blend(bg2, style.accent, light and 0.30 or 0.28)
   -- The palette the core's tokenizer draws the query with: the field holds
   -- plain text, so every token has to resolve to the field's own colour.  Built
   -- once per colour refresh rather than once per drawn line.
   colors.syntax = setmetatable({}, { __index = function() return colors.text end })
   -- The selection band inside the field: a step away from the field colour, so
   -- it stays visible in a dark and in a light field alike.
-  colors.selection = blend(colors.inner, style.text, 0.22)
+  colors.selection = light and blend(colors.inner, black, 0.22)
+    or blend(colors.inner, ctext, 0.25)
 end
 
 local STATE_KEY = "state"
@@ -377,8 +389,8 @@ function FindField:new(kind)
   -- CommandView:new() gives us a SingleLineDoc, so pasted newlines are dropped
   CommandView.new(self)
   self.kind = kind
-  -- the "Find:" / "Replace:" prompt, drawn in the gutter like CommandView's
-  self.label = (kind == "find" and "Find:" or "Replace:") .. " "
+  -- Sublime's panel has no text labels: the toggles identify the row
+  self.label = ""
   self.visible = false
   self.size.y = 0
   -- width of the empty space in front of the query: the row is lined up with
@@ -481,6 +493,8 @@ function FindField:draw()
   rounded_rect(ix, iy, iw, ih, colors.inner, RADIUS)
   self.input_box = { x = ix, y = iy, w = iw, h = ih }
   DocView.draw(self)
+  -- right-aligned button group, outside the text clip (see draw_buttons)
+  self:draw_buttons()
   -- field overlay: history chevron + match counter at the right edge (Sublime
   -- shows both inside the field); masked by a patch of the field colour so
   -- scrolled text does not run underneath them
@@ -495,8 +509,7 @@ function FindField:draw()
     renderer.draw_rect(chev.x + 1, iy + 1, mask_w, ih - 2, colors.inner)
     renderer.draw_rect(chev.x + 1, iy + 1, 1, ih - 2, colors.frame)
     common.draw_text(font,
-      self.hovered_control == chev and style.text
-        or blend(style.background, style.text, 0.70),
+      self.hovered_control == chev and colors.text or colors.dim,
       chev.text, "center", chev.x, ty, chev.w, lh)
     local btext, bcolor = count_badge()
     if btext and btext ~= "" then
@@ -526,7 +539,7 @@ end
 function count_badge()
   local cfg = config.plugins.findbar
   local text = state.count_text()
-  local color = blend(style.background, style.text, 0.70)
+  local color = colors.dim
   if state.err then
     return "!", style.error, state.err
   end
@@ -554,17 +567,46 @@ local function shared_layout(font)
   local icon_w = math.max(
     control_width(font, "Aa"), control_width(font, ".*"),
     control_width(font, "\\b"))
-  local label_w = math.max(font:get_width("Find:"), font:get_width("Replace:"))
-    + style.padding.x
+  -- Sublime's panel: no text labels, the toggles sit left of the field and
+  -- each row carries its own right-aligned button group
   layout_cache = {
-    font = font, gap = gap, icon_w = icon_w, label_w = label_w,
+    font = font, gap = gap, icon_w = icon_w,
     icons_w = icon_w * 3,
-    col1 = math.max(control_width(font, "Find"), control_width(font, "Find All")),
-    col2 = math.max(control_width(font, "Replace"), control_width(font, "Replace All")),
-    col3 = control_width(font, "×"),
+    rows = {
+      find    = { "Find", "Find Prev", "Find All", "×" },
+      replace = { "Replace", "Replace All" },
+    },
   }
-  layout_cache.right_w = layout_cache.col1 + layout_cache.col2 + layout_cache.col3 + gap * 2
   return layout_cache
+end
+
+local button_commands = {
+  ["Find"]        = "findbar:next",
+  ["Find Prev"]   = "findbar:previous",
+  ["Find All"]    = "findbar:find-all",
+  ["×"]           = "findbar:escape",
+  ["Replace"]     = "findbar:replace-current",
+  ["Replace All"] = "findbar:replace-all",
+}
+
+local button_tooltips = {
+  ["Find"]        = "Next match (enter)",
+  ["Find Prev"]   = "Previous match (shift+enter)",
+  ["Find All"]    = "Select every match (multi-cursor)",
+  ["×"]           = "Close the find panel (esc)",
+  ["Replace"]     = "Replace this match",
+  ["Replace All"] = "Replace every match in the file",
+}
+
+---Total width of this row's right-aligned button group.
+function FindField:row_buttons_width()
+  local font = self:get_font()
+  local L = shared_layout(font)
+  local total = 0
+  for _, text in ipairs(L.rows[self.kind]) do
+    total = total + control_width(font, text) + L.gap
+  end
+  return total - L.gap
 end
 
 ---Position and size of the input box, shared by `draw` (which paints it) and
@@ -574,7 +616,7 @@ function FindField:field_geometry()
   local pad = style.padding.x / 2
   local gw = self:get_gutter_width()
   local ix = self.position.x + gw + pad
-  local iw = self.size.x - gw - (shared_layout(self:get_font()).right_w + pad) - pad
+  local iw = self.size.x - gw - (self:row_buttons_width() + pad) - pad
   local ih = math.max(self.size.y - pad_v() * 2, self:get_line_height())
   local iy = self.position.y + (self.size.y - ih) / 2
   return ix, iy, iw, ih, pad
@@ -582,18 +624,18 @@ end
 
 ---Rebuilds `self.controls`, the clickable parts of the row.
 ---
----The left side (toggles, chevron) is drawn in the gutter by
----`draw_line_gutter`; the right side (buttons) by `draw_overlay`.
----`get_gutter_width` and `get_right_inset` keep the text between them.
----Called from both getters, so the drawing and the hit testing always agree.
+---The left side (toggles) is drawn in the gutter by `draw_line_gutter`; the
+---right side (buttons) by `draw_overlay`.  `get_gutter_width` and
+---`get_right_inset` keep the text between them.  Called from both getters,
+---so the drawing and the hit testing always agree.
 function FindField:layout_controls()
   local cfg = config.plugins.findbar
   local font = self:get_font()
   local L = shared_layout(font)
   local controls = {}
 
-  -- left: the toggles and the history chevron, in fixed icon columns; shown
-  -- on both rows, like Sublime's icon column, so the rows stay identical
+  -- left: the toggles in fixed icon columns, directly left of the field
+  -- like Sublime's icon column
   local x = 0
   local function push_icon(text, command_name, tooltip, active)
     controls[#controls + 1] = {
@@ -606,28 +648,28 @@ function FindField:layout_controls()
   push_icon(".*", "findbar:toggle-regex", "Regular expression", cfg.regex)
   push_icon("\\b", "findbar:toggle-word", "Whole word", cfg.whole_word)
 
-  -- right: the buttons, aligned in columns across both rows (Find above
-  -- Find All, Replace above Replace All)
-  x = 0
-  local function push_button(text, command_name, tooltip, col_w)
-    controls[#controls + 1] = {
-      text = text, side = "right", command = command_name, tooltip = tooltip,
-      button = true, x = x, w = col_w,
-    }
-    x = x + col_w + L.gap
+  -- right: this row's buttons, right-aligned as a group (Sublime's panel
+  -- does not align the two rows' buttons into shared columns)
+  local labels = L.rows[self.kind]
+  local widths, total = {}, 0
+  for _, text in ipairs(labels) do
+    local w = control_width(font, text)
+    widths[#widths + 1] = w
+    total = total + w + L.gap
   end
-  if self.kind == "find" then
-    push_button("Find", "findbar:next", "Next match (shift+enter for previous)", L.col1)
-    push_button("Replace", "findbar:replace-current", "Replace this match", L.col2)
-    push_button("×", "findbar:escape", "Close the find panel (esc)", L.col3)
-  else
-    push_button("Find All", "findbar:find-all", "Select every match (multi-cursor)", L.col1)
-    push_button("Replace All", "findbar:replace-all", "Replace every match in the file", L.col2)
+  total = total - L.gap
+  x = 0
+  for i, text in ipairs(labels) do
+    controls[#controls + 1] = {
+      text = text, side = "right", command = button_commands[text],
+      tooltip = button_tooltips[text], button = true, x = x, w = widths[i],
+    }
+    x = x + widths[i] + L.gap
   end
 
   -- offsets to absolute coordinates: left ones from the left edge, right ones
   -- from the strip's right edge
-  local base = self.size.x - style.padding.x / 2 - L.right_w
+  local base = self.size.x - style.padding.x / 2 - total
   for _, c in ipairs(controls) do
     if c.side == "left" then
       c.x = c.x + style.padding.x / 2
@@ -650,20 +692,18 @@ function FindField:layout_controls()
 end
 
 ---The buttons live on the right of the row; the text is clipped just before
----them (see the fork's DocView:get_right_inset).  Both rows reserve the same
----width, so their input boxes end at the same x.
+---them (see the fork's DocView:get_right_inset).  Each row reserves its own
+---button group's width, like Sublime's panel.
 function FindField:get_right_inset()
   if self.size.y < 1 then return 0 end
-  self:layout_controls()
-  return shared_layout(self:get_font()).right_w + style.padding.x / 2
+  return self:row_buttons_width() + style.padding.x / 2
 end
 
----The left area: icon column (Aa / .* / \b / ▾) plus the "Find:" / "Replace:"
----label, or the document's line-number width when that is wider.  Both rows
----derive it from the same shared numbers, so the fields start at the same x.
+---The left area: the icon column (Aa / .* / \b), or the document's
+---line-number width when that is wider, so the query lines up with the code.
 function FindField:get_gutter_width()
   local L = shared_layout(self:get_font())
-  local w = style.padding.x / 2 + L.icons_w + L.label_w + style.padding.x
+  local w = style.padding.x / 2 + L.icons_w + style.padding.x
   if (self.left_inset or 0) > w then w = self.left_inset end
   return w, 0
 end
@@ -725,32 +765,35 @@ function FindField:draw_line_gutter(line, x, y, width)
     for _, c in ipairs(self.controls) do
       if c.side == "left" then
         local cx = self.position.x + c.x
+        local hovered = self.hovered_control == c
+        -- every toggle is a bordered chip, like Sublime's icon buttons: the
+        -- active one fills with the accent, the rest are outlined
         if c.active then
-          -- selected toggle: bright chip behind the icon (Sublime's
-          -- icon_button_highlight) and the icon at full opacity
-          rounded_rect(cx + 1, cy + 1, c.w - 2, ch - 2, colors.chip, RADIUS)
-          common.draw_text(font, style.text, c.text, "center", cx, ty, c.w, lh)
-        elseif self.hovered_control == c then
-          common.draw_text(font, style.text, c.text, "center", cx, ty, c.w, lh)
+          rounded_rect(cx, cy, c.w, ch, colors.chip, RADIUS)
+          common.draw_text(font, style.background, c.text, "center", cx, ty, c.w, lh)
         else
-          -- resting: borderless, readable but clearly inactive
-          common.draw_text(font, blend(style.background, style.text, 0.70),
+          -- outlined chip: a ring one unit larger reads as a 1px border
+          rounded_rect(cx - 1, cy - 1, c.w + 2, ch + 2, colors.frame, RADIUS + 1)
+          rounded_rect(cx, cy, c.w, ch, hovered and colors.hover or colors.panel, RADIUS)
+          common.draw_text(font, hovered and colors.text or colors.dim,
             c.text, "center", cx, ty, c.w, lh)
         end
       end
     end
-    common.draw_text(font, blend(style.background, style.text, 0.70), self.label,
-      "right", self.position.x, ty, gw - style.padding.x, lh)
+    if self.label ~= "" then
+      common.draw_text(font, colors.dim, self.label,
+        "right", self.position.x, ty, gw - style.padding.x, lh)
+    end
     core.pop_clip_rect()
   end
   return self:get_line_height()
 end
 
----Draws the controls.  Note that `DocView.draw_overlay` here is the plugin's
----own wrapper around the core one: it draws the caret and, for a document view,
----the match highlights.  For a field it stops after the caret.
-function FindField:draw_overlay()
-  DocView.draw_overlay(self)
+---The row's right-aligned button group.  Drawn from `FindField:draw`, *after*
+---`DocView.draw` has popped the text clip: the text clip excludes the right
+---inset (where these buttons live), so drawing them from draw_overlay — inside
+---that clip — would hide the whole group.
+function FindField:draw_buttons()
   if self.size.y < 1 then return end
   local font = self:get_font()
   local lh = self:get_line_height()
@@ -759,18 +802,16 @@ function FindField:draw_overlay()
   local ch = math.min(lh, self.size.y - pad_v() * 2)
   local cy = self.position.y + (self.size.y - ch) / 2
   for _, c in ipairs(self.controls) do
-    if c.side == "right" then
+    if c.side == "right" and c.button then
       local cx = self.position.x + c.x
-      if c.button then
-        -- a labelled button ("Find", "Replace All", ...): Sublime frames these
-        -- and keeps the label at full strength; hover lightens the fill as
-        -- well as the border, like a real button
-        local hovered = self.hovered_control == c
-        local border = blend(style.background, style.text, hovered and 0.50 or 0.32)
-        rounded_rect(cx - 1, cy, c.w + 2, ch, border, RADIUS + 1)
-        rounded_rect(cx, cy + 1, c.w, ch - 2, hovered and colors.btn_hover or colors.btn, RADIUS)
-        common.draw_text(font, style.text, c.text, "center", cx, ty, c.w, lh)
-      end
+      -- a labelled button ("Find", "Replace All", ...): Sublime frames these
+      -- and keeps the label at full strength; hover picks up the accent
+      local hovered = self.hovered_control == c
+      local border = hovered and blend(style.background2 or style.background, style.accent, 0.55)
+        or colors.frame
+      rounded_rect(cx - 1, cy, c.w + 2, ch, border, RADIUS + 1)
+      rounded_rect(cx, cy + 1, c.w, ch - 2, hovered and colors.btn_hover or colors.btn, RADIUS)
+      common.draw_text(font, colors.text, c.text, "center", cx, ty, c.w, lh)
     end
   end
 end

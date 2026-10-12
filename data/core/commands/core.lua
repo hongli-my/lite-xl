@@ -188,12 +188,14 @@ command.add(nil, {
 
   ["core:toggle-fullscreen"] = function()
     fullscreen = not fullscreen
-    if fullscreen then
-      restore_title_view = core.title_view.visible
-    end
     system.set_window_mode(core.window, fullscreen and "fullscreen" or "normal")
-    core.show_title_bar(not fullscreen and restore_title_view)
-    core.title_view:configure_hit_test(not fullscreen and restore_title_view)
+    core.show_title_bar(false)
+    if fullscreen then
+      -- no permanent title bar; the title view auto-reveals on top hover
+      system.set_window_hit_test(core.window)
+    else
+      core.configure_borderless_window()
+    end
   end,
 
   ["core:reload-module"] = function()

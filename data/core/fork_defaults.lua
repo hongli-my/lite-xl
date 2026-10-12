@@ -23,6 +23,10 @@ require "colors.slate"
 -------------------------------------------------------------------------------
 -- Config
 -------------------------------------------------------------------------------
+-- Bordered window: the native macOS title bar (with the traffic lights)
+-- stays; the custom title view is only shown borderless.
+config.borderless = false
+
 -- Do not allow scrolling past the end of the document.
 config.scroll_past_end = false
 

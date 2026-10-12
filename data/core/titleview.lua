@@ -58,21 +58,6 @@ function TitleView:on_scale_change()
 end
 
 function TitleView:update()
-  -- While in fullscreen the title bar is hidden; temporarily reveal it when
-  -- the mouse hovers the top edge so the window controls (close, unfullscreen
-  -- via the restore button) stay reachable, and hide it again once the mouse
-  -- moves back into the editor.
-  if core.window_mode == "fullscreen" then
-    local h = title_view_height()
-    local mouse_y = core.root_view and core.root_view.mouse.y or -1
-    if not self.visible and mouse_y >= 0 and mouse_y <= h then
-      self.visible = true
-      self:configure_hit_test(true)
-    elseif self.visible and mouse_y > h * 2 then
-      self.visible = false
-      self:configure_hit_test(false)
-    end
-  end
   self.size.y = self.visible and title_view_height() or 0
   title_commands[2] = core.window_mode == "maximized" and restore_command or maximize_command
   TitleView.super.update(self)
@@ -153,6 +138,7 @@ end
 
 function TitleView:draw()
   self:draw_background(style.background2)
+  if self.spacer then return end
   self:draw_window_title()
   self:draw_window_controls()
 end
