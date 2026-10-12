@@ -131,7 +131,8 @@ function LineWrapping.reconstruct_breaks(docview, default_font, width, line_offs
     docview.wrapped_line_to_idx = { }
     -- one element per actual line; gives the indent width for the acutal line
     docview.wrapped_line_offsets = { }
-    docview.wrapped_settings = { ["width"] = width, ["font"] = default_font }
+    docview.wrapped_settings = { ["width"] = width, ["font"] = default_font,
+      ["font_size"] = default_font.get_size and default_font:get_size() or 0 }
     for i = line_offset or 1, #doc.lines do
       local breaks, offset = LineWrapping.compute_line_breaks(doc, default_font, i, width, config.plugins.linewrapping.mode)
       table.insert(docview.wrapped_line_offsets, offset)
@@ -226,9 +227,18 @@ function LineWrapping.update_docview_breaks(docview)
   local reserved = math.max(docview:get_right_inset(), w or 0)
   local width = (type(config.plugins.linewrapping.width_override) == "function" and config.plugins.linewrapping.width_override(docview))
     or config.plugins.linewrapping.width_override or (docview.size.x - docview:get_gutter_width() - reserved)
-  if (not docview.wrapped_settings or docview.wrapped_settings.width == nil or width ~= docview.wrapped_settings.width) then
+  -- zooming (ctrl+wheel / the scale plugin) resizes the font object in place,
+  -- so the font size is part of the cache key: the pixel width alone does not
+  -- change on zoom, and the breaks would stay at the old font's columns
+  local font = docview:get_font()
+  local font_size = font.get_size and font:get_size() or SCALE
+  local settings = docview.wrapped_settings
+  if not settings or settings.width == nil
+      or width ~= settings.width
+      or font ~= settings.font
+      or font_size ~= settings.font_size then
     docview.scroll.to.x = 0
-    LineWrapping.reconstruct_breaks(docview, docview:get_font(), width)
+    LineWrapping.reconstruct_breaks(docview, font, width)
   end
 end
 
