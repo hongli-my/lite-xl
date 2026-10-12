@@ -1002,18 +1002,37 @@ end
 -- ============================================================
 -- Draw
 -- ============================================================
+---Linear blend of two {r,g,b,a} colours, t=0 -> a, t=1 -> b.
+local function blend_color(a, b, t)
+  return {
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+    a[3] + (b[3] - a[3]) * t,
+    a[4] + (b[4] - a[4]) * t,
+  }
+end
+
+---Theme-agnostic floating button colours: a chip blended towards the text
+---colour is dark on a light theme and light on a dark one, so the label stays
+---readable over any editor background (the old near-transparent tint melted
+---into the document).
+local function button_colors(hovered)
+  if hovered then
+    local bg = { table.unpack(style.accent) }
+    bg[4] = 255
+    return bg, style.background
+  end
+  return blend_color(style.background, style.text, 0.8),
+         blend_color(style.background, style.text, 0.1)
+end
+
 function MarkdownPreviewView:draw_toggle_button()
   local label = config.plugins.markdown_preview.button_label_edit
   local font = style.font
   local x, y, w, h = self:get_button_rect()
   local border = common.round(1 * SCALE)
-  local bg, fg
-  if self.hovered_button then
-    bg, fg = style.accent, style.background
-  else
-    bg = is_dark() and { 255, 255, 255, 22 } or { 0, 0, 0, 18 }
-    fg = style.text
-  end
+  local bg, fg = button_colors(self.hovered_button)
+  bg[4] = 235
   renderer.draw_rect(x - border, y - border, w + border * 2, h + border * 2, style.divider)
   renderer.draw_rect(x, y, w, h, bg)
   common.draw_text(font, fg, label, "center", x, y, w, h)
@@ -1324,13 +1343,8 @@ function DocView:draw(...)
   local font = style.font
   local x, y, w, h = dv_button_rect(self)
   local border = common.round(1 * SCALE)
-  local bg, fg
-  if self.md_preview_btn_hover then
-    bg, fg = style.accent, style.background
-  else
-    bg = is_dark() and { 255, 255, 255, 22 } or { 0, 0, 0, 18 }
-    fg = style.text
-  end
+  local bg, fg = button_colors(self.md_preview_btn_hover)
+  bg[4] = 235
   renderer.draw_rect(x - border, y - border, w + border * 2, h + border * 2, style.divider)
   renderer.draw_rect(x, y, w, h, bg)
   common.draw_text(font, fg, label, "center", x, y, w, h)

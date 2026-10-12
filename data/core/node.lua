@@ -545,8 +545,15 @@ function Node:draw_tab_title(view, font, is_active, is_hovered, x, y, w, h)
     end
   end
   local color = style.tab_dim or style.dim
-  if is_active then color = style.text end
-  if is_hovered then color = style.tab_hover_text or style.text end
+  -- tab_hover_text is designed for the light hover background, which is only
+  -- drawn on inactive tabs (see draw_tab_borders); the active tab keeps its
+  -- dark chip on hover, so it must keep tab_active_text or the filename
+  -- becomes dark-on-dark
+  if is_active then
+    color = style.tab_active_text or style.text
+  elseif is_hovered then
+    color = style.tab_hover_text or style.text
+  end
   common.draw_text(font, color, text, align, x, y, w, h)
 end
 
@@ -583,7 +590,7 @@ function Node:draw_tab(view, is_active, is_hovered, is_close_hovered, x, y, w, h
   local cx, cw, cpad = close_button_location(x, w)
   local show_close_button = ((is_active or is_hovered) and not standalone and config.tab_close_button)
   if show_close_button then
-    local close_style = is_close_hovered and style.text or style.dim
+    local close_style = is_close_hovered and style.text or (style.tab_dim or style.dim)
     common.draw_text(style.icon_font, close_style, "C", nil, cx, y, cw, h)
   elseif not standalone and view.doc and view.doc.is_dirty and view.doc:is_dirty() then
     -- Sublime's modified-file marker: a small dot in the close slot; hovering

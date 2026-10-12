@@ -64,6 +64,9 @@ style.modified = { common.color "#2979ff" }
 
 -- Sidebar specific colors (used by treeview)
 style.sidebar_text = { common.color "#333333" }
+-- Text drawn on the light chrome surfaces (status bar, title bar, command
+-- view): style.text is tuned for the dark editor and is unreadable there
+style.chrome_text = { common.color "#333333" }
 style.sidebar_accent = { common.color "#2979ff" }
 style.sidebar_dim = { common.color "#999999" }
 style.sidebar_line_highlight = { common.color "#d6ebff" } -- light blue for light sidebar

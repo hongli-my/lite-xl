@@ -16,6 +16,14 @@ style.line_highlight = { common.color "#f2f2f2" }
 style.scrollbar = { common.color "#e0e0e0" }
 style.scrollbar2 = { common.color "#c0c0c0" }
 
+-- Tab + tooltip colours (fork additions; without them the inactive tab text
+-- falls back to style.dim and becomes unreadable on the light chrome)
+style.tab_dim = { common.color "#767676" }        -- Inactive tab text
+style.tab_hover = { common.color "#dcdcdc" }      -- Inactive tab hover background
+style.tab_hover_text = { common.color "#111111" } -- Inactive tab hover text
+style.tab_active_text = { common.color "#181818" }-- Active tab text
+style.tooltip_background = { common.color "#272822" } -- Dark overlay like the fork's other themes
+
 style.syntax["normal"] = { common.color "#181818" }
 style.syntax["symbol"] = { common.color "#181818" }
 style.syntax["comment"] = { common.color "#22a21f" }

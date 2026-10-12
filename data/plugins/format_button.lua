@@ -48,6 +48,16 @@ local function is_inside(dv, x, y)
   return x >= bx and x <= bx + bw and y >= by and y <= by + bh
 end
 
+---Linear blend of two {r,g,b,a} colours, t=0 -> a, t=1 -> b.
+local function blend_color(a, b, t)
+  return {
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+    a[3] + (b[3] - a[3]) * t,
+    a[4] + (b[4] - a[4]) * t,
+  }
+end
+
 
 function DocView:draw_format_button()
   if not get_formatter(self) then return end
@@ -57,16 +67,18 @@ function DocView:draw_format_button()
   local background
   local text_color
   if self.format_button_hovered then
-    background = { table.unpack(style.line_highlight) }
+    -- accent chip with the editor background for the label: unmistakable
+    -- feedback on both light and dark themes
+    background = { table.unpack(style.accent) }
     background[4] = 255
-    text_color = style.accent
+    text_color = style.background
   else
-    -- dark background matching the editor (the button floats over the editor),
-    -- with the accent colour for the label instead of the unreadable light
-    -- text on light background
-    background = { table.unpack(style.background) }
+    -- a chip blended towards the text colour becomes dark on a light theme
+    -- and light on a dark one, so the floating button never melts into the
+    -- editor background the way a theme-fixed colour would
+    background = blend_color(style.background, style.text, 0.8)
     background[4] = button_alpha
-    text_color = style.accent
+    text_color = blend_color(style.background, style.text, 0.1)
   end
 
   renderer.draw_rect(x - border_width, y - border_width,

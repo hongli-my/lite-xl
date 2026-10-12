@@ -58,6 +58,21 @@ function TitleView:on_scale_change()
 end
 
 function TitleView:update()
+  -- While in fullscreen the title bar is hidden; temporarily reveal it when
+  -- the mouse hovers the top edge so the window controls (close, unfullscreen
+  -- via the restore button) stay reachable, and hide it again once the mouse
+  -- moves back into the editor.
+  if core.window_mode == "fullscreen" then
+    local h = title_view_height()
+    local mouse_y = core.root_view and core.root_view.mouse.y or -1
+    if not self.visible and mouse_y >= 0 and mouse_y <= h then
+      self.visible = true
+      self:configure_hit_test(true)
+    elseif self.visible and mouse_y > h * 2 then
+      self.visible = false
+      self:configure_hit_test(false)
+    end
+  end
   self.size.y = self.visible and title_view_height() or 0
   title_commands[2] = core.window_mode == "maximized" and restore_command or maximize_command
   TitleView.super.update(self)
@@ -67,7 +82,7 @@ end
 function TitleView:draw_window_title()
   local h = style.font:get_height()
   local ox, oy = self:get_content_offset()
-  local color = style.text
+  local color = style.chrome_text or style.text
   local x, y = ox + style.padding.x, oy + style.padding.y
   common.draw_text(style.icon_font, icon_colors.bg, "5", nil, x, y, 0, h)
   common.draw_text(style.icon_font, icon_colors.color6, "6", nil, x, y, 0, h)
@@ -98,7 +113,7 @@ end
 
 function TitleView:draw_window_controls()
   for item, x, y, w, h in self:each_control_item() do
-    local color = item == self.hovered_item and style.text or style.dim
+    local color = item == self.hovered_item and (style.chrome_text or style.text) or style.dim
     common.draw_text(style.icon_font, color, item.symbol, nil, x, y, 0, h)
   end
 end

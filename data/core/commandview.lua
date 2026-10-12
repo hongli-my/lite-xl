@@ -368,7 +368,7 @@ end
 function CommandView:draw_line_gutter(idx, x, y)
   local yoffset = self:get_line_text_y_offset()
   local pos = self.position
-  local color = common.lerp(style.text, style.accent, self.gutter_text_brightness / 100)
+  local color = common.lerp(style.chrome_text or style.text, style.accent, self.gutter_text_brightness / 100)
   core.push_clip_rect(pos.x, pos.y, self:get_gutter_width(), self.size.y)
   x = x + style.padding.x
   renderer.draw_text(self:get_font(), self.label, x, y + yoffset, color)
@@ -389,7 +389,7 @@ end
 ---sublime-style match highlighting.  Groups consecutive same-style runs so a
 ---filename costs a handful of draw calls.
 local function draw_text_with_hits(font, text, hits, x, y)
-  local base, hit_col = style.dim, style.text
+  local base, hit_col = style.dim, style.chrome_text or style.text
   local run_start, run_hit, cx = 1, nil, x
   local pos, len = 1, #text
   while pos <= len do

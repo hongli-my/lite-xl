@@ -607,13 +607,15 @@ end
 ---@param draw_fn fun(font,color,text,align, x,y,w,h):number
 local function draw_items(self, items, x, y, draw_fn)
   local font = style.font
-  local color = style.text
+  local color = style.chrome_text or style.text
 
   for _, item in ipairs(items) do
     if Object.is(item, renderer.font) then
       font = item
     elseif type(item) == "table" then
-      color = item
+      -- generic style.text items are drawn over the light chrome, so resolve
+      -- them to the chrome text colour (themes with a light status bar set it)
+      color = item == style.text and (style.chrome_text or style.text) or item
     else
       x = draw_fn(font, color, item, nil, x, y, 0, self.size.y)
     end
@@ -680,7 +682,7 @@ function StatusView:draw_item_tooltip(item)
       text,
       x + (style.padding.x * 2),
       self.position.y - h - style.padding.y,
-      style.text
+      style.chrome_text or style.text
     )
   end)
 end
