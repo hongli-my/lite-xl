@@ -30,6 +30,10 @@ end
 config.plugins.treeview = common.merge({
   -- Default treeview width
   size = 200 * SCALE,
+  -- Sublime-style preview tabs: a single click opens the file as a preview
+  -- tab (italic title, replaced by the next single-clicked file); editing the
+  -- file or double-clicking its item turns it into a regular tab.
+  preview_tabs = true,
   highlight_focused_file = true,
   expand_dirs_to_focused_file = false,
   scroll_to_focused_file = false,
@@ -376,167 +380,18 @@ function TreeView:draw_tooltip()
 end
 
 
--- Nerd Font file icon mappings (unicode codepoints)
--- https://www.nerdfonts.com/cheat-sheet
-local file_icons = {
-  -- dirs (using Font Awesome icons which are stable across Nerd Font versions)
-  dir_closed = "\u{f07b}",  -- 
-  dir_open   = "\u{f07c}",  -- 
-  -- by extension
-  lua    = "\u{e620}",  -- 
-  py     = "\u{e73c}",  -- 
-  js     = "\u{e74e}",  -- 
-  ts     = "\u{e628}",  -- 
-  html   = "\u{e736}",  -- 
-  css    = "\u{e749}",  -- 
-  json   = "\u{e60b}",  -- 
-  md     = "\u{e609}",  -- 
-  txt    = "\u{f15c}",  --  (fa-file_text)
-  xml    = "\u{e736}",  -- 
-  yaml   = "\u{e60b}",  -- 
-  yml    = "\u{e60b}",  -- 
-  toml   = "\u{e60b}",  -- 
-  sh     = "\u{e615}",  -- 
-  bash   = "\u{e615}",  -- 
-  zsh    = "\u{e615}",  -- 
-  fish   = "\u{e615}",  -- 
-  c      = "\u{e61e}",  -- 
-  h      = "\u{e61e}",  -- 
-  cpp    = "\u{e61d}",  -- 
-  hpp    = "\u{e61d}",  -- 
-  cc     = "\u{e61d}",  -- 
-  go     = "\u{e627}",  -- 
-  rs     = "\u{e7a8}",  -- 
-  java   = "\u{e738}",  -- 
-  rb     = "\u{e739}",  -- 
-  php    = "\u{e73d}",  -- 
-  swift  = "\u{e755}",  -- 
-  kt     = "\u{e634}",  -- 
-  sql    = "\u{e70e}",  -- 
-  git    = "\u{e702}",  -- 
-  docker = "\u{e650}",  -- 
-  lock   = "\u{f023}",  -- 
-  img    = "\u{e60d}",  -- 
-  png    = "\u{e60d}",  -- 
-  jpg    = "\u{e60d}",  -- 
-  svg    = "\u{e60d}",  -- 
-  gif    = "\u{e60d}",  -- 
-  conf   = "\u{e615}",  -- 
-  cfg    = "\u{e615}",  -- 
-  ini    = "\u{e615}",  -- 
-  log    = "\u{f15c}",  --  (fa-file_text)
-  -- by filename
-  Makefile      = "\u{e673}",  -- 
-  Dockerfile    = "\u{e650}",  -- 
-  README        = "\u{e609}",  -- 
-  LICENSE       = "\u{f023}",  -- 
-  [".gitignore"]  = "\u{e702}",  -- 
-  [".env"]        = "\u{e615}",  -- 
-  [".gitmodules"] = "\u{e702}",  -- 
-}
-local default_file_icon = "\u{f15b}"  --  (fa-file)
-
--- File icon colors for a Sublime-Text-like file icon experience
--- Each entry is a color table {r, g, b, a}
-local file_icon_colors = {
-  -- dirs
-  dir_closed = { common.color "#555555" },
-  dir_open   = { common.color "#555555" },
-  -- Web / markup
-  html   = { common.color "#e44d26" },  -- orange
-  css    = { common.color "#264de4" },  -- blue
-  js     = { common.color "#f7df1e" },  -- yellow
-  ts     = { common.color "#3178c6" },  -- blue
-  json   = { common.color "#f7df1e" },  -- yellow
-  xml    = { common.color "#ff6600" },  -- orange
-  svg    = { common.color "#ff9900" },  -- orange
-  -- Python
-  py     = { common.color "#3776ab" },  -- python blue
-  -- Lua
-  lua    = { common.color "#000080" },  -- navy blue
-  -- C / C++
-  c      = { common.color "#555555" },  -- gray
-  h      = { common.color "#a8b9cc" },  -- light blue-gray
-  cpp    = { common.color "#659ad2" },  -- blue
-  hpp    = { common.color "#659ad2" },  -- blue
-  cc     = { common.color "#659ad2" },  -- blue
-  -- Go
-  go     = { common.color "#00add8" },  -- go blue
-  -- Rust
-  rs     = { common.color "#dea584" },  -- rust brown
-  -- Java
-  java   = { common.color "#b07219" },  -- java brown
-  -- Ruby
-  rb     = { common.color "#cc342d" },  -- ruby red
-  -- PHP
-  php    = { common.color "#4f5d95" },  -- php purple
-  -- Swift
-  swift  = { common.color "#ffac45" },  -- swift orange
-  -- Kotlin
-  kt     = { common.color "#a97bff" },  -- kotlin purple
-  -- SQL
-  sql    = { common.color "#555555" },  -- gray
-  -- Shell
-  sh     = { common.color "#89e051" },  -- green
-  bash   = { common.color "#89e051" },  -- green
-  zsh    = { common.color "#89e051" },  -- green
-  fish   = { common.color "#89e051" },  -- green
-  -- Git
-  git    = { common.color "#f05032" },  -- git orange
-  -- Docker
-  docker = { common.color "#2496ed" },  -- docker blue
-  -- Config / settings
-  conf   = { common.color "#555555" },  -- gray
-  cfg    = { common.color "#555555" },  -- gray
-  ini    = { common.color "#555555" },  -- gray
-  toml   = { common.color "#9c4221" },  -- toml brown
-  yml    = { common.color "#cb171e" },  -- yaml red
-  yaml   = { common.color "#cb171e" },  -- yaml red
-  env    = { common.color "#f7df1e" },  -- yellow
-  -- Markdown / text
-  md     = { common.color "#555555" },  -- gray
-  txt    = { common.color "#555555" },  -- gray
-  log    = { common.color "#555555" },  -- gray
-  -- Images
-  img    = { common.color "#a063eb" },  -- purple
-  png    = { common.color "#a063eb" },  -- purple
-  jpg    = { common.color "#a063eb" },  -- purple
-  gif    = { common.color "#a063eb" },  -- purple
-  -- Lock files
-  lock   = { common.color "#de5c38" },  -- red-orange
-  -- by filename
-  Makefile      = { common.color "#427819" },  -- green
-  Dockerfile    = { common.color "#2496ed" },  -- docker blue
-  README        = { common.color "#555555" },  -- gray
-  LICENSE       = { common.color "#cb171e" },  -- red
-  [".gitignore"]  = { common.color "#f05032" },  -- git orange
-  [".env"]        = { common.color "#f7df1e" },  -- yellow
-  [".gitmodules"] = { common.color "#f05032" },  -- git orange
-}
-local default_file_icon_color = { common.color "#555555" }
+-- File type icons: shared module, also used by the quick-open palette and
+-- the tabs so every surface shows the same glyph for a file.
+local file_icons = require "plugins.file_icons"
+local default_file_icon = file_icons.default_icon
+local default_file_icon_color = file_icons.default_color
 
 local function get_file_icon(name, is_dir, expanded)
-  if is_dir then
-    return expanded and file_icons.dir_open or file_icons.dir_closed
-  end
-  -- exact filename match first
-  local basename = name:match("([^/]+)$") or name
-  if file_icons[basename] then return file_icons[basename] end
-  -- then extension
-  local ext = basename:match("%.([^.]+)$")
-  if ext and file_icons[ext] then return file_icons[ext] end
-  return default_file_icon
+  return file_icons.icon(name, is_dir, expanded)
 end
 
 local function get_file_icon_color(name, is_dir)
-  if is_dir then
-    return file_icon_colors.dir_closed
-  end
-  local basename = name:match("([^/]+)$") or name
-  if file_icon_colors[basename] then return file_icon_colors[basename] end
-  local ext = basename:match("%.([^.]+)$")
-  if ext and file_icon_colors[ext] then return file_icon_colors[ext] end
-  return default_file_icon_color
+  return file_icons.color(name, is_dir)
 end
 
 function TreeView:get_item_icon(item, active, hovered)
@@ -705,9 +560,50 @@ function TreeView:toggle_expand(toggle, item)
   end
 end
 
-function TreeView:open_doc(filename)
-  core.root_view:open_doc(core.open_doc(filename))
+-- the view currently shown as a preview tab, plus double-click detection
+local preview_view = nil
+local last_open = { filename = nil, time = 0 }
+
+function TreeView:open_doc(filename, preview)
+  -- Sublime-style preview tabs: a single click opens the file as a preview
+  -- (italic tab title); clicking another file reuses that tab instead of
+  -- piling up tabs.  The preview becomes a real tab once the file is edited
+  -- (lazy-pinned in Node:draw_tab_title) or the item is double-clicked.
+  if preview and not config.plugins.treeview.preview_tabs then
+    preview = false
+  end
+  if preview then
+    -- already open as a regular (non-preview) tab anywhere: just focus it
+    for _, v in ipairs(core.root_view.root_node:get_children()) do
+      if v.doc and v ~= preview_view and v.doc.abs_filename == filename then
+        core.root_view:open_doc(v.doc)
+        return v
+      end
+    end
+  end
+  if preview and preview_view then
+    if preview_view.doc and preview_view.doc.abs_filename == filename then
+      -- same file again (the second press of a double-click): just focus it
+      core.set_active_view(preview_view)
+      return preview_view
+    end
+    local node = core.root_view.root_node:get_node_for_view(preview_view)
+    if node and not preview_view.doc:is_dirty() then
+      node:remove_view(core.root_view.root_node, preview_view)
+    end
+    preview_view = nil
+  end
+  local opened = core.root_view:open_doc(core.open_doc(filename))
+  local dv = opened
+  if preview and dv and dv:is(DocView) and dv.doc then
+    dv.preview_tab = true
+    preview_view = dv
+  end
+  return opened
 end
+
+-- the view currently shown as a preview tab, plus double-click detection
+-- (second declaration below TreeView:open_doc kept for readability)
 
 -- init
 local view = TreeView()
@@ -768,14 +664,14 @@ local function treeitem() return view.hovered_item or view.selected_item end
 
 function TreeView:on_context_menu()
   return { items = {
-    { text = "Open in System", command = "treeview:open-in-system" },
+    { text = "Open in System", icon = "\u{f08e}", command = "treeview:open-in-system" },
     ContextMenu.DIVIDER,
-    { text = "Rename", command = "treeview:rename" },
-    { text = "Delete", command = "treeview:delete" },
-    { text = "New File", command = "treeview:new-file" },
-    { text = "New Folder", command = "treeview:new-folder" },
-    { text = "Remove directory", command = "treeview:remove-project-directory" },
-    { text = "Find in Directory", command = "treeview:search-in-directory" }
+    { text = "Rename", icon = "\u{f044}", command = "treeview:rename" },
+    { text = "Delete", icon = "\u{f014}", command = "treeview:delete" },
+    { text = "New File", icon = "\u{f016}", command = "treeview:new-file" },
+    { text = "New Folder", icon = "\u{f65f}", command = "treeview:new-folder" },
+    { text = "Remove directory", icon = "\u{f068}", command = "treeview:remove-project-directory" },
+    { text = "Find in Directory", icon = "\u{f002}", command = "treeview:search-in-directory" }
   } }, self
 end
 
@@ -943,10 +839,29 @@ command.add(TreeView, {
   end,
 
   ["treeview:select-and-open"] = function()
-    if view.hovered_item then
-      view:set_selection(view.hovered_item)
+    local item = view.hovered_item
+    if not item then return end
+    view:set_selection(item)
+    if item.type == "dir" then
       command.perform "treeview:open"
+      return
     end
+    -- single click opens a preview tab; a quick second click on the same item
+    -- pins it (Sublime's double-click)
+    local now = system.get_time()
+    local is_double = last_open.filename == item.abs_filename
+      and (now - last_open.time) < 0.35
+    last_open.filename, last_open.time = item.abs_filename, now
+    core.try(function()
+      if core.last_active_view and core.active_view == view then
+        core.set_active_view(core.last_active_view)
+      end
+      view:open_doc(item.abs_filename, not is_double)
+      if is_double and preview_view then
+        preview_view.preview_tab = nil
+        preview_view = nil
+      end
+    end)
   end,
 
   ["treeview:collapse"] = function()

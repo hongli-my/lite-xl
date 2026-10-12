@@ -413,6 +413,16 @@ local function draw_text_with_hits(font, text, hits, x, y)
 end
 
 
+---Linear blend of two {r,g,b,a} colours, t=0 -> a, t=1 -> b.
+local function blend(a, b, t)
+  return {
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+    a[3] + (b[3] - a[3]) * t,
+    a[4] + (b[4] - a[4]) * t,
+  }
+end
+
 local function draw_suggestions_box(self)
   local lh = self:get_suggestion_line_height()
   local dh = style.divider_size
@@ -425,8 +435,11 @@ local function draw_suggestions_box(self)
   if #self.suggestions > 0 then
     renderer.draw_rect(rx, ry, rw, rh, style.background3)
     renderer.draw_rect(rx, ry - dh, rw, dh, style.divider)
+    -- the selected row follows the accent colour instead of style.line_highlight,
+    -- which is tuned for the editor background and turns into a dark band on a
+    -- light command palette
     local y = self.position.y - self.selection_offset - dh
-    renderer.draw_rect(rx, y, rw, lh, style.line_highlight)
+    renderer.draw_rect(rx, y, rw, lh, blend(style.background3, style.accent, 0.25))
   end
 
   -- draw suggestion text
@@ -436,10 +449,19 @@ local function draw_suggestions_box(self)
     local item = self.suggestions[i]
     local color = style.accent
     local y = self.position.y - (i - first + 1) * lh - dh
+    -- optional leading file-type icon (Nerd Font glyph supplied by the
+    -- suggestion source, e.g. the quick-open palette)
+    local text_x = x
+    if item.icon and style.nerd_font then
+      local iw = style.nerd_font:get_width(item.icon)
+      common.draw_text(style.nerd_font, item.icon_color or style.dim,
+        item.icon, nil, text_x, y, 0, lh)
+      text_x = text_x + iw + style.padding.x / 2
+    end
     if item.hits and next(item.hits) then
-      draw_text_with_hits(self:get_font(), item.text, item.hits, x, y)
+      draw_text_with_hits(self:get_font(), item.text, item.hits, text_x, y)
     else
-      common.draw_text(self:get_font(), color, item.text, nil, x, y, 0, lh)
+      common.draw_text(self:get_font(), color, item.text, nil, text_x, y, 0, lh)
     end
 
     if item.info then

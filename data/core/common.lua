@@ -228,12 +228,14 @@ end
 ---@return table[]
 function common.fuzzy_match_with_recents_highlighted(haystack, recents, needle)
   if needle == "" then
-    -- same ordering as fuzzy_match_with_recents, minus the highlighting
+    -- same ordering as fuzzy_match_with_recents, minus the highlighting;
+    -- `hits = {}` renders the full name in the suggestion colour instead of
+    -- the dim hit-miss palette used while typing
     local res = {}
-    for i = 2, #recents do table.insert(res, { text = recents[i] }) end
-    if recents[1] then table.insert(res, { text = recents[1] }) end
+    for i = 2, #recents do table.insert(res, { text = recents[i], hits = {} }) end
+    if recents[1] then table.insert(res, { text = recents[1], hits = {} }) end
     local others = common.fuzzy_match(haystack, "", true)
-    for i = 1, #others do table.insert(res, { text = others[i] }) end
+    for i = 1, #others do table.insert(res, { text = others[i], hits = {} }) end
     return res
   end
   return fuzzy_match_items_highlighted(haystack, needle, true)

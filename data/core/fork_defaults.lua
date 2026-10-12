@@ -115,6 +115,9 @@ style.font = font_group("/FiraSans-Regular.ttf", 14 * SCALE, UI_FONT_OPTS)
 style.code_font = font_group("/JetBrainsMono-Regular.ttf", 14 * SCALE, CODE_FONT_OPTS)
 -- the welcome screen uses a copy of the UI font: keep the fallbacks
 style.big_font = style.font:copy(46 * SCALE)
+-- italic face for Sublime-style preview tabs (single click in the treeview)
+style.tab_preview_font = font_group("/FiraSans-Regular.ttf", 14 * SCALE,
+  { antialiasing = "grayscale", hinting = "full", italic = true })
 
 -- File type icons used by the treeview.
 style.nerd_font = try_font(fonts_dir .. "/JetBrainsMonoNerdFontMono-Regular.ttf",

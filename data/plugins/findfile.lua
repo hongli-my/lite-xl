@@ -53,6 +53,9 @@ command.add(nil, {
       end)
     end
     local original_files
+    -- file-type icons for the suggestion rows (same glyphs as the treeview);
+    -- optional: the palette works without the icons module
+    local icon_ok, file_icons = pcall(require, "plugins.file_icons")
     core.command_view:enter("Open File From Project", {
       submit = function(text, item)
         text = item and item.text or text
@@ -64,6 +67,13 @@ command.add(nil, {
           return original_files
         end
         original_files = common.fuzzy_match_with_recents_highlighted(files, core.visited_files, text)
+        if icon_ok then
+          for _, item in ipairs(original_files) do
+            local name = item.text:match("([^/\\]+)$") or item.text
+            item.icon = file_icons.icon(name, false)
+            item.icon_color = file_icons.color(name, false)
+          end
+        end
         return original_files
       end,
       cancel = function()

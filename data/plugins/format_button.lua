@@ -88,6 +88,19 @@ function DocView:draw_format_button()
 end
 
 
+-- Reserve the button's width through the DocView right inset so that wrapped
+-- lines break before the button instead of running underneath it (the same
+-- mechanism the minimap and the preview button use).
+local old_get_right_inset = DocView.get_right_inset
+function DocView:get_right_inset()
+  local inset = old_get_right_inset(self)
+  if get_formatter(self) then
+    local _, _, w = get_button_rect(self)
+    inset = inset + w + style.padding.x / 2
+  end
+  return inset
+end
+
 local old_draw = DocView.draw
 function DocView:draw(...)
   old_draw(self, ...)

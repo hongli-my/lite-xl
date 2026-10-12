@@ -880,12 +880,12 @@ end
 
 function DocView:on_context_menu()
   return { items = {
-    { text = "Cut",     command = "doc:cut" },
-    { text = "Copy",    command = "doc:copy" },
-    { text = "Paste",   command = "doc:paste" },
+    { text = "Cut",     icon = "\u{f0c4}", command = "doc:cut" },
+    { text = "Copy",    icon = "\u{f0c5}", command = "doc:copy" },
+    { text = "Paste",   icon = "\u{f0ea}", command = "doc:paste" },
     ContextMenu.DIVIDER,
-    { text = "Find",    command = "find-replace:find"    },
-    { text = "Replace", command = "find-replace:replace" }
+    { text = "Find",    icon = "\u{f002}", command = "find-replace:find"    },
+    { text = "Replace", icon = "\u{f363}", command = "find-replace:replace" }
   } }, self
 end
 

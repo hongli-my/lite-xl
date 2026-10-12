@@ -5,10 +5,20 @@ local keymap = require "core.keymap"
 local style = require "core.style"
 local View = require "core.view"
 
-local border_width = 1
+local border_width = math.max(1, common.round(1 * SCALE))
 local divider_width = 1
 local divider_padding = 5
 local DIVIDER = {}
+
+---Linear blend of two {r,g,b,a} colours, t=0 -> a, t=1 -> b.
+local function blend(a, b, t)
+  return {
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+    a[3] + (b[3] - a[3]) * t,
+    a[4] + (b[4] - a[4]) * t,
+  }
+end
 
 ---An item in the context menu.
 ---
@@ -55,10 +65,15 @@ local function get_item_size(item)
     lh = divider_width + divider_padding * SCALE * 2
   else
     lw = style.font:get_width(item.text)
+    -- optional leading icon (Nerd Font glyph), with a gap to the text
+    if item.icon and style.nerd_font then
+      lw = lw + style.nerd_font:get_width(item.icon) + style.padding.x
+    end
     if item.info then
       lw = lw + style.padding.x + style.font:get_width(item.info)
     end
-    lh = style.font:get_height() + style.padding.y
+    -- a touch taller than font + padding so the rows breathe, like Sublime's
+    lh = style.font:get_height() + style.padding.y + common.round(2 * SCALE)
   end
   return lw, lh
 end
@@ -231,24 +246,50 @@ function ContextMenu:draw()
   if not self.items then return end
   local bx, by, bw, bh = self.position.x, self.position.y, self.items.width, self.height
 
-  renderer.draw_rect(
-    bx - border_width,
-    by - border_width,
-    bw + (border_width * 2),
-    bh + (border_width * 2),
-    style.divider
-  )
-  renderer.draw_rect(bx, by, bw, bh, style.contextmenu_background or style.background3)
+  -- Sublime-style skin: rounded panel with a layered frame (a faint outer
+  -- ring reads as depth where a real shadow is not available), rows hover as
+  -- inset rounded chips and dividers are short and quiet instead of being
+  -- full-width light lines.
+  local bg = style.contextmenu_background or style.background3
+  local radius = math.max(3, common.round(6 * SCALE))
+  local item_radius = math.max(2, radius - 3)
+  local item_inset = common.round(4 * SCALE)
+  local ring = blend(bg, style.text, 0.30)
+  local shadow = blend(bg, style.text, 0.12)
+  local hover = blend(bg, style.text, 0.16)
+  local divider = blend(bg, style.text, 0.18)
+
+  renderer.draw_rounded_rect(
+    bx - border_width * 2, by - border_width * 2,
+    bw + border_width * 4, bh + border_width * 4,
+    radius + 2, shadow)
+  renderer.draw_rounded_rect(
+    bx - border_width, by - border_width,
+    bw + border_width * 2, bh + border_width * 2,
+    radius + 1, ring)
+  renderer.draw_rounded_rect(bx, by, bw, bh, radius, bg)
 
   for i, item, x, y, w, h in self:each_item() do
     if item == DIVIDER then
-      renderer.draw_rect(x, y + divider_padding * SCALE, w, divider_width, style.divider)
+      renderer.draw_rect(
+        x + style.padding.x, y + divider_padding * SCALE,
+        w - style.padding.x * 2, divider_width, divider)
     else
       if i == self.selected then
-        renderer.draw_rect(x, y, w, h, style.selection)
+        renderer.draw_rounded_rect(
+          x + item_inset, y + SCALE,
+          w - item_inset * 2, h - SCALE * 2,
+          item_radius, hover)
       end
 
-      common.draw_text(style.font, style.text, item.text, "left", x + style.padding.x, y, w, h)
+      local text_x = x + style.padding.x
+      if item.icon and style.nerd_font then
+        local iw = style.nerd_font:get_width(item.icon)
+        common.draw_text(style.nerd_font, item.icon_color or style.dim,
+          item.icon, nil, text_x, y, 0, h)
+        text_x = text_x + iw + style.padding.x
+      end
+      common.draw_text(style.font, style.text, item.text, "left", text_x, y, w, h)
       if item.info then
         common.draw_text(style.font, style.dim, item.info, "right", x, y, w - style.padding.x, h)
       end

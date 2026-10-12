@@ -195,10 +195,13 @@ end
 
 local old_get_right_inset = DocView.get_right_inset
 function DocView:get_right_inset()
+  -- additive: other widgets (the preview / format buttons) may reserve width
+  -- through the same hook, and whoever loads last must not discard it
+  local inset = old_get_right_inset(self)
   if active(self) then
-    return config.plugins.minimap.width + PAD
+    return inset + config.plugins.minimap.width + PAD
   end
-  return old_get_right_inset(self)
+  return inset
 end
 
 local old_draw_overlay = DocView.draw_overlay

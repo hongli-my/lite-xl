@@ -738,7 +738,10 @@ function MarkdownPreviewView:compute_layout()
   local show_ln = cfg.show_line_numbers_in_preview
   local pad = style.padding
   local gw = show_ln and (style.font:get_width(tostring(#self.doc.lines)) + pad.x * 2) or 0
-  local full_w = math.max(50, self.size.x - gw - pad.x * 2)
+  -- keep the wrapped column clear of the floating "编辑" toggle in the
+  -- top-right corner: reserve the button's width plus a gap
+  local _, _, btn_w = self:get_button_rect()
+  local full_w = math.max(50, self.size.x - gw - pad.x * 2 - btn_w - pad.x)
   -- left-aligned content column (full available width)
   local avail_w = full_w
   local x0 = pad.x + gw
@@ -1333,6 +1336,19 @@ end
 local function dv_button_hit(dv, x, y)
   local bx, by, bw, bh = dv_button_rect(dv)
   return x >= bx and x <= bx + bw and y >= by and y <= by + bh
+end
+
+-- The floating button must not sit on top of the text: reserve its width
+-- through the DocView right inset, so wrapped lines break before reaching it
+-- (the same mechanism the minimap uses).
+local orig_dv_get_right_inset = DocView.get_right_inset
+function DocView:get_right_inset()
+  local inset = orig_dv_get_right_inset(self)
+  if is_markdown_docview(self) then
+    local _, _, bw = dv_button_rect(self)
+    inset = inset + bw + style.padding.x / 2
+  end
+  return inset
 end
 
 local orig_dv_draw = DocView.draw

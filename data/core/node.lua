@@ -19,6 +19,18 @@ end
 ---@class core.node : core.object
 local Node = Object:extend()
 
+-- Optional file-type icons on the tabs, provided by the shared
+-- plugins.file_icons module when it is present (it ships with this fork;
+-- loading is guarded so the core never depends on a plugin being enabled).
+local file_icons = false
+local function get_file_icon_module()
+  if file_icons == false then
+    local ok, mod = pcall(require, "plugins.file_icons")
+    file_icons = ok and mod or nil
+  end
+  return file_icons
+end
+
 function Node:__tostring() return "Node" end
 
 function Node:new(type)
@@ -531,6 +543,14 @@ function Node:update()
 end
 
 function Node:draw_tab_title(view, font, is_active, is_hovered, x, y, w, h)
+  -- editing the file pins a preview tab
+  if view and view.preview_tab and view.doc and view.doc:is_dirty() then
+    view.preview_tab = nil
+  end
+  -- Sublime-style preview tab: italic title
+  if view and view.preview_tab and style.tab_preview_font then
+    font = style.tab_preview_font
+  end
   local text = view and view:get_name() or ""
   local dots_width = font:get_width("…")
   local align = "center"
@@ -599,11 +619,24 @@ function Node:draw_tab(view, is_active, is_hovered, is_close_hovered, x, y, w, h
     renderer.draw_rounded_rect(cx, y + (h - dot) / 2, dot, dot, dot / 2,
       blend_color(style.background, style.text, 0.65))
   end
-  -- Title
-  x = x + cpad
-  w = cx - x
-  core.push_clip_rect(x, y, w, h)
-  self:draw_tab_title(view, style.font, is_active, is_hovered, x, y, w, h)
+  -- Title, optionally preceded by the file-type icon (same glyph family as
+  -- the treeview; disable with config.tab_file_icons = false)
+  local title_x = x + cpad
+  if config.tab_file_icons ~= false and view and view.doc and view.doc.filename then
+    local fi = get_file_icon_module()
+    if fi then
+      local glyph = fi.icon(view.doc.filename, false)
+      local ifont = fi.font()
+      local iw = ifont:get_width(glyph)
+      local lh = ifont:get_height()
+      common.draw_text(ifont, fi.color(view.doc.filename, false), glyph,
+        nil, title_x, y + (h - lh) / 2, 0, lh)
+      title_x = title_x + iw + math.max(2, common.round(3 * SCALE))
+    end
+  end
+  w = cx - title_x
+  core.push_clip_rect(title_x, y, w, h)
+  self:draw_tab_title(view, style.font, is_active, is_hovered, title_x, y, w, h)
   core.pop_clip_rect()
 end
 

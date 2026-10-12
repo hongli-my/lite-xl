@@ -24,7 +24,6 @@ cd "$(dirname "$0")/.." || exit 1
 TREEVIEW=data/plugins/treeview.lua
 TARGET=data/fonts/JetBrainsMonoNerdFontMono-Regular.ttf
 SRC=${1:-$TARGET}
-
 if [ ! -f "$SRC" ]; then
   echo "error: font not found: $SRC" >&2
   exit 1
@@ -37,7 +36,10 @@ if [ "$src_size" -lt 500000 ]; then
   exit 1
 fi
 
-icons=$(grep -o '\\u{[0-9a-fA-F]*}' "$TREEVIEW" \
+# Codepoints come from every UI file that draws Nerd Font glyphs: the shared
+# file-icon module (file type icons) plus the menus (context menu icons).
+icons=$(cat data/plugins/file_icons.lua "$TREEVIEW" data/core/docview.lua data/core/contextmenu.lua \
+  | grep -o '\\u{[0-9a-fA-F]*}' \
   | sed 's/\\u{/U+/; s/}$//' \
   | sort -u \
   | tr '\n' ',')
