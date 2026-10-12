@@ -88,30 +88,33 @@ function DocView:draw_format_button()
 end
 
 
--- Reserve the button's width through the DocView right inset so that wrapped
--- lines break before the button instead of running underneath it (the same
--- mechanism the minimap and the preview button use).
-local old_get_right_inset = DocView.get_right_inset
-function DocView:get_right_inset()
-  local inset = old_get_right_inset(self)
-  if get_formatter(self) then
-    local _, _, w = get_button_rect(self)
-    inset = inset + w + style.padding.x / 2
-  end
-  return inset
+-- Hover-reveal: hidden until the mouse approaches the top-right corner, so
+-- no width has to be reserved from the wrapped text.
+local function is_near(dv, x, y)
+  local bx, by, bw, bh = get_button_rect(dv)
+  local hx, hy = style.padding.x * 6, style.padding.y * 4
+  return x >= bx - hx and x <= bx + bw + hx and y >= by - hy and y <= by + bh + hy
 end
 
 local old_draw = DocView.draw
 function DocView:draw(...)
   old_draw(self, ...)
-  self:draw_format_button()
+  if self.format_btn_reveal then
+    self:draw_format_button()
+  end
 end
 
 
 local old_on_mouse_moved = DocView.on_mouse_moved
 function DocView:on_mouse_moved(x, y, ...)
   old_on_mouse_moved(self, x, y, ...)
-  local hovered = get_formatter(self) ~= nil and is_inside(self, x, y)
+  local formatter = get_formatter(self) ~= nil
+  local reveal = formatter and is_near(self, x, y)
+  if reveal ~= self.format_btn_reveal then
+    self.format_btn_reveal = reveal
+    core.redraw = true
+  end
+  local hovered = formatter and reveal and is_inside(self, x, y)
   if hovered ~= self.format_button_hovered then
     self.format_button_hovered = hovered
     core.redraw = true
@@ -124,13 +127,14 @@ local old_on_mouse_left = DocView.on_mouse_left
 function DocView:on_mouse_left(...)
   old_on_mouse_left(self, ...)
   self.format_button_hovered = false
+  self.format_btn_reveal = false
 end
 
 
 local old_on_mouse_pressed = DocView.on_mouse_pressed
 function DocView:on_mouse_pressed(button, x, y, clicks)
   local formatter = get_formatter(self)
-  if formatter and button == "left" and is_inside(self, x, y) then
+  if formatter and self.format_btn_reveal and button == "left" and is_inside(self, x, y) then
     -- the format commands act on the active view
     core.set_active_view(self)
     command.perform(formatter.command)

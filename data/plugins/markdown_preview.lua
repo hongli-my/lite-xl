@@ -738,10 +738,7 @@ function MarkdownPreviewView:compute_layout()
   local show_ln = cfg.show_line_numbers_in_preview
   local pad = style.padding
   local gw = show_ln and (style.font:get_width(tostring(#self.doc.lines)) + pad.x * 2) or 0
-  -- keep the wrapped column clear of the floating "编辑" toggle in the
-  -- top-right corner: reserve the button's width plus a gap
-  local _, _, btn_w = self:get_button_rect()
-  local full_w = math.max(50, self.size.x - gw - pad.x * 2 - btn_w - pad.x)
+  local full_w = math.max(50, self.size.x - gw - pad.x * 2)
   -- left-aligned content column (full available width)
   local avail_w = full_w
   local x0 = pad.x + gw
@@ -909,6 +906,7 @@ end
 -- ============================================================
 function MarkdownPreviewView:on_mouse_moved(x, y, ...)
   MarkdownPreviewView.super.on_mouse_moved(self, x, y, ...)
+  self.hovered_pos = { x = x, y = y }
   local bx, by, bw, bh = self:get_button_rect()
   self.hovered_button = (x >= bx and x <= bx + bw and y >= by and y <= by + bh)
   self.hovered_link = nil
@@ -939,6 +937,7 @@ end
 function MarkdownPreviewView:on_mouse_left(...)
   MarkdownPreviewView.super.on_mouse_left(self, ...)
   self.hovered_button = false
+  self.hovered_pos = nil
   self.hovered_link = nil
   self.hovered_copy_btn = nil
   self.hovered_heading = nil
@@ -1030,6 +1029,15 @@ local function button_colors(hovered)
 end
 
 function MarkdownPreviewView:draw_toggle_button()
+  -- hover-reveal like the edit view's "预览" button: hidden until the mouse
+  -- approaches the top-right corner
+  local bx, by, bw, bh = self:get_button_rect()
+  local hx, hy = style.padding.x * 6, style.padding.y * 4
+  local mx = self.hovered_pos
+  if not mx then return end
+  if mx.x < bx - hx or mx.x > bx + bw + hx or mx.y < by - hy or mx.y > by + bh + hy then
+    return
+  end
   local label = config.plugins.markdown_preview.button_label_edit
   local font = style.font
   local x, y, w, h = self:get_button_rect()
@@ -1338,23 +1346,19 @@ local function dv_button_hit(dv, x, y)
   return x >= bx and x <= bx + bw and y >= by and y <= by + bh
 end
 
--- The floating button must not sit on top of the text: reserve its width
--- through the DocView right inset, so wrapped lines break before reaching it
--- (the same mechanism the minimap uses).
-local orig_dv_get_right_inset = DocView.get_right_inset
-function DocView:get_right_inset()
-  local inset = orig_dv_get_right_inset(self)
-  if is_markdown_docview(self) then
-    local _, _, bw = dv_button_rect(self)
-    inset = inset + bw + style.padding.x / 2
-  end
-  return inset
+-- Hover-reveal: the button is hidden until the mouse approaches the
+-- top-right corner, so no width has to be reserved from the wrapped text
+-- (a permanent reservation left a visible empty band at every line end).
+local function dv_button_near(dv, x, y)
+  local bx, by, bw, bh = dv_button_rect(dv)
+  local hx, hy = style.padding.x * 6, style.padding.y * 4
+  return x >= bx - hx and x <= bx + bw + hx and y >= by - hy and y <= by + bh + hy
 end
 
 local orig_dv_draw = DocView.draw
 function DocView:draw(...)
   orig_dv_draw(self, ...)
-  if not is_markdown_docview(self) then return end
+  if not is_markdown_docview(self) or not self.md_btn_reveal then return end
   local label = config.plugins.markdown_preview.button_label_preview
   local font = style.font
   local x, y, w, h = dv_button_rect(self)
@@ -1369,7 +1373,12 @@ end
 local orig_dv_mouse_moved = DocView.on_mouse_moved
 function DocView:on_mouse_moved(x, y, ...)
   orig_dv_mouse_moved(self, x, y, ...)
-  local hov = is_markdown_docview(self) and dv_button_hit(self, x, y)
+  local near = is_markdown_docview(self) and dv_button_near(self, x, y)
+  if near ~= self.md_btn_reveal then
+    self.md_btn_reveal = near
+    core.redraw = true
+  end
+  local hov = near and dv_button_hit(self, x, y)
   if hov ~= self.md_preview_btn_hover then
     self.md_preview_btn_hover = hov
     core.redraw = true
@@ -1381,11 +1390,13 @@ local orig_dv_mouse_left = DocView.on_mouse_left
 function DocView:on_mouse_left(...)
   orig_dv_mouse_left(self, ...)
   self.md_preview_btn_hover = false
+  self.md_btn_reveal = false
 end
 
 local orig_dv_mouse_pressed = DocView.on_mouse_pressed
 function DocView:on_mouse_pressed(button, x, y, clicks)
-  if is_markdown_docview(self) and button == "left" and dv_button_hit(self, x, y) then
+  if is_markdown_docview(self) and self.md_btn_reveal and button == "left"
+      and dv_button_hit(self, x, y) then
     command.perform("markdown-preview:toggle")
     return true
   end

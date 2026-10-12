@@ -220,8 +220,12 @@ end
 
 function LineWrapping.update_docview_breaks(docview)
   local w = docview.v_scrollbar.expanded_size or style.expanded_scrollbar_size
+  -- widgets reserving the right edge (minimap, floating buttons) take part in
+  -- the wrap width: without this, lines are wrapped underneath them and the
+  -- text clip then cuts the overflow, leaving a mysterious gap at line ends
+  local reserved = math.max(docview:get_right_inset(), w or 0)
   local width = (type(config.plugins.linewrapping.width_override) == "function" and config.plugins.linewrapping.width_override(docview))
-    or config.plugins.linewrapping.width_override or (docview.size.x - docview:get_gutter_width() - w)
+    or config.plugins.linewrapping.width_override or (docview.size.x - docview:get_gutter_width() - reserved)
   if (not docview.wrapped_settings or docview.wrapped_settings.width == nil or width ~= docview.wrapped_settings.width) then
     docview.scroll.to.x = 0
     LineWrapping.reconstruct_breaks(docview, docview:get_font(), width)

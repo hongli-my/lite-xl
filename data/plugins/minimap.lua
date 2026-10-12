@@ -23,7 +23,14 @@ config.plugins.minimap = common.merge({
   -- show the minimap strip on the right edge of code views
   visible = true,
   -- strip width in logical pixels
-  width = 80,
+  width = 100,
+  -- zoom of the map: rendered line height in logical pixels
+  line_height = 5,
+  -- "text" renders scaled-down real glyphs (Sublime's look); "blocks" draws
+  -- the cheaper per-token colour bars
+  render = "text",
+  -- column width for the "blocks" renderer, logical pixels
+  column_width = 1.6,
 }, config.plugins.minimap)
 
 local PAD = math.max(2, math.floor(style.padding.x / 2))
@@ -39,9 +46,10 @@ end
 ---Line height inside the map is fixed (Sublime's map is fixed-zoom); the
 ---rendered window slides through long documents.
 local function metrics(dv)
-  local width = config.plugins.minimap.width
-  local mm_lh = math.max(2, common.round(2 * SCALE))
-  local col_w = math.max(1, common.round(1.1 * SCALE))
+  local cfg = config.plugins.minimap
+  local width = cfg.width
+  local mm_lh = math.max(2, common.round(cfg.line_height * SCALE))
+  local col_w = math.max(1, common.round(cfg.column_width * SCALE))
   local map_x = dv.position.x + dv.size.x - width - PAD
   return {
     w = width,
@@ -85,6 +93,21 @@ local function blob_color(type_)
   return c
 end
 
+---A tiny copy of the code font used to render the map as scaled-down real
+---text (Sublime's look).  Rebuilt when the zoom or the code font changes.
+local tiny_font, tiny_font_key
+local function get_tiny_font()
+  local key = string.format("%s:%.2f:%d", tostring(style.code_font),
+    config.plugins.minimap.line_height, SCALE)
+  if tiny_font_key ~= key then
+    local size = math.max(2, config.plugins.minimap.line_height * SCALE * 0.95)
+    local ok, f = pcall(style.code_font.copy, style.code_font, size)
+    tiny_font = ok and f or false
+    tiny_font_key = key
+  end
+  return tiny_font or nil
+end
+
 local function draw_minimap(dv)
   local doc = dv.doc
   local m = metrics(dv)
@@ -93,12 +116,42 @@ local function draw_minimap(dv)
     blob_cache = { bg = style.background[1] }
   end
   local gap = math.max(1, common.round(0.6 * SCALE))
+  local tiny = config.plugins.minimap.render ~= "blocks" and get_tiny_font() or nil
+
+  -- Panel: tint the whole reserved strip (out to the view's right edge, so
+  -- the scrollbar zone reads as part of it) and separate it from the text
+  -- with a divider line right on the strip's left edge.  The old hairline sat
+  -- PAD pixels inside the text area, where it read as a stray line and gave
+  -- the impression the strip overlapped the code.
+  local blend = function(a, b, t)
+    return {
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+      a[3] + (b[3] - a[3]) * t,
+      255,
+    }
+  end
+  local strip_w = dv.position.x + dv.size.x - m.x
+  renderer.draw_rect(m.x, m.y, strip_w, m.h, blend(style.background, style.text, 0.035))
+  renderer.draw_rect(m.x - 1, m.y, 1, m.h, blend(style.background, style.text, 0.30))
 
   core.push_clip_rect(m.x, m.y, m.w, m.h)
   for line = first_line, last_line do
     local text = doc.lines[line]
     if text and #text > 1 then
       local y = m.y + (line - first_line) * m.lh
+      if tiny then
+        -- scaled-down real glyphs, token colours included (Sublime's look)
+        local tx = m.x
+        for _, type_, tok in doc.highlighter:each_token(line) do
+          if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
+          if tok ~= "" then
+            common.draw_text(tiny, blob_color(type_), tok, nil, tx, y, 0, m.lh)
+            tx = tx + tiny:get_width(tok)
+            if tx >= m.x + m.w then break end
+          end
+        end
+      else
       local cx = 0
       for _, type_, tok in doc.highlighter:each_token(line) do
         if cx < m.max_cols then
@@ -123,6 +176,7 @@ local function draw_minimap(dv)
           end
         end
       end
+      end
     end
   end
 
@@ -138,9 +192,6 @@ local function draw_minimap(dv)
   renderer.draw_rect(m.x, vy + vh - b, m.w, b, vedge)
   renderer.draw_rect(m.x, vy, b, vh, vedge)
   renderer.draw_rect(m.x + m.w - b, vy, b, vh, vedge)
-  -- hairline separating the strip from the text
-  renderer.draw_rect(m.x - PAD, m.y, 1, m.h,
-    { style.text[1], style.text[2], style.text[3], 25 })
   core.pop_clip_rect()
 end
 
@@ -154,6 +205,12 @@ local function hit(dv, x)
   return x >= m.x - PAD and x <= dv.position.x + dv.size.x
 end
 
+---Floating buttons (the preview / format chips) live inside the strip's x
+---range; when one is hovered the click belongs to it, not to the map.
+local function on_floating_button(dv)
+  return dv.md_preview_btn_hover or dv.format_button_hovered
+end
+
 local function scroll_to(dv, x, y)
   local m = metrics(dv)
   local first_line = window_start(dv, m)
@@ -165,7 +222,8 @@ end
 
 local old_on_mouse_pressed = DocView.on_mouse_pressed
 function DocView:on_mouse_pressed(button, x, y, clicks)
-  if button == "left" and hit(self, x) and y >= self.position.y
+  if button == "left" and not on_floating_button(self)
+      and hit(self, x) and y >= self.position.y
       and y <= self.position.y + self.size.y then
     self.__minimap_drag = true
     scroll_to(self, x, y)
@@ -204,12 +262,15 @@ function DocView:get_right_inset()
   return inset
 end
 
-local old_draw_overlay = DocView.draw_overlay
-function DocView:draw_overlay(...)
-  old_draw_overlay(self, ...)
+-- Drawn from the draw_scrollbar hook, which runs *after* the text clip is
+-- popped: the text clip excludes the reserved right inset, so a minimap drawn
+-- in draw_overlay (inside that clip) would be invisible.
+local old_draw_scrollbar = DocView.draw_scrollbar
+function DocView:draw_scrollbar(...)
   if active(self) then
     draw_minimap(self)
   end
+  old_draw_scrollbar(self, ...)
 end
 
 -------------------------------------------------------------------------------
