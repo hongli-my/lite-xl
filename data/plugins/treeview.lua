@@ -262,6 +262,9 @@ end
 function TreeView:get_text_bounding_box(item, x, y, w, h)
   local icon_width = style.icon_font:get_width("D")
   local xoffset = item.depth * style.padding.x + style.padding.x + icon_width
+  if item.type == "dir" then
+    xoffset = xoffset + style.padding.x
+  end
   x = x + xoffset
   w = style.font:get_width(item.name) + 2 * style.padding.x
   return x, y, w, h
@@ -445,8 +448,11 @@ function TreeView:draw_item_chevron(item, active, hovered, x, y, w, h)
     local chevron_icon = item.expanded and "-" or "+"
     local chevron_color = hovered and (style.sidebar_accent or style.accent) or (style.sidebar_text or style.text)
     common.draw_text(style.icon_font, chevron_color, chevron_icon, nil, x, y, 0, h)
+    return style.padding.x
   end
-  return style.padding.x
+  -- files have no chevron: keep their icon aligned with the parent
+  -- folder icon column instead of reserving a full indent unit
+  return 0
 end
 
 
