@@ -231,8 +231,12 @@ local function scan_file(out, filename, rel)
 end
 
 function TodoView:rescan()
+  -- NOTE: never clear self.items here.  Clearing made the whole view flash
+  -- empty during every rescan (clicking a checkbox writes the file, dirwatch
+  -- fires, rescan clears, view blanks until the async scan finishes).
+  -- The new list is built in `out` and swapped in atomically when done;
+  -- stale rows keep rendering until then.
   self.searching = true
-  self.items = {}
   local exts = {}
   for _, e in ipairs(config.plugins.todo_agenda.extensions) do
     exts[e] = true
@@ -1191,6 +1195,8 @@ function TodoView:on_mouse_pressed(button, x, y, clicks)
       local box = math.floor(hit.h * 0.34)
       if x < hit.x + style.padding.x * 1.5 + 4 * SCALE + box + 4 then
         toggle_task_in_source(item)
+        -- our own write will fire dirwatch; in-place update suffices
+        self._suppress_rescan_until = system.get_time() + 1
         core.redraw = true
         return true
       end
@@ -1206,11 +1212,13 @@ function TodoView:on_mouse_pressed(button, x, y, clicks)
     if x >= ix and y >= iy and x < ix + w and y < iy + h then
       local bx, by, bw, bh = checkbox_rect(ix, iy, h)
       if x >= bx and x < bx + bw and y >= by and y < by + bh then
-      -- toggle the checkbox in place; the item moves to the done group on
-      -- the next rescan, not instantly (instant re-sort made rows jump)
-      toggle_task_in_source(item)
-      core.redraw = true
-      return true
+        -- toggle the checkbox in place; the item moves to the done group on
+        -- the next rescan (instant re-sort made rows jump).  Our own write
+        -- will fire dirwatch — the in-place update is enough.
+        self._suppress_rescan_until = system.get_time() + 1
+        toggle_task_in_source(item)
+        core.redraw = true
+        return true
       end
       -- click on the text: jump to the source line
       core.try(function()
@@ -1237,6 +1245,8 @@ function TodoView:on_mouse_released(button, x, y)
       local old_tag = d.item.tag or config.plugins.todo_agenda.kanban_default_column
       if new_tag and new_tag ~= old_tag then
         retag_task_in_source(d.item, new_tag)
+        -- our own write will fire dirwatch; in-place update suffices
+        self._suppress_rescan_until = system.get_time() + 1
         core.log("已移动到 #%s(%s:%d)", new_tag, d.item.rel, d.item.line)
       end
     end
@@ -1247,6 +1257,13 @@ function TodoView:on_mouse_released(button, x, y)
 end
 
 function TodoView:update()
+  -- Suppress the rescan that our own write-back triggers via dirwatch:
+  -- toggle/retag already updated the items in place, so a full rescan right
+  -- after would rebuild every card (perceived as flicker).
+  if self._suppress_rescan_until and system.get_time() < self._suppress_rescan_until then
+    self._rescan_pending = false
+    self._suppress_rescan_until = nil
+  end
   -- show the full-text tooltip once the cursor has rested 0.4s on a card
   if self._tip_item and self._tip_since
      and system.get_time() - self._tip_since > 0.4 then
