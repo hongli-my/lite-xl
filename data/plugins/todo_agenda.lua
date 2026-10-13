@@ -652,8 +652,13 @@ local function tag_color(tag)
     syn.keyword, syn.keyword2, syn.number, syn.string, syn["function"],
   }
   c = palette[(n % #palette) + 1] or style.accent or style.text
-  -- blend toward the palette colour so near-black entries stay visible
-  c = common.lerp(style.text, c, 0.85)
+  -- keep the palette colour AS IS: blending toward style.text desaturated
+  -- every column into the same pale wash.  Only enforce a minimum
+  -- brightness so near-black entries stay visible on dark backgrounds.
+  local bg = style.background
+  if c[1] + c[2] + c[3] < bg[1] + bg[2] + bg[3] + 90 then
+    c = common.lerp(bg, c, 0.45)
+  end
   tag_color_cache[tag] = c
   return c
 end
@@ -674,10 +679,10 @@ function TodoView:draw_kanban()
   for i, col in ipairs(cols) do
     local cx = x0 + (i - 1) * (col_w + gap)
     local tcol = tag_color(col.tag)
-    -- column container: rounded, one step above the view background
+    -- column container: rounded, tinted toward the column colour (visible)
     renderer.draw_rounded_rect(cx, y0, col_w, view_h, radius + 2 * SCALE,
-      surface_color())
-    -- column header: colored dot + tag name + open-count chip
+      common.lerp(style.background, tcol, 0.14))
+    -- column header: colored dot + tag name in column colour + count chip
     local open_n = 0
     for _, it in ipairs(col.items) do
       if not it.checked then open_n = open_n + 1 end
@@ -686,7 +691,7 @@ function TodoView:draw_kanban()
     local dot_y = y0 + style.padding.y
     renderer.draw_rounded_rect(cx + style.padding.x * 1.5, dot_y,
       dr * 2, dr * 2, dr, tcol)
-    common.draw_text(style.font, style.text, col.tag, "left",
+    common.draw_text(style.font, tcol, col.tag, "left",
       cx + style.padding.x * 1.5 + dr * 2 + style.padding.x,
       y0, col_w, head_h)
     local cnt = tostring(open_n)
@@ -694,8 +699,8 @@ function TodoView:draw_kanban()
     local cnt_w = style.code_font:get_width(cnt) + style.padding.x * 1.5
     local cnt_y = y0 + (head_h - cnt_h) / 2
     renderer.draw_rounded_rect(cx + col_w - cnt_w - style.padding.x, cnt_y,
-      cnt_w, cnt_h, radius, raised_color())
-    common.draw_text(style.code_font, style.dim, cnt, "center",
+      cnt_w, cnt_h, radius, common.lerp(style.background, tcol, 0.32))
+    common.draw_text(style.code_font, tcol, cnt, "center",
       cx + col_w - cnt_w - style.padding.x, cnt_y, cnt_w, cnt_h)
     -- cards (scrolled per column, clipped to the column body)
     local sy = col_scroll(self, i, #cols)
@@ -710,10 +715,10 @@ function TodoView:draw_kanban()
       end
     end
     core.pop_clip_rect()
-    -- drag target highlight: tint the whole column toward its tag colour
+    -- drag target highlight: strong tint toward the column colour
     if self.drag and self.drag.target_col == i then
       renderer.draw_rounded_rect(cx, y0, col_w, view_h, radius + 2 * SCALE,
-        common.lerp(style.background, tcol, 0.10))
+        common.lerp(style.background, tcol, 0.26))
     end
   end
 
@@ -733,20 +738,22 @@ end
 -- chip on a second visual layer (bottom-right) when it fits.
 function TodoView:draw_card(x, y, w, h, item, hovered, today, tcol)
   local radius = 4 * SCALE
-  -- soft shadow: slightly larger, darker rounded rect under the card
+  -- soft shadow under the card
   renderer.draw_rounded_rect(x, y + 1.5 * SCALE, w, h, radius,
     common.lerp(style.background, style.text, 0.03))
-  -- card body: clearly raised above the column surface
-  local bg = common.lerp(style.background, style.text,
-    hovered and 0.19 or 0.15)
+  -- card body: raised, faintly tinted with the column colour (stronger on
+  -- hover so cards feel alive)
+  local bg = common.lerp(style.background,
+    hovered and style.text or tcol,
+    hovered and 0.22 or 0.12)
   renderer.draw_rounded_rect(x, y, w, h, radius, bg)
-  -- colored left bar (column hue; dimmed when the task is done)
-  local bar = item.checked and common.lerp(style.background, style.text, 0.10)
+  -- colored left bar: 4px, full column colour (dimmed when done)
+  local bar = item.checked and common.lerp(style.background, tcol, 0.30)
     or tcol
-  renderer.draw_rounded_rect(x, y, 3 * SCALE, h, 1.5 * SCALE, bar)
-  -- checkbox (hollow square, filled with a check when done)
+  renderer.draw_rounded_rect(x, y, 4 * SCALE, h, 2 * SCALE, bar)
+  -- checkbox (hollow square, accent check when done)
   local box = math.floor(h * 0.34)
-  local bx, by = x + style.padding.x * 1.5 + 3 * SCALE,
+  local bx, by = x + style.padding.x * 1.5 + 4 * SCALE,
     y + math.floor((h - box) / 2)
   renderer.draw_rounded_rect(bx, by, box, box, 1.5 * SCALE,
     item.checked and (style.accent or style.text) or style.dim)
@@ -771,12 +778,11 @@ function TodoView:draw_card(x, y, w, h, item, hovered, today, tcol)
     local chip_w = style.code_font:get_width(chip) + style.padding.x * 1.5
     if chip_w < avail then
       local ch_y = y + h - chip_h - style.padding.y * 0.5
+      local chip_col = overdue and error_color() or style.dim
       renderer.draw_rounded_rect(x + w - chip_w - style.padding.x * 0.5,
         ch_y, chip_w, chip_h, 3 * SCALE,
-        common.lerp(style.background, overdue and error_color() or style.dim,
-          0.35))
-      common.draw_text(style.code_font,
-        overdue and error_color() or style.dim, chip, "center",
+        common.lerp(style.background, chip_col, 0.40))
+      common.draw_text(style.code_font, chip_col, chip, "center",
         x + w - chip_w - style.padding.x * 0.5, ch_y, chip_w, chip_h)
       -- text stays on the upper half when a chip is present
       local text_h = h - chip_h - style.padding.y
@@ -935,15 +941,15 @@ function TodoView:draw_calendar()
             local tcol = tag_color(it.tag
               or config.plugins.todo_agenda.kanban_default_column)
             local pill_bg = common.lerp(style.background,
-              overdue and error_color() or tcol, hovered and 0.42 or 0.22)
+              overdue and error_color() or tcol, hovered and 0.55 or 0.38)
             renderer.draw_rounded_rect(cx + 2, ly, cw_i - 4, pill_h - 2,
               3 * SCALE, pill_bg)
-            renderer.draw_rect(cx + 2, ly, 2 * SCALE, pill_h - 2,
+            renderer.draw_rect(cx + 2, ly, 2.5 * SCALE, pill_h - 2,
               overdue and error_color() or tcol)
             draw_text_clipped(style.font,
               it.checked and style.dim or style.text,
               (it.checked and "✓ " or "") .. it.display, "left",
-              cx + 2 + 2 * SCALE + 4, ly, cw_i - 12, pill_h)
+              cx + 2 + 2.5 * SCALE + 4, ly, cw_i - 13, pill_h)
             cell.pills[#cell.pills + 1] = { item = it, x = cx + 2, y = ly,
               w = cw_i - 4, h = pill_h - 2 }
           end
@@ -1069,9 +1075,9 @@ function TodoView:on_mouse_pressed(button, x, y, clicks)
     local hit = self:kanban_hit(x, y)
     if hit and hit.kind == "card" then
       local item = hit.item
-      -- checkbox zone: accent bar + padding + box (matches draw_card)
-      local box = math.floor(hit.h * 0.4)
-      if x < hit.x + style.padding.x + 2 * SCALE + box + 4 then
+      -- checkbox zone: color bar + padding + box (matches draw_card)
+      local box = math.floor(hit.h * 0.34)
+      if x < hit.x + style.padding.x * 1.5 + 4 * SCALE + box + 4 then
         toggle_task_in_source(item)
         core.redraw = true
         return true
@@ -1189,8 +1195,15 @@ function TodoView:draw()
       end
       -- checkbox
       self:draw_checkbox(ix, iy, h, item.checked, hovered)
+      -- tag colour dot between checkbox and text
+      local tcol = tag_color(item.tag
+        or config.plugins.todo_agenda.kanban_default_column)
+      local dot_r = 2.5 * SCALE
+      local dot_y = iy + (h - dot_r * 2) / 2
+      renderer.draw_rounded_rect(ix + style.padding.x + math.floor(h * 0.55)
+        + style.padding.x * 0.5, dot_y, dot_r * 2, dot_r * 2, dot_r, tcol)
       -- text: file:line prefix (dim) + task text
-      local tx = ix + style.padding.x + math.floor(h * 0.55) + style.padding.x
+      local tx = ix + style.padding.x + math.floor(h * 0.55) + style.padding.x * 2 + dot_r * 2
       local prefix = string.format("%s:%d  ", item.rel, item.line)
       local tcolor = item.checked and style.dim or style.text
       tx = common.draw_text(style.code_font, style.dim, prefix, "left", tx, iy, w, h)
