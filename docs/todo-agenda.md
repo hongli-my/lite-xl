@@ -57,3 +57,11 @@ lua tests/headless/test_todo_agenda.lua
 ```
 
 覆盖:解析(@due/#tag/多标签/display)、勾选写回 Doc 模型、拖卡改 tag 写回、日历落格与月份导航、视图切换。
+
+## UI 行为细节(review 后)
+
+- 看板列内滚轮 = 该列垂直滚动(每列独立);`shift+滚轮` = 整板水平平移
+- 长任务文本在卡片/日历格/列表行内自动截断加 `…`,不再溢出边界
+- 卡片视觉:填充背景 + 左侧 2px 强调条(hover 变 accent),完成态 dim + `✓` 前缀;完成勾选框带 ✓ 刻痕
+- 月份标题本地化 `2026年10月`;列头 hover 手型光标
+- `style.error` 缺失的主题(fall/summer/textadept)回退 `style.dim`,不再崩溃

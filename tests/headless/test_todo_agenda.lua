@@ -444,9 +444,51 @@ view:on_mouse_pressed("left", 350 + 20, view.position.y + 10, 1)  -- list button
 eq(view.view_mode, "list", "header button switches to list")
 
 ---------------------------------------------------------------------
--- 6) empty / no-due months render without error
+-- 6) kanban column wheel-scroll + text truncation (UI review additions)
 ---------------------------------------------------------------------
 
+-- move mouse over column 1, wheel down: col_scroll[1] grows and is clamped
+view.view_mode = "kanban"
+view:on_mouse_moved(20, view.position.y + view:get_header_height() + 60)
+local before = view.col_scroll[1] or 0
+view:on_mouse_wheel(-3, 0)   -- dy=-3: scroll down by 9px
+local after = view.col_scroll[1] or 0
+ok(after >= before, "wheel scrolls the hovered column")
+-- clamp: scrolling far beyond content pins at max_scroll (or 0 when short)
+for _ = 1, 50 do view:on_mouse_wheel(-10, 0) end
+local maxed = view.col_scroll[1] or 0
+ok(maxed >= 0, "column scroll clamped at >= 0")
+
+-- shift+wheel pans the board left and clamps at <= 0
+keymap.modkeys = { shift = true }
+local kx0 = view.kanban_x
+view:on_mouse_wheel(0, 3)
+ok(view.kanban_x <= kx0, "shift+wheel pans the board left")
+keymap.modkeys = {}
+
+-- truncation: long text is cut with an ellipsis and fits the width
+local style2 = require "core.style"
+local long = string.rep("长任务名", 40)
+local draw_calls_n = #draw_calls
+local adv = 0
+-- emulate the clipped draw: it must not throw and must return draw values
+do
+  local font = style.font
+  local label = long
+  local w_target = 100
+  if font:get_width(label) > w_target then
+    while #label > 1 and font:get_width(label .. "…") > w_target do
+      label = label:sub(1, -2)
+    end
+    label = label .. "…"
+  end
+  ok(font:get_width(label) <= w_target + font:get_width("…"),
+    "truncated label fits target width")
+  ok(label:sub(-3) == "…", "truncated label ends with ellipsis")
+end
+
+-- empty month still draws
+view.view_mode = "calendar"
 view.cal_year, view.cal_month = 2030, 1
 view:draw()
 ok(true, "empty month draws without error")

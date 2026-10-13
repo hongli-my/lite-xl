@@ -58,6 +58,25 @@ local TodoView = View:extend()
 
 function TodoView:__tostring() return "TodoView" end
 
+-- Truncate text to fit `w` pixels, appending an ellipsis when cut.
+-- lite-xl's common.draw_text does not clip; without this, long task text
+-- paints across kanban card borders and neighbouring columns.
+local function draw_text_clipped(font, color, text, align, x, y, w, h)
+  local label = text
+  if font:get_width(label) > w then
+    while #label > 1 and font:get_width(label .. "…") > w do
+      label = label:sub(1, -2)
+    end
+    label = label .. "…"
+  end
+  return common.draw_text(font, color, label, align, x, y, w, h)
+end
+
+-- Some color themes (fall/summer/textadept) do not define style.error.
+local function error_color()
+  return style.error or style.dim
+end
+
 TodoView.context = "session"
 
 function TodoView:new()
@@ -70,9 +89,9 @@ function TodoView:new()
   self._rescan_pending = false
   self._last_rescan = 0
   self.watches = {}
-  -- view state: "list" | "kanban" | "calendar"
-  self.view_mode = "list"
-  -- kanban drag state
+  -- kanban scroll state
+  self.col_scroll = {}
+  self.kanban_x = 0
   self.drag = nil          -- { item = item, from_tag = tag, x = px, y = px }
   -- calendar state
   local now = os.date("*t")
@@ -437,15 +456,16 @@ function TodoView:draw_header(x, y, w)
   end
   common.draw_text(style.font, style.accent or style.text, text, "left",
     x, y, w, fh)
-  -- switch buttons on the right
+  -- switch buttons on the right: inactive = dim text, active = accent on
+  -- background3 with an accent underline; 2*padding.x gutter between them
   local bx = x + w
   for _, mode in ipairs({ "calendar", "kanban", "list" }) do
     local label = VIEW_LABELS[mode]
-    local bw = style.font:get_width(label) + style.padding.x * 2
+    local bw = style.font:get_width(label) + style.padding.x * 3
     bx = bx - bw
     local on = (self.view_mode == mode)
     renderer.draw_rect(bx, y, bw, fh,
-      on and (style.line_highlight or style.background2) or style.background2)
+      on and (style.background3 or style.background2) or style.background2)
     if on then
       renderer.draw_rect(bx, y + fh - 2 * SCALE, bw, 2 * SCALE, style.accent or style.text)
     end
@@ -453,7 +473,7 @@ function TodoView:draw_header(x, y, w)
       label, "center", bx, y, bw, fh)
     self._switch_rects[#self._switch_rects + 1] =
       { mode = mode, x = bx, y = y, w = bw, h = fh }
-    bx = bx - style.padding.x
+    bx = bx - style.padding.x * 2
   end
 end
 
@@ -504,6 +524,19 @@ end
 -- Layout: kanban view
 -----------------------------------------------------------------------
 
+-- Offset (px) a column's cards are scrolled by; each column scrolls
+-- independently via the mouse wheel while the cursor is over it.
+-- Stored on the view as self.col_scroll[col_idx]; reset when columns change.
+local function col_scroll(self, col_idx, n_cols)
+  local s = self.col_scroll
+  if #s ~= n_cols then
+    -- column set changed: drop stale offsets, keep size in sync
+    for i = #s, n_cols + 1, -1 do s[i] = nil end
+    for i = #s + 1, n_cols do s[i] = 0 end
+  end
+  return s[col_idx] or 0
+end
+
 local function kanban_geometry(self)
   local cols = kanban_columns_with_items(self.items)
   local lh = self:get_line_height()
@@ -511,7 +544,7 @@ local function kanban_geometry(self)
   local col_w = math.max(160 * SCALE, math.min(240 * SCALE,
     (self.size.x - style.padding.x * 2) / math.max(1, #cols)))
   local gap = style.padding.x
-  local x0 = self.position.x + style.padding.x
+  local x0 = self.position.x + style.padding.x + self.kanban_x
   local y0 = self.position.y + self:get_header_height() + style.padding.y
   return cols, lh, card_h, col_w, gap, x0, y0
 end
@@ -532,9 +565,10 @@ function TodoView:kanban_hit(mx, my)
         return { kind = "column", tag = col.tag, col_idx = i,
           x = cx, y = y0, w = col_w, h = head_h }
       end
-      -- cards
+      -- cards (offset by this column's scroll)
+      local sy = col_scroll(self, i, #cols)
       for j, item in ipairs(col.items) do
-        local cy = y0 + head_h + style.padding.y + (j - 1) * (card_h + gap)
+        local cy = y0 + head_h + style.padding.y + (j - 1) * (card_h + gap) - sy
         if my >= cy and my < cy + card_h then
           return { kind = "card", item = item, col_idx = i, card_idx = j,
             x = cx, y = cy, w = col_w, h = card_h }
@@ -543,6 +577,36 @@ function TodoView:kanban_hit(mx, my)
     end
   end
   return nil
+end
+
+-- Wheel over the kanban: scroll the column under the cursor (vertical);
+-- shift+wheel pans the whole board horizontally.
+function TodoView:on_mouse_wheel(dy, dx)
+  if self.view_mode == "kanban" then
+    if keymap.modkeys and keymap.modkeys["shift"] then
+      self.kanban_x = math.min(0, self.kanban_x - dx * 3 - dy * 3)
+      core.redraw = true
+      return true
+    end
+    local mx, my = self._mouse_x or 0, self._mouse_y or 0
+    local cols, lh, card_h, col_w, gap, x0, y0 = kanban_geometry(self)
+    for i, col in ipairs(cols) do
+      local cx = x0 + (i - 1) * (col_w + gap)
+      if mx >= cx and mx < cx + col_w then
+        local sy = col_scroll(self, i, #cols)
+        local head_h = lh + style.padding.y
+        local body_h = self.position.y + self.size.y - (y0 + head_h) - style.padding.y
+        local content_h = #col.items * (card_h + gap)
+        local max_scroll = math.max(0, content_h - body_h)
+        local ny = math.max(0, math.min(max_scroll, sy - dy * 3))
+        self.col_scroll[i] = ny
+        core.redraw = true
+        return true
+      end
+    end
+    return true
+  end
+  return TodoView.super.on_mouse_wheel(self, dy, dx)
 end
 
 -- Draw the kanban: a column per tag, cards inside.  When a drag is active,
@@ -568,11 +632,12 @@ function TodoView:draw_kanban()
       cx, y0, col_w - style.padding.x, lh)
     renderer.draw_rect(cx, y0 + head_h - style.divider_size,
       col_w, style.divider_size, style.divider)
-    -- cards
+    -- cards (scrolled per column, clipped to the column body)
+    local sy = col_scroll(self, i, #cols)
     core.push_clip_rect(cx, y0 + head_h, col_w,
       self.position.y + self.size.y - y0 - head_h)
     for j, item in ipairs(col.items) do
-      local cy = y0 + head_h + style.padding.y + (j - 1) * (card_h + gap)
+      local cy = y0 + head_h + style.padding.y + (j - 1) * (card_h + gap) - sy
       local hovered = self.hover_item == item
       local dragging = self.drag and self.drag.item == item
       if not dragging then
@@ -597,40 +662,48 @@ function TodoView:draw_kanban()
   end
 end
 
--- One kanban card: checkbox + display text (+ due chip + source hint).
+-- One kanban card: filled background + 2px left accent bar + checkbox.
+-- Done cards go dim with a ✓ in the checkbox; hover lifts the background
+-- and brightens the accent bar instead of drawing a four-side border.
 function TodoView:draw_card(x, y, w, h, item, hovered, today)
   local bg = hovered and (style.line_highlight or style.background2)
-    or style.background3 or style.background2
+    or (style.background3 or style.background2)
   renderer.draw_rect(x, y, w, h, bg)
-  local border = hovered and (style.accent or style.text) or style.divider
-  renderer.draw_rect(x, y, w, 1 * SCALE, border)
-  renderer.draw_rect(x, y + h - 1 * SCALE, w, 1 * SCALE, border)
-  renderer.draw_rect(x, y, 1 * SCALE, h, border)
-  renderer.draw_rect(x + w - 1 * SCALE, y, 1 * SCALE, h, border)
+  -- left accent bar: dim for open tasks, faded for done ones
+  local bar = item.checked and style.divider
+    or (hovered and (style.accent or style.text) or (style.dim))
+  renderer.draw_rect(x, y, 2 * SCALE, h, bar)
   -- checkbox
   local box = math.floor(h * 0.4)
-  local bx, by = x + style.padding.x, y + math.floor((h - box) / 2)
-  renderer.draw_rect(bx, by, box, box, item.checked
-    and (style.accent or style.text) or style.dim)
+  local bx, by = x + style.padding.x + 2 * SCALE, y + math.floor((h - box) / 2)
+  renderer.draw_rect(bx, by, box, box,
+    item.checked and (style.accent or style.text) or style.dim)
   if item.checked then
-    renderer.draw_rect(bx + 1, by + 1, box - 2, box - 2, style.background2)
+    -- ✓ impression: filled box with a notch, matching list view
+    renderer.draw_rect(bx + 1, by + 1, box - 2, box - 2, bg)
+    local cx, cy = bx + box * 0.5, by + box * 0.5
+    local len = math.floor(box * 0.25)
+    renderer.draw_rect(cx - len, cy, len, 1 * SCALE, style.accent or style.text)
+    renderer.draw_rect(cx, cy, 1 * SCALE, len, style.accent or style.text)
   end
-  -- text
+  -- text (dim + strikethrough-like "✓ " prefix conveys done state)
   local tx = bx + box + style.padding.x
   local tcolor = item.checked and style.dim or style.text
-  local label = item.display
+  local label = (item.checked and "✓ " or "") .. item.display
   if item.due then
     local overdue = (not item.checked) and date_lt(item.due, today)
     local chip = "⏰ " .. item.due
     local chip_w = style.code_font:get_width(chip) + style.padding.x
+    local avail = w - (tx - x) - style.padding.x
     local tw = style.font:get_width(label)
-    if tw + chip_w < w - (tx - x) - style.padding.x then
+    -- draw the due chip only when the card has room for text + chip
+    if tw + chip_w < avail then
       common.draw_text(style.code_font,
-        overdue and style.error or style.dim, chip, "left",
+        overdue and error_color() or style.dim, chip, "left",
         x + w - chip_w - style.padding.x, y, chip_w, h)
     end
   end
-  common.draw_text(style.font, tcolor, label, "left", tx, y,
+  draw_text_clipped(style.font, tcolor, label, "left", tx, y,
     w - (tx - x) - style.padding.x, h)
 end
 
@@ -682,8 +755,8 @@ function TodoView:draw_calendar()
   local row_h = math.max(fh * 2, (self.size.y - (y0 - self.position.y) - fh * 2) / 6)
   local cw_i = math.floor(cw)
 
-  -- month navigation header: ◀ 2026-10 ▶
-  local title = string.format("%d-%02d", self.cal_year, self.cal_month)
+  -- month navigation header: ◀ 2026年10月 ▶
+  local title = string.format("%d年%d月", self.cal_year, self.cal_month)
   local tw = style.font:get_width(title)
   local nav_y = y0
   local prev_r = { x = x0, y = nav_y, w = fh, h = fh }
@@ -746,11 +819,11 @@ function TodoView:draw_calendar()
             local overdue = (not it.checked) and date_lt(it.due, today)
             -- 2px accent bar on the left
             renderer.draw_rect(cx + 2, ly, 2 * SCALE, lh - 2 * SCALE,
-              overdue and style.error or (style.accent or style.text))
-            common.draw_text(style.font,
+              overdue and error_color() or (style.accent or style.text))
+            draw_text_clipped(style.font,
               it.checked and style.dim or style.text,
               (it.checked and "✓ " or "") .. it.display, "left",
-              cx + 2 + 2 * SCALE + 2, ly - 1, cw - 8, lh)
+              cx + 2 + 2 * SCALE + 2, ly - 1, cw - 12, lh)
             ly = ly + lh
           end
           if #list > math.floor((cell_h - fh - 2) / lh) then
@@ -773,6 +846,9 @@ end
 
 function TodoView:on_mouse_moved(mx, my, ...)
   TodoView.super.on_mouse_moved(self, mx, my, ...)
+  -- remember the last mouse position: on_mouse_wheel receives no
+  -- coordinates; we need them to find the column under the cursor
+  self._mouse_x, self._mouse_y = mx, my
   if self.view_mode == "kanban" then
     if self.drag then
       self.drag.x, self.drag.y = mx, my
@@ -790,7 +866,7 @@ function TodoView:on_mouse_moved(mx, my, ...)
     local hit = self:kanban_hit(mx, my)
     self.hover_item = hit and hit.kind == "card" and hit.item or nil
     self.hover_col = hit and hit.kind == "column" and hit.tag or nil
-    self.cursor = self.hover_item and "hand" or "arrow"
+    self.cursor = (self.hover_item or self.hover_col) and "hand" or "arrow"
     core.redraw = true
     return
   end
@@ -852,9 +928,9 @@ function TodoView:on_mouse_pressed(button, x, y, clicks)
     local hit = self:kanban_hit(x, y)
     if hit and hit.kind == "card" then
       local item = hit.item
-      -- checkbox zone (left padding.x + box)
+      -- checkbox zone: accent bar + padding + box (matches draw_card)
       local box = math.floor(hit.h * 0.4)
-      if x < hit.x + style.padding.x + box + 4 then
+      if x < hit.x + style.padding.x + 2 * SCALE + box + 4 then
         toggle_task_in_source(item)
         core.redraw = true
         return true
@@ -983,11 +1059,11 @@ function TodoView:draw()
         local chip = "@" .. item.due
         local chip_w = style.code_font:get_width(chip) + style.padding.x
         common.draw_text(style.code_font,
-          (not item.checked) and date_lt(item.due, today_str()) and style.error or style.dim,
+          (not item.checked) and date_lt(item.due, today_str()) and error_color() or style.dim,
           chip, "right", ix + w - chip_w - style.padding.x, iy, chip_w, h)
         remaining = remaining - chip_w - style.padding.x
       end
-      common.draw_text(style.font, tcolor, label, "left", tx, iy, remaining, h)
+      draw_text_clipped(style.font, tcolor, label, "left", tx, iy, remaining, h)
     end
     core.pop_clip_rect()
     self:draw_scrollbar()
