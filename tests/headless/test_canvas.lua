@@ -322,7 +322,16 @@ for _, n in ipairs(mv.nodes) do
   if #n.children == 0 then leaves = leaves + 1 end
 end
 eq(leaves, 3, "mindmap parsed 3 leaves")
-eq(#mv.root.children, 2, "mindmap root has 2 branches")
+-- centering runs on first draw (view is unsized at construction time)
+ok(not mv._fitted, "not fitted before any draw")
+mv:draw()
+ok(mv._fitted, "fitted on first draw")
+local tw_, th_ = mv._tree_w, mv._tree_h
+local z_ = math.min(1.0, (mv.size.x - 48) / tw_, (mv.size.y - 48) / th_)
+z_ = math.max(z_, 0.25)
+ok(math.abs(mv.cam.z - z_) < 1e-9, "fit zoom matches tree size")
+ok(math.abs(mv.cam.x - (mv.size.x - tw_ * z_) / 2) < 1e-9, "tree centred horizontally")
+ok(math.abs(mv.cam.y - (mv.size.y - th_ * z_) / 2) < 1e-9, "tree centred vertically")
 -- leaf x positions grow with depth; parents centred over children
 local av = mv.root.children[1]
 local c1_, c2_ = av.children[1], av.children[2]

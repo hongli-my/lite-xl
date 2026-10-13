@@ -201,11 +201,11 @@ function CanvasView:new(path)
   self.drag = nil             -- { kind="card"/"pan", ... }
   self.hover = nil            -- card id under cursor
   self._mouse_x, self._mouse_y = 0, 0
+  self._fitted = false
   self:load()
-  self:center_content()
 end
 
--- Centre the card cloud in the viewport (first open only, before any pan).
+-- Centre the card cloud in the viewport (first real draw, when sized).
 function CanvasView:center_content()
   if #self.card_order == 0 or self.size.x <= 0 then return end
   local min_x, min_y = math.huge, math.huge
@@ -226,6 +226,7 @@ function CanvasView:center_content()
   self.cam.z = z
   self.cam.x = (vw - tw * z) / 2 - min_x * z
   self.cam.y = (vh - th * z) / 2 - min_y * z
+  self._fitted = true
 end
 
 function CanvasView:get_name()
@@ -547,6 +548,7 @@ function CanvasView:draw_background(...)
 end
 
 function CanvasView:draw()
+  if not self._fitted then self:center_content() end
   self:draw_background(style.background)
   local c = self.cam
 
@@ -736,9 +738,9 @@ function MindView:new(path)
   self.path = path
   self.cam = { x = 0, y = 0, z = 1.0 }
   self.drag = nil
+  self._fitted = false
   self._mouse_x, self._mouse_y = 0, 0
   self:parse()
-  self:center_and_fit()
 end
 
 function MindView:get_name()
@@ -832,8 +834,10 @@ function MindView:center_and_fit()
   local z = math.min(1.0, (vw - pad * 2) / tw, (vh - pad * 2) / th)
   z = math.max(z, 0.25)
   self.cam.z = z
+  -- node coordinates run 0..tw / 0..th; centre that box in the viewport
   self.cam.x = (vw - tw * z) / 2
   self.cam.y = (vh - th * z) / 2
+  self._fitted = true
 end
 
 function MindView:on_mouse_moved(mx, my, ...)
@@ -914,28 +918,29 @@ local function branch_color(n)
 end
 
 -- Smooth horizontal-S link between parent edge and child edge,
--- approximated with rect segments along a cubic bezier.
+-- approximated with square stamps along a cubic bezier. Squares (not
+-- horizontal rects) guarantee continuity for steep segments.
 local function draw_mind_link(x1, y1, x2, y2, color, z)
-  local t = math.max(1.5, 2 * SCALE * z)
-  local steps = 14
+  local t = math.max(2, 2.5 * SCALE * z)
+  local half = t / 2
+  -- sample so that consecutive stamps always overlap
+  local dist = math.abs(x2 - x1) + math.abs(y2 - y1)
+  local steps = math.max(12, math.min(48, math.ceil(dist / (half * 0.8))))
   local dx = x2 - x1
   local c1x = x1 + dx * 0.5
   local c2x = x2 - dx * 0.5
-  local px, py
   for i = 0, steps do
     local s = i / steps
     local u = 1 - s
     local bx = u*u*u*x1 + 3*u*u*s*c1x + 3*u*s*s*c2x + s*s*s*x2
     local by = u*u*u*y1 + 3*u*u*s*y1 + 3*u*s*s*y2 + s*s*s*y2
-    if px then
-      renderer.draw_rect(math.min(px, bx), math.min(py, by),
-        math.max(math.abs(bx - px), t), t, color)
-    end
-    px, py = bx, by
+    renderer.draw_rect(bx - half, by - half, t, t, color)
   end
 end
 
 function MindView:draw()
+  -- first real draw: the view has its final size now, fit once
+  if not self._fitted then self:center_and_fit() end
   self:draw_background(style.background)
   local c = self.cam
   core.push_clip_rect(self.position.x, self.position.y, self.size.x, self.size.y)
