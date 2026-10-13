@@ -111,6 +111,14 @@ local common = {
   end,
   color = function(s) return { 0, 0, 0, 255 } end,
   relative_path = function(base, target) return target end,
+  lerp = function(a, b, t)
+    if type(a) == "table" then
+      local res = {}
+      for k, v in pairs(b) do res[k] = a[k] + (v - a[k]) * t end
+      return res
+    end
+    return a + (b - a) * t
+  end,
   draw_text = function(font, color, text, align, x, y, w, h)
     return x + (font.get_width and font:get_width(text) or #text * 7)
   end,

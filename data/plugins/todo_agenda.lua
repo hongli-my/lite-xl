@@ -77,6 +77,29 @@ local function error_color()
   return style.error or style.dim
 end
 
+-- Theme-safe surface colours.  This fork's default theme (slate) uses LIGHT
+-- chrome colours for background2/background3 (#efefef) while style.text is
+-- tuned for the dark editor (#d4d4d4) — drawing text over background2 is
+-- unreadable.  Instead of borrowing chrome colours, derive every surface
+-- from the editor background blended toward the text colour, so contrast
+-- between surface and text is guaranteed in any theme:
+--   surface: bg lerped 6% toward text (one step above the editor bg)
+--   raised : bg lerped 12% toward text (cards, hover, active buttons)
+--   accent bar / checked box: style.accent (Monokai green here) pops on bg
+local function surface_color()
+  return common.lerp(style.background, style.text, 0.06)
+end
+
+local function raised_color()
+  return common.lerp(style.background, style.text, 0.13)
+end
+
+-- Text on our surfaces: style.text when the theme defines a dark editor bg
+-- with light text (the norm); fall back to chrome_text for light themes.
+local function surface_text()
+  return style.chrome_text or style.text
+end
+
 TodoView.context = "session"
 
 function TodoView:new()
@@ -465,7 +488,7 @@ function TodoView:draw_header(x, y, w)
     bx = bx - bw
     local on = (self.view_mode == mode)
     renderer.draw_rect(bx, y, bw, fh,
-      on and (style.background3 or style.background2) or style.background2)
+      on and raised_color() or surface_color())
     if on then
       renderer.draw_rect(bx, y + fh - 2 * SCALE, bw, 2 * SCALE, style.accent or style.text)
     end
@@ -618,9 +641,9 @@ function TodoView:draw_kanban()
 
   for i, col in ipairs(cols) do
     local cx = x0 + (i - 1) * (col_w + gap)
-    -- column background
+    -- column background (theme-safe surface, not chrome background2)
     renderer.draw_rect(cx, y0, col_w, self.size.y - (y0 - self.position.y),
-      style.background2)
+      surface_color())
     -- column header: tag + count
     local open_n = 0
     for _, it in ipairs(col.items) do
@@ -666,8 +689,7 @@ end
 -- Done cards go dim with a ✓ in the checkbox; hover lifts the background
 -- and brightens the accent bar instead of drawing a four-side border.
 function TodoView:draw_card(x, y, w, h, item, hovered, today)
-  local bg = hovered and (style.line_highlight or style.background2)
-    or (style.background3 or style.background2)
+  local bg = hovered and raised_color() or surface_color()
   renderer.draw_rect(x, y, w, h, bg)
   -- left accent bar: dim for open tasks, faded for done ones
   local bar = item.checked and style.divider
@@ -679,8 +701,9 @@ function TodoView:draw_card(x, y, w, h, item, hovered, today)
   renderer.draw_rect(bx, by, box, box,
     item.checked and (style.accent or style.text) or style.dim)
   if item.checked then
-    -- ✓ impression: filled box with a notch, matching list view
-    renderer.draw_rect(bx + 1, by + 1, box - 2, box - 2, bg)
+    -- ✓ impression: hollow box with an accent check, matching list view
+    renderer.draw_rect(bx + 1 * SCALE, by + 1 * SCALE,
+      box - 2 * SCALE, box - 2 * SCALE, bg)
     local cx, cy = bx + box * 0.5, by + box * 0.5
     local len = math.floor(box * 0.25)
     renderer.draw_rect(cx - len, cy, len, 1 * SCALE, style.accent or style.text)
@@ -791,13 +814,12 @@ function TodoView:draw_calendar()
       if in_month then
         ds = string.format("%04d-%02d-%02d", self.cal_year, self.cal_month, day)
       end
-      -- cell background
+      -- cell background (theme-safe: surface for in-month, plain bg outside)
       renderer.draw_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2,
-        in_month and style.background2 or style.background)
+        in_month and surface_color() or style.background)
       local is_today = ds == today
       if is_today then
-        renderer.draw_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2,
-          style.line_highlight or style.background2)
+        renderer.draw_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2, raised_color())
         renderer.draw_rect(cx + 1, cy + 1, cw_i - 2, 1 * SCALE, style.accent)
         renderer.draw_rect(cx + 1, cy + 1, 1 * SCALE, cell_h - 2, style.accent)
         renderer.draw_rect(cx + cw_i - 2 * SCALE, cy + 1, 1 * SCALE, cell_h - 2, style.accent)
