@@ -802,8 +802,8 @@ function MindView:parse()
   layout(root, 0)
   self.root = root
   self.nodes = nodes
-  -- proper column layout: cumulative x per depth
-  local xgap = 64
+  -- column layout: cumulative x per depth, breathing room after the root
+  local xgap = 72
   local col_x = { 0 }
   local max_row_w = {}
   for _, n in ipairs(nodes) do
@@ -814,7 +814,8 @@ function MindView:parse()
   for _, n in ipairs(nodes) do if n.depth > max_depth then max_depth = n.depth end end
   for d = 0, max_depth do
     col_x[d] = acc
-    acc = acc + (max_row_w[d] or 0) + xgap
+    -- extra gap between root and first level so curves can unfold
+    acc = acc + (max_row_w[d] or 0) + (d == 0 and xgap * 1.3 or xgap)
   end
   for _, n in ipairs(nodes) do n.x = col_x[n.depth] or 0 end
   -- branch colour index: first-level children get distinct colours
@@ -822,8 +823,9 @@ function MindView:parse()
     local function tag(n) n.branch = i for _, cc in ipairs(n.children) do tag(cc) end end
     tag(ch)
   end
+  -- pill half-heights extend past the leaf row extent; pad both ends
   self._tree_w = acc - xgap
-  self._tree_h = math.max(row - 1, 0) * ygap + fh
+  self._tree_h = math.max(row - 1, 0) * ygap + fh + 16
 end
 
 -- Centre the tree in the viewport and pick a zoom that fits it.
@@ -924,24 +926,26 @@ local function branch_color(n)
   return col or style.accent or style.text
 end
 
--- Smooth horizontal-S link between parent edge and child edge,
--- approximated with square stamps along a cubic bezier. Squares (not
--- horizontal rects) guarantee continuity for steep segments.
+-- Smooth organic link between parent edge and child edge.
+-- Rasterised as an L-coverage rect per sample pair (covers both the x run
+-- and the y run of each step): continuous at any slope, 24 rects per link.
 local function draw_mind_link(x1, y1, x2, y2, color, z)
-  local t = math.max(2.5, 3 * SCALE * z)
+  local t = math.max(2, 2.5 * SCALE * z)
   local half = t / 2
-  -- dense stamps: each covers half the previous step -> solid line at any slope
-  local dist = math.abs(x2 - x1) + math.abs(y2 - y1)
-  local steps = math.max(24, math.min(120, math.ceil(dist / (half * 0.5))))
   local dx = x2 - x1
-  local c1x = x1 + dx * 0.5
-  local c2x = x2 - dx * 0.5
-  for i = 0, steps do
+  -- control points pull horizontally out of both ends (natural mindmap look)
+  local c1x = x1 + dx * 0.45
+  local c2x = x2 - dx * 0.45
+  local steps = 24
+  local px, py = x1, y1
+  for i = 1, steps do
     local s = i / steps
     local u = 1 - s
     local bx = u*u*u*x1 + 3*u*u*s*c1x + 3*u*s*s*c2x + s*s*s*x2
     local by = u*u*u*y1 + 3*u*u*s*y1 + 3*u*s*s*y2 + s*s*s*y2
-    renderer.draw_rect(bx - half, by - half, t, t, color)
+    renderer.draw_rect(math.min(px, bx) - half, math.min(py, by) - half,
+      math.abs(bx - px) + t, math.abs(by - py) + t, color)
+    px, py = bx, by
   end
 end
 
@@ -956,9 +960,11 @@ function MindView:draw()
   -- links (drawn under the nodes)
   local function link(n)
     for _, ch in ipairs(n.children) do
-      local x1 = (n.x + n.w) * c.z + c.x
+      -- inset endpoints so the line tucks under the pill edges
+      local inset = 2 * SCALE
+      local x1 = (n.x + n.w) * c.z + c.x - inset
       local y1 = n.y * c.z + c.y
-      local x2 = ch.x * c.z + c.x
+      local x2 = ch.x * c.z + c.x + inset
       local y2 = ch.y * c.z + c.y
       local bc = common.lerp(style.background, branch_color(ch), 0.62)
       draw_mind_link(x1, y1, x2, y2, bc, c.z)
