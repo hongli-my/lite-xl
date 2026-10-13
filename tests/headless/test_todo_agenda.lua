@@ -73,6 +73,9 @@ renderer = {
   draw_rect = function(x, y, w, h, color)
     draw_calls[#draw_calls + 1] = { x = x, y = y, w = w, h = h }
   end,
+  draw_rounded_rect = function(x, y, w, h, radius, color)
+    draw_calls[#draw_calls + 1] = { x = x, y = y, w = w, h = h, r = radius }
+  end,
 }
 
 SCALE = 1.0
@@ -363,15 +366,17 @@ eq(disk_line, "- [ ] 线代作业 4 @due(2026-10-16) #作业",
 
 -- simulate kanban drag to #复习: press on card, move to another column, release.
 view.view_mode = "kanban"
--- #cols = configured 4 (作业 复习 项目 生活) + present unknown tags + default.
--- Present tags here: 作业, 复习 (config order) → 5 columns total (4 + 其他).
--- 作业 is col 1 (x = 8), 复习 is col 2 (x = 8 + col_w + 8).
+-- geometry mirrors kanban_geometry(): col_w = max(200, min(260, 784/n)),
+-- gap = padding.x*1.5 = 12, head_h = fh+12 = 27, y0 = header+6,
+-- card_h = fh+20 = 35.  Columns: 4 configured + default = 5.
 local n_cols = 5
-local col_w = math.max(160, math.min(240, (800 - 16) / n_cols))
+local col_w = math.max(200, math.min(260, (800 - 24) / n_cols))
+local gap = 12
 local x_col1 = 8                          -- 作业 column left edge
-local x_col2 = x_col1 + col_w + 8         -- 复习 column left edge
--- first card of col 1: y0 = header + padding.y = 31; head_h = 23; card y = 58
-local card_y = 60
+local x_col2 = x_col1 + col_w + gap       -- 复习 column left edge
+local head_h = 27
+local y0 = view.position.y + view:get_header_height() + 6
+local card_y = y0 + head_h + 17           -- middle of the first card
 local hit = view:kanban_hit(x_col1 + 20, card_y)
 ok(hit and hit.kind == "card", "kanban hit-test finds a card")
 if hit then

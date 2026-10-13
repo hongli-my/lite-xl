@@ -560,16 +560,22 @@ local function col_scroll(self, col_idx, n_cols)
   return s[col_idx] or 0
 end
 
+-- Kanban geometry, Trello proportions: cards are 1.5 lines tall with real
+-- padding, columns are rounded containers with a colored dot header.
 local function kanban_geometry(self)
   local cols = kanban_columns_with_items(self.items)
   local lh = self:get_line_height()
-  local card_h = lh + style.padding.y      -- one line + breathing room
-  local col_w = math.max(160 * SCALE, math.min(240 * SCALE,
-    (self.size.x - style.padding.x * 2) / math.max(1, #cols)))
-  local gap = style.padding.x
+  local fh = style.font:get_height()
+  -- card: two lines of breathing room around one line of text
+  local card_h = fh + style.padding.y * 5
+  local col_w = math.max(200 * SCALE, math.min(260 * SCALE,
+    (self.size.x - style.padding.x * 3) / math.max(1, #cols)))
+  local gap = style.padding.x * 1.5
+  -- column header: dot + tag + count, taller than a plain line
+  local head_h = fh + style.padding.y * 3
   local x0 = self.position.x + style.padding.x + self.kanban_x
-  local y0 = self.position.y + self:get_header_height() + style.padding.y
-  return cols, lh, card_h, col_w, gap, x0, y0
+  local y0 = self.position.y + self:get_header_height() + style.padding.y * 1.5
+  return cols, lh, card_h, col_w, gap, x0, y0, head_h
 end
 
 -- Hit-test the kanban layout at view coords (mx, my).
@@ -578,12 +584,11 @@ end
 --   { kind = "column", tag = tag, col_idx = i, x=, y=, w=, h= }
 --   nil
 function TodoView:kanban_hit(mx, my)
-  local cols, lh, card_h, col_w, gap, x0, y0 = kanban_geometry(self)
+  local cols, lh, card_h, col_w, gap, x0, y0, head_h = kanban_geometry(self)
   for i, col in ipairs(cols) do
     local cx = x0 + (i - 1) * (col_w + gap)
     if mx >= cx and mx < cx + col_w then
       -- header zone of the column
-      local head_h = lh + style.padding.y
       if my >= y0 and my < y0 + head_h then
         return { kind = "column", tag = col.tag, col_idx = i,
           x = cx, y = y0, w = col_w, h = head_h }
@@ -591,7 +596,7 @@ function TodoView:kanban_hit(mx, my)
       -- cards (offset by this column's scroll)
       local sy = col_scroll(self, i, #cols)
       for j, item in ipairs(col.items) do
-        local cy = y0 + head_h + style.padding.y + (j - 1) * (card_h + gap) - sy
+        local cy = y0 + head_h + (j - 1) * (card_h + gap) - sy
         if my >= cy and my < cy + card_h then
           return { kind = "card", item = item, col_idx = i, card_idx = j,
             x = cx, y = cy, w = col_w, h = card_h }
@@ -632,102 +637,155 @@ function TodoView:on_mouse_wheel(dy, dx)
   return TodoView.super.on_mouse_wheel(self, dy, dx)
 end
 
--- Draw the kanban: a column per tag, cards inside.  When a drag is active,
--- the dragged card follows the cursor and the target column is highlighted.
+-- Stable per-tag hue: hash the tag into a palette of theme colours so every
+-- column gets its own dot colour — alive, but still theme-born.
+-- Palette entries: theme status colours + syntax colours (via style.syntax).
+local tag_color_cache = {}
+local function tag_color(tag)
+  local c = tag_color_cache[tag]
+  if c ~= nil then return c end
+  local n = 0
+  for i = 1, #tag do n = (n * 31 + tag:byte(i)) % 1000003 end
+  local syn = style.syntax or {}
+  local palette = {
+    style.accent, style.good, style.warn, style.modified,
+    syn.keyword, syn.keyword2, syn.number, syn.string, syn["function"],
+  }
+  c = palette[(n % #palette) + 1] or style.accent or style.text
+  -- blend toward the palette colour so near-black entries stay visible
+  c = common.lerp(style.text, c, 0.85)
+  tag_color_cache[tag] = c
+  return c
+end
+
+-- Header dot radius helper (font-derived).
+local function dot_radius()
+  return math.max(3 * SCALE, math.floor(style.code_font:get_height() * 0.28))
+end
+
+-- Draw the kanban: rounded column containers with colored dot headers,
+-- raised rounded cards.  The dragged card floats on top of everything.
 function TodoView:draw_kanban()
-  local cols, lh, card_h, col_w, gap, x0, y0 = kanban_geometry(self)
+  local cols, lh, card_h, col_w, gap, x0, y0, head_h = kanban_geometry(self)
   local today = today_str()
-  local head_h = lh + style.padding.y
+  local view_h = self.size.y - (y0 - self.position.y) - style.padding.y
+  local radius = 4 * SCALE
 
   for i, col in ipairs(cols) do
     local cx = x0 + (i - 1) * (col_w + gap)
-    -- column background (theme-safe surface, not chrome background2)
-    renderer.draw_rect(cx, y0, col_w, self.size.y - (y0 - self.position.y),
+    local tcol = tag_color(col.tag)
+    -- column container: rounded, one step above the view background
+    renderer.draw_rounded_rect(cx, y0, col_w, view_h, radius + 2 * SCALE,
       surface_color())
-    -- column header: tag + count
+    -- column header: colored dot + tag name + open-count chip
     local open_n = 0
     for _, it in ipairs(col.items) do
       if not it.checked then open_n = open_n + 1 end
     end
-    common.draw_text(style.font, style.text, "#" .. col.tag, "left",
-      cx + style.padding.x, y0, col_w, lh)
-    common.draw_text(style.code_font, style.dim, tostring(#col.items), "right",
-      cx, y0, col_w - style.padding.x, lh)
-    renderer.draw_rect(cx, y0 + head_h - style.divider_size,
-      col_w, style.divider_size, style.divider)
+    local dr = dot_radius()
+    local dot_y = y0 + style.padding.y
+    renderer.draw_rounded_rect(cx + style.padding.x * 1.5, dot_y,
+      dr * 2, dr * 2, dr, tcol)
+    common.draw_text(style.font, style.text, col.tag, "left",
+      cx + style.padding.x * 1.5 + dr * 2 + style.padding.x,
+      y0, col_w, head_h)
+    local cnt = tostring(open_n)
+    local cnt_h = style.code_font:get_height() + style.padding.y
+    local cnt_w = style.code_font:get_width(cnt) + style.padding.x * 1.5
+    local cnt_y = y0 + (head_h - cnt_h) / 2
+    renderer.draw_rounded_rect(cx + col_w - cnt_w - style.padding.x, cnt_y,
+      cnt_w, cnt_h, radius, raised_color())
+    common.draw_text(style.code_font, style.dim, cnt, "center",
+      cx + col_w - cnt_w - style.padding.x, cnt_y, cnt_w, cnt_h)
     -- cards (scrolled per column, clipped to the column body)
     local sy = col_scroll(self, i, #cols)
-    core.push_clip_rect(cx, y0 + head_h, col_w,
-      self.position.y + self.size.y - y0 - head_h)
+    core.push_clip_rect(cx, y0 + head_h, col_w, view_h - head_h)
     for j, item in ipairs(col.items) do
-      local cy = y0 + head_h + style.padding.y + (j - 1) * (card_h + gap) - sy
+      local cy = y0 + head_h + (j - 1) * (card_h + gap) - sy
       local hovered = self.hover_item == item
       local dragging = self.drag and self.drag.item == item
       if not dragging then
-        self:draw_card(cx + 2 * SCALE, cy, col_w - 4 * SCALE, card_h, item,
-          hovered, today)
+        self:draw_card(cx + style.padding.x, cy,
+          col_w - style.padding.x * 2, card_h, item, hovered, today, tcol)
       end
     end
     core.pop_clip_rect()
-    -- drag target highlight
+    -- drag target highlight: tint the whole column toward its tag colour
     if self.drag and self.drag.target_col == i then
-      renderer.draw_rect(cx, y0, col_w,
-        self.size.y - (y0 - self.position.y),
-        style.dragging_highlight or style.line_highlight)
+      renderer.draw_rounded_rect(cx, y0, col_w, view_h, radius + 2 * SCALE,
+        common.lerp(style.background, tcol, 0.10))
     end
   end
 
   -- dragged card on top, following the cursor
   if self.drag then
     local d = self.drag
-    local w = col_w - 4 * SCALE
-    self:draw_card(d.x - w / 2, d.y - card_h / 2, w, card_h, d.item, true, today)
+    local w = col_w - style.padding.x * 2
+    local tcol = tag_color(d.item.tag
+      or config.plugins.todo_agenda.kanban_default_column)
+    self:draw_card(d.x - w / 2, d.y - card_h / 2, w, card_h, d.item,
+      true, today, tcol)
   end
 end
 
--- One kanban card: filled background + 2px left accent bar + checkbox.
--- Done cards go dim with a ✓ in the checkbox; hover lifts the background
--- and brightens the accent bar instead of drawing a four-side border.
-function TodoView:draw_card(x, y, w, h, item, hovered, today)
-  local bg = hovered and raised_color() or surface_color()
-  renderer.draw_rect(x, y, w, h, bg)
-  -- left accent bar: dim for open tasks, faded for done ones
-  local bar = item.checked and style.divider
-    or (hovered and (style.accent or style.text) or (style.dim))
-  renderer.draw_rect(x, y, 2 * SCALE, h, bar)
-  -- checkbox
-  local box = math.floor(h * 0.4)
-  local bx, by = x + style.padding.x + 2 * SCALE, y + math.floor((h - box) / 2)
-  renderer.draw_rect(bx, by, box, box,
+-- One kanban card, Trello style: raised rounded rectangle with a soft
+-- shadow ring, colored left bar matching the column, checkbox, and a due
+-- chip on a second visual layer (bottom-right) when it fits.
+function TodoView:draw_card(x, y, w, h, item, hovered, today, tcol)
+  local radius = 4 * SCALE
+  -- soft shadow: slightly larger, darker rounded rect under the card
+  renderer.draw_rounded_rect(x, y + 1.5 * SCALE, w, h, radius,
+    common.lerp(style.background, style.text, 0.03))
+  -- card body: clearly raised above the column surface
+  local bg = common.lerp(style.background, style.text,
+    hovered and 0.19 or 0.15)
+  renderer.draw_rounded_rect(x, y, w, h, radius, bg)
+  -- colored left bar (column hue; dimmed when the task is done)
+  local bar = item.checked and common.lerp(style.background, style.text, 0.10)
+    or tcol
+  renderer.draw_rounded_rect(x, y, 3 * SCALE, h, 1.5 * SCALE, bar)
+  -- checkbox (hollow square, filled with a check when done)
+  local box = math.floor(h * 0.34)
+  local bx, by = x + style.padding.x * 1.5 + 3 * SCALE,
+    y + math.floor((h - box) / 2)
+  renderer.draw_rounded_rect(bx, by, box, box, 1.5 * SCALE,
     item.checked and (style.accent or style.text) or style.dim)
   if item.checked then
-    -- ✓ impression: hollow box with an accent check, matching list view
-    renderer.draw_rect(bx + 1 * SCALE, by + 1 * SCALE,
-      box - 2 * SCALE, box - 2 * SCALE, bg)
+    renderer.draw_rounded_rect(bx + 1.5 * SCALE, by + 1.5 * SCALE,
+      box - 3 * SCALE, box - 3 * SCALE, 1 * SCALE, bg)
     local cx, cy = bx + box * 0.5, by + box * 0.5
     local len = math.floor(box * 0.25)
     renderer.draw_rect(cx - len, cy, len, 1 * SCALE, style.accent or style.text)
     renderer.draw_rect(cx, cy, 1 * SCALE, len, style.accent or style.text)
   end
-  -- text (dim + strikethrough-like "✓ " prefix conveys done state)
+  -- text
   local tx = bx + box + style.padding.x
   local tcolor = item.checked and style.dim or style.text
   local label = (item.checked and "✓ " or "") .. item.display
+  local avail = w - (tx - x) - style.padding.x
+  -- due chip at the bottom-right of the card when there is room
   if item.due then
     local overdue = (not item.checked) and date_lt(item.due, today)
-    local chip = "⏰ " .. item.due
-    local chip_w = style.code_font:get_width(chip) + style.padding.x
-    local avail = w - (tx - x) - style.padding.x
-    local tw = style.font:get_width(label)
-    -- draw the due chip only when the card has room for text + chip
-    if tw + chip_w < avail then
+    local chip = "⏰ " .. item.due:sub(6)
+    local chip_h = style.code_font:get_height() + style.padding.y * 0.5
+    local chip_w = style.code_font:get_width(chip) + style.padding.x * 1.5
+    if chip_w < avail then
+      local ch_y = y + h - chip_h - style.padding.y * 0.5
+      renderer.draw_rounded_rect(x + w - chip_w - style.padding.x * 0.5,
+        ch_y, chip_w, chip_h, 3 * SCALE,
+        common.lerp(style.background, overdue and error_color() or style.dim,
+          0.35))
       common.draw_text(style.code_font,
-        overdue and error_color() or style.dim, chip, "left",
-        x + w - chip_w - style.padding.x, y, chip_w, h)
+        overdue and error_color() or style.dim, chip, "center",
+        x + w - chip_w - style.padding.x * 0.5, ch_y, chip_w, chip_h)
+      -- text stays on the upper half when a chip is present
+      local text_h = h - chip_h - style.padding.y
+      draw_text_clipped(style.font, tcolor, label, "left", tx, y,
+        avail, text_h)
+      return
     end
   end
-  draw_text_clipped(style.font, tcolor, label, "left", tx, y,
-    w - (tx - x) - style.padding.x, h)
+  draw_text_clipped(style.font, tcolor, label, "left", tx, y, avail, h)
 end
 
 -----------------------------------------------------------------------
@@ -814,16 +872,16 @@ function TodoView:draw_calendar()
       if in_month then
         ds = string.format("%04d-%02d-%02d", self.cal_year, self.cal_month, day)
       end
-      -- cell background (theme-safe: surface for in-month, plain bg outside)
-      renderer.draw_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2,
-        in_month and surface_color() or style.background)
+      -- cell background: rounded, theme-safe surface for in-month days
+      renderer.draw_rounded_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2,
+        4 * SCALE, in_month and surface_color() or style.background)
       local is_today = ds == today
       if is_today then
-        renderer.draw_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2, raised_color())
-        renderer.draw_rect(cx + 1, cy + 1, cw_i - 2, 1 * SCALE, style.accent)
-        renderer.draw_rect(cx + 1, cy + 1, 1 * SCALE, cell_h - 2, style.accent)
-        renderer.draw_rect(cx + cw_i - 2 * SCALE, cy + 1, 1 * SCALE, cell_h - 2, style.accent)
-        renderer.draw_rect(cx + 1, cy + cell_h - 2 * SCALE, cw_i - 2, 1 * SCALE, style.accent)
+        -- today: raised cell with a colored ring (two-pass rounded stroke)
+        renderer.draw_rounded_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2,
+          4 * SCALE, tag_color(today))
+        renderer.draw_rounded_rect(cx + 2.5 * SCALE, cy + 2.5 * SCALE,
+          cw_i - 5 * SCALE, cell_h - 5 * SCALE, 3 * SCALE, raised_color())
       end
       -- day number
       if in_month then
@@ -839,13 +897,19 @@ function TodoView:draw_calendar()
           for k = 1, math.min(#list, math.floor((cell_h - fh - 2) / lh)) do
             local it = list[k]
             local overdue = (not it.checked) and date_lt(it.due, today)
-            -- 2px accent bar on the left
-            renderer.draw_rect(cx + 2, ly, 2 * SCALE, lh - 2 * SCALE,
-              overdue and error_color() or (style.accent or style.text))
+            -- event pill: rounded chip tinted with the task's tag colour
+            local tcol = tag_color(it.tag
+              or config.plugins.todo_agenda.kanban_default_column)
+            local pill_bg = common.lerp(style.background,
+              overdue and error_color() or tcol, 0.22)
+            renderer.draw_rounded_rect(cx + 3, ly + 1, cw_i - 6, lh - 3,
+              3 * SCALE, pill_bg)
+            renderer.draw_rect(cx + 3, ly + 1, 2 * SCALE, lh - 3,
+              overdue and error_color() or tcol)
             draw_text_clipped(style.font,
               it.checked and style.dim or style.text,
               (it.checked and "✓ " or "") .. it.display, "left",
-              cx + 2 + 2 * SCALE + 2, ly - 1, cw - 12, lh)
+              cx + 3 + 2 * SCALE + 4, ly - 1, cw_i - 14, lh)
             ly = ly + lh
           end
           if #list > math.floor((cell_h - fh - 2) / lh) then
