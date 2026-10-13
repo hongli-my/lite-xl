@@ -430,6 +430,8 @@ function CanvasView:on_mouse_moved(mx, my, ...)
     elseif self.drag.kind == "card" then
       if math.abs(mx - self.drag.sx) + math.abs(my - self.drag.sy) > 4 then
         self.drag.moved = true
+        -- user-dragged cards are pinned: kbgen keeps their position on regen
+        self.drag.card.pinned = true
       end
       local c = self.drag.card
       c.x = self.drag.ox + (mx - self.drag.sx) / self.cam.z
@@ -673,7 +675,7 @@ function CanvasView:draw()
     end
   end
 
-  -- arrows between card centres
+  -- arrows between cards
   local function draw_arrow(x1, y1, x2, y2, col)
     local t = 1.5 * SCALE
     -- horizontal then vertical elbow
@@ -687,17 +689,47 @@ function CanvasView:draw()
     renderer.draw_rect(x2 - ah / 2, y2 - dir * ah, ah, t, col)
     renderer.draw_rect(x2 - ah / 2, y2 - dir * ah / 2, ah / 2 + t / 2, t, col)
   end
+  -- organic mindmap curve for structural links (same L-coverage raster as
+  -- MindView links): from parent's right edge into child's left edge
+  local function draw_struct_curve(from, to, col)
+    local fw, fh = self:card_geometry(from)
+    local tw, th = self:card_geometry(to)
+    local x1 = (from.x + fw) * c.z + c.x
+    local y1 = (from.y + fh / 2) * c.z + c.y
+    local x2 = to.x * c.z + c.x
+    local y2 = (to.y + th / 2) * c.z + c.y
+    local z = c.z
+    local t = math.max(2, 2.5 * SCALE * z)
+    local half = t / 2
+    local dx = x2 - x1
+    local c1x = x1 + dx * 0.45
+    local c2x = x2 - dx * 0.45
+    local steps = 24
+    local px, py = x1, y1
+    for i = 1, steps do
+      local s = i / steps
+      local u = 1 - s
+      local bx = u*u*u*x1 + 3*u*u*s*c1x + 3*u*s*s*c2x + s*s*s*x2
+      local by = u*u*u*y1 + 3*u*u*s*y1 + 3*u*s*s*y2 + s*s*s*y2
+      renderer.draw_rect(math.min(px, bx) - half, math.min(py, by) - half,
+        math.abs(bx - px) + t, math.abs(by - py) + t, col)
+      px, py = bx, by
+    end
+  end
   for _, a in ipairs(self.arrows) do
     local from, to = self.cards[a.from], self.cards[a.to]
     if from and to then
-      local fw, fh = self:card_geometry(from)
-      local tw, th = self:card_geometry(to)
-      draw_arrow((from.x + fw / 2) * c.z + c.x, (from.y + fh / 2) * c.z + c.y,
-        (to.x + tw / 2) * c.z + c.x, (to.y + th / 2) * c.z + c.y,
-        -- structural links (kbgen dir->section) render dimmer than hand-drawn
-        a.kind == "struct"
-          and common.lerp(style.background, style.text, 0.22)
-          or common.lerp(style.background, style.accent or style.text, 0.55))
+      if a.kind == "struct" then
+        -- structural links (kbgen dir->section) as organic mindmap curves
+        draw_struct_curve(from, to,
+          common.lerp(style.background, style.text, 0.28))
+      else
+        local fw, fh = self:card_geometry(from)
+        local tw, th = self:card_geometry(to)
+        draw_arrow((from.x + fw / 2) * c.z + c.x, (from.y + fh / 2) * c.z + c.y,
+          (to.x + tw / 2) * c.z + c.x, (to.y + th / 2) * c.z + c.y,
+          common.lerp(style.background, style.accent or style.text, 0.55))
+      end
     end
   end
   -- in-progress arrow drag preview

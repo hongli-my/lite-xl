@@ -44,7 +44,11 @@ local c1_arrows = c1:match('"arrows": *(%b[])')
 local user_from = c1:match('"id":"(k%d+)"') or "k1"
 local user_arrows = c1_arrows:sub(2, -2) .. ","
   .. '{"from":"' .. user_from .. '","to":"x1"}'
-local t = (c1:gsub('"x":380', '"x":999', 1))
+-- move the FIRST md card (any x value) to x=999
+local any_x = c1:match('"id":"' .. user_from .. '"[^}]*"x":(%d+)')
+  or c1:match('"x":(%d+)')
+local t = (c1:gsub('"x":' .. any_x, '"x":999', 1))
+  :gsub('"id":"' .. user_from .. '"', '"id":"' .. user_from .. '","pinned":true', 1)
   :gsub('"arrows": *%b[]', '"arrows": [' .. user_arrows .. "]")
 ok(t:find('"x":999', 1, true) ~= nil, "user card move patched in")
 ok(t:find('"to":"x1"', 1, true) ~= nil, "user arrow patched in")

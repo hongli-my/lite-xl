@@ -178,10 +178,18 @@ local function json_decode(s)
   return parse()
 end
 
+---------------------------------------------------------------------
+-- 驾驶舱 canvas: 思维导图式树形布局 + 增量合并
+--   * 结构: 中心根卡 → 目录卡 → 章节卡 (struct 箭头, 导图曲线渲染)
+--   * 卡片键 = file+heading / dir; 已有卡位置保留
+--   * 新章节沿其父目录的分支追加; 手绘箭头/便签/frame 永不丢
+---------------------------------------------------------------------
+
 local function gen_canvas(root, path)
   -- read existing sidecar if present
   local existing_cards, arrows, frames = {}, {}, {}
   local by_section, by_dir = {}, {}
+  local root_card
   local fp = io.open(path, "r")
   if fp then
     local ok, data = pcall(json_decode, fp:read("*a"))
@@ -193,6 +201,8 @@ local function gen_canvas(root, path)
           by_section[(c.file or "?") .. "\t" .. (c.heading or "?")] = c
         elseif c.type == "sticky" and c.dir then
           by_dir[c.dir] = c
+        elseif c.type == "sticky" and c.is_root then
+          root_card = c
         end
       end
       arrows = data.arrows or {}
@@ -200,60 +210,119 @@ local function gen_canvas(root, path)
     end
   end
 
-  -- keep every user card (stickies, images, deleted-section md cards) as-is
+  -- keep every user card as-is
   local cards = {}
   for _, c in ipairs(existing_cards) do
     cards[#cards + 1] = c
   end
 
-  -- per-dir: sticky entry card + section cards + struct arrows dir->section
-  local struct_arrows = {}
-  local max_x = 0
-  for _, c in ipairs(cards) do max_x = math.max(max_x, c.x or 0) end
-  local col_w = 300
-  local cx = max_x + col_w + 80
-  local next_id = #cards
+  -- measure: char-width estimate is fine for layout (CJK ~ 1em, latin ~ 0.55em)
+  local EM = 16
+  local function est_w(text) return #text * EM * 0.62 + 48 end
+  local function est_h(n_lines) return n_lines * EM + 26 end
+
+  -- 1) collect the section tree from all dir READMEs
+  local dirs = {}
   for _, dir in ipairs(config.plugins.kbgen.dirs) do
     local lines = read_lines(root .. "/" .. dir .. "/README.md")
     if lines then
-      -- directory entry card (sticky, clickable through to the README)
-      local dcard = by_dir[dir]
-      if not dcard then
-        next_id = next_id + 1
-        dcard = { id = "d" .. tostring(next_id), type = "sticky",
-          dir = dir, text = "📂 " .. dir, x = cx, y = 40 }
-        cards[#cards + 1] = dcard
-      end
-      -- section cards for NEW sections only (existing keep their positions)
-      local y = 160
-      local n_in_col = 0
+      local sections = {}
       for _, l in ipairs(lines) do
         local hashes, title = l:match("^(#+)%s+(.-)%s*$")
         if hashes and #hashes >= 2 then
-          local file = dir .. "/README.md"
-          local heading = string.rep("#", #hashes) .. " " .. title
-          local key = file .. "\t" .. heading
-          local scard = by_section[key]
-          if not scard then
-            next_id = next_id + 1
-            scard = { id = "k" .. tostring(next_id),
-              type = "md", file = file, heading = heading,
-              x = cx, y = y }
-            cards[#cards + 1] = scard
-            by_section[key] = scard
-            y = y + 200
-            n_in_col = n_in_col + 1
-          end
-          -- struct arrows always rebuilt from current ids
-          struct_arrows[#struct_arrows + 1] =
-            { from = dcard.id, to = by_section[key].id, kind = "struct" }
+          sections[#sections + 1] = {
+            file = dir .. "/README.md",
+            heading = string.rep("#", #hashes) .. " " .. title,
+            title = title,
+            n_rows = 0,
+          }
+        elseif #sections > 0 and l:match("^%s*-%s+") then
+          sections[#sections].n_rows = sections[#sections].n_rows + 1
         end
       end
-      if n_in_col > 0 then cx = cx + col_w + 60 end
+      if #sections > 0 then dirs[#dirs + 1] = { dir = dir, sections = sections } end
     end
   end
 
-  -- user-drawn arrows (no kind field) are preserved; struct arrows rebuilt
+  -- 2) assign / create cards for the tree nodes (positions from layout below)
+  local next_id = #cards
+  local function new_id(prefix)
+    next_id = next_id + 1
+    return prefix .. tostring(next_id)
+  end
+  -- the mindmap root card
+  if not root_card then
+    root_card = { id = new_id("r"), type = "sticky", is_root = true,
+      text = "📦 知识库", x = 0, y = 0 }
+    cards[#cards + 1] = root_card
+  end
+  local struct_arrows = {}
+  for _, d in ipairs(dirs) do
+    local dcard = by_dir[d.dir]
+    if not dcard then
+      dcard = { id = new_id("d"), type = "sticky", dir = d.dir,
+        text = "📂 " .. d.dir, x = 0, y = 0 }
+      cards[#cards + 1] = dcard
+    end
+    d.card = dcard
+    struct_arrows[#struct_arrows + 1] =
+      { from = root_card.id, to = dcard.id, kind = "struct" }
+    for _, s in ipairs(d.sections) do
+      local key = s.file .. "\t" .. s.heading
+      local scard = by_section[key]
+      if not scard then
+        scard = { id = new_id("k"), type = "md", file = s.file,
+          heading = s.heading, x = 0, y = 0 }
+        cards[#cards + 1] = scard
+        by_section[key] = scard
+      end
+      -- estimated card size: heading strip + up to 5 rows
+      s.card = scard
+      s.w = math.max(est_w(s.title), est_w("共 " .. math.max(s.n_rows,1) .. " 项") )
+      s.h = est_h(math.min(s.n_rows, 5) + 1)
+      struct_arrows[#struct_arrows + 1] =
+        { from = dcard.id, to = scard.id, kind = "struct" }
+    end
+  end
+
+  -- 3) tree layout: classic mindmap (right-growing), parents vertically centred.
+  --    Cards the user has dragged (pinned=true, saved by canvas) keep their
+  --    position; only unpinned struct cards get re-laid-out.
+  local X_GAP, Y_GAP = 90, 26
+  local x_root = 0
+  local x_dirs = x_root + est_w(root_card.text) + X_GAP
+  local cursor = 0
+  for _, d in ipairs(dirs) do
+    local total_h = 0
+    for _, s in ipairs(d.sections) do
+      total_h = total_h + s.h + Y_GAP
+    end
+    total_h = math.max(total_h - Y_GAP, 0)
+    d.y_mid = cursor + total_h / 2
+    local dcard_y = cursor + total_h / 2 - est_h(1) / 2
+    d.card_y = dcard_y
+    local sy = cursor
+    for _, s in ipairs(d.sections) do
+      if not s.card.pinned then
+        s.card.x = x_dirs + est_w(d.dir) + X_GAP
+        s.card.y = sy
+      end
+      sy = sy + s.h + Y_GAP
+    end
+    cursor = sy + Y_GAP * 2.5
+  end
+  for _, d in ipairs(dirs) do
+    if not d.card.pinned then
+      d.card.x = x_dirs
+      d.card.y = d.card_y
+    end
+  end
+  if not root_card.pinned then
+    root_card.x = x_root
+    root_card.y = (cursor - Y_GAP * 2.5) / 2 - est_h(1) / 2
+  end
+
+  -- 4) user-drawn arrows (no kind) are preserved; struct rebuilt
   local final_arrows = {}
   for _, a in ipairs(arrows) do
     if not a.kind then final_arrows[#final_arrows + 1] = a end
