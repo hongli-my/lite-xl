@@ -349,7 +349,9 @@ function CanvasView:card_geometry(card)
     local lines = card._md_lines or {}
     -- collapsed cards show only the heading strip
     local n = card.collapsed and 1 or #lines
-    local h = card.h or (fh + n * (fh + 2) + pad * 2 + 6)
+    local want = fh + n * (fh + 2) + pad * 2 + 6
+    -- stored h is a floor (min height), content can always grow past it
+    local h = math.max(card.h or 0, want)
     return w, h, lines
   end
 end
@@ -384,10 +386,10 @@ function CanvasView:refresh_md_card(card)
       local t = text:match("^%s*-%s+(.+)$") or text
       if t ~= "" then
         count = count + 1
-        -- markdown links become clickable sub-items: [label](target)
-        local label, target = t:match("^%[(.-)%]%((.-)%)$")
+        -- markdown link bullets: [label](target) with optional trailing note
+        local label, target, note = t:match("^%[(.-)%]%((.-)%)%s*(.*)$")
         lines[#lines + 1] = label and ("▸ " .. label) or t
-        -- keyed by line index so hit-testing can map row -> target directly
+        -- keyed by line index so hit-testing maps row -> target directly
         links[#lines] = label and target or nil
       end
     end
@@ -395,7 +397,13 @@ function CanvasView:refresh_md_card(card)
   if doc then
     for i = 1, #doc.lines do feed(doc.lines[i]:gsub("\n$", "")) end
   else
-    local fp = io.open(card.file, "r")
+    -- resolve relative paths against the sidecar's directory (the project)
+    local path = card.file
+    if path and not path:find("^/") then
+      local dir = self.path and self.path:match("^(.*)[/\\]")
+      if dir then path = dir .. "/" .. path end
+    end
+    local fp = io.open(path, "r")
     if not fp then return end
     for text in fp:lines() do feed(text) end
     fp:close()
