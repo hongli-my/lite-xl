@@ -627,6 +627,17 @@ function CanvasView:draw()
     60, style.code_font:get_height())
 end
 
+local function draw_text_clipped_canvas(font, color, text, x, y, w, h)
+  local label = text
+  if font:get_width(label) > w and w > 4 then
+    while #label > 1 and font:get_width(label .. "…") > w do
+      label = label:sub(1, -2)
+    end
+    label = label .. "…"
+  end
+  return common.draw_text(font, color, label, "left", x, y, w, h)
+end
+
 function CanvasView:draw_card(card)
   local c = self.cam
   local fh = style.font:get_height()
@@ -683,17 +694,6 @@ function CanvasView:draw_card(card)
   end
 end
 
--- clipped text for the canvas (same truncation rule as todo_agenda)
-function draw_text_clipped_canvas(font, color, text, x, y, w, h)
-  local label = text
-  if font:get_width(label) > w and w > 4 then
-    while #label > 1 and font:get_width(label .. "…") > w do
-      label = label:sub(1, -2)
-    end
-    label = label .. "…"
-  end
-  return common.draw_text(font, color, label, "left", x, y, w, h)
-end
 
 ---------------------------------------------------------------------
 -- mindmap view (separate View over a markdown outline)
