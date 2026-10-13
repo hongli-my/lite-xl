@@ -929,7 +929,7 @@ command.add(nil, {
 })
 
 keymap.add({
-  ["ctrl+shift+m"] = "mindmap:open",
+  ["ctrl+shift+e"] = "mindmap:open",
 })
 
 return { CanvasView = CanvasView, MindView = MindView, json = json }

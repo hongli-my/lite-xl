@@ -8,7 +8,7 @@
 | 操作 | 命令/快捷键 |
 |---|---|
 | 当前 md 文件开画布 | `canvas:open`(侧栏命令面板) |
-| 当前 md 文件开导图 | `mindmap:open` / `ctrl+shift+m` |
+| 当前 md 文件开导图 | `mindmap:open` / `ctrl+shift+e` |
 
 画布数据存 `<文件名>.canvas`(同目录 sidecar JSON),可直接放进 git 或忽略。
 
@@ -45,7 +45,7 @@
 
 ## Mindmap 导图
 
-打开任意 markdown 文件后 `ctrl+shift+m`:嵌套 `- 列表` 渲染为树(两层缩进 = 一层树),
+打开任意 markdown 文件后 `ctrl+shift+e`:嵌套 `- 列表` 渲染为树(两层缩进 = 一层树),
 `- 平级` = 兄弟节点。
 
 ```markdown

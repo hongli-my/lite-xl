@@ -187,7 +187,7 @@ local CanvasView, MindView, json = plugin.CanvasView, plugin.MindView, plugin.js
 ok(CanvasView and MindView and json, "plugin exports CanvasView/MindView/json")
 ok(commands["canvas:open"], "canvas:open registered")
 ok(commands["mindmap:open"], "mindmap:open registered")
-eq(keymaps["ctrl+shift+m"], "mindmap:open", "keymap bound")
+eq(keymaps["ctrl+shift+e"], "mindmap:open", "keymap bound")
 
 -- ---------------- json round-trip --------------------------------------------
 local doc1 = {
