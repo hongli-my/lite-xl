@@ -197,11 +197,35 @@ function CanvasView:new(path)
   self.card_order = {}        -- array of ids (z-order, last on top)
   self.arrows = {}
   self.frames = {}
-  self.cam = { x = 40, y = 30, z = 0.9 }
+  self.cam = { x = 0, y = 0, z = 1.0 }
   self.drag = nil             -- { kind="card"/"pan", ... }
   self.hover = nil            -- card id under cursor
   self._mouse_x, self._mouse_y = 0, 0
   self:load()
+  self:center_content()
+end
+
+-- Centre the card cloud in the viewport (first open only, before any pan).
+function CanvasView:center_content()
+  if #self.card_order == 0 or self.size.x <= 0 then return end
+  local min_x, min_y = math.huge, math.huge
+  local max_x, max_y = -math.huge, -math.huge
+  for _, id in ipairs(self.card_order) do
+    local card = self.cards[id]
+    local w, h = self:card_geometry(card)
+    min_x = math.min(min_x, card.x)
+    min_y = math.min(min_y, card.y)
+    max_x = math.max(max_x, card.x + w)
+    max_y = math.max(max_y, card.y + h)
+  end
+  local tw, th = max_x - min_x, max_y - min_y
+  local vw, vh = self.size.x, self.size.y
+  local pad = 32 * SCALE
+  local z = math.min(1.0, (vw - pad * 2) / tw, (vh - pad * 2) / th)
+  z = math.max(z, 0.25)
+  self.cam.z = z
+  self.cam.x = (vw - tw * z) / 2 - min_x * z
+  self.cam.y = (vh - th * z) / 2 - min_y * z
 end
 
 function CanvasView:get_name()
@@ -646,24 +670,28 @@ function CanvasView:draw_card(card)
   local x, y = card.x * c.z + c.x, card.y * c.z + c.y
   local sw, sh = w * c.z, h * c.z
   local hovered = (self.hover == card.id)
+  local r = 6 * SCALE
+
+  -- soft drop shadow under every card (offset copy, theme-safe)
+  local sh_col = common.lerp(style.background, style.text, 0.06)
+  renderer.draw_rounded_rect(x + 2 * SCALE, y + 3 * SCALE, sw, sh, r, sh_col)
 
   if card.type == "sticky" then
     local bg = sticky_color(card.id)
-    renderer.draw_rounded_rect(x, y, sw, sh, 4 * SCALE, bg)
-    -- slight darker edge
-    renderer.draw_rounded_rect(x, y + sh - 2 * SCALE, sw, 2 * SCALE, 1 * SCALE,
-      common.lerp(bg, style.background, 0.3))
-    if hovered then
-      renderer.draw_rounded_rect(x, y, sw, sh, 4 * SCALE,
-        common.lerp(bg, style.text, 0.15))
-    end
+    if hovered then bg = common.lerp(bg, style.text, 0.10) end
+    renderer.draw_rounded_rect(x, y, sw, sh, r, bg)
+    -- left accent bar
+    renderer.draw_rounded_rect(x, y + 2 * SCALE, 3 * SCALE, sh - 4 * SCALE,
+      1.5 * SCALE, common.lerp(bg, style.text, 0.28))
     local fs = fh * c.z
     for li, l in ipairs(lines) do
-      draw_text_clipped_canvas(style.font, style.text, l, x + pad * c.z,
-        y + (pad + (li - 1) * fh) * c.z, sw - pad * 2 * c.z, fs)
+      draw_text_clipped_canvas(style.font, style.text, l,
+        x + (pad + 4) * c.z, y + (pad + (li - 1) * fh) * c.z,
+        sw - (pad + 6) * c.z, fs)
     end
   elseif card.type == "image" then
-    renderer.draw_rounded_rect(x, y, sw, sh, 4 * SCALE, raised_color())
+    renderer.draw_rounded_rect(x, y, sw, sh, r,
+      hovered and raised_color() or surface_color())
     if card._img then
       renderer.draw_image(card._img, x + 2 * SCALE, y + 2 * SCALE,
         sw - 4 * SCALE, (sh - fh - 6) * c.z - 4 * SCALE)
@@ -679,11 +707,11 @@ function CanvasView:draw_card(card)
         x + pad * c.z, y + sh - (fh + 2) * c.z, sw - pad * 2 * c.z, fh * c.z)
     end
   else -- md card
-    renderer.draw_rounded_rect(x, y, sw, sh, 4 * SCALE,
+    renderer.draw_rounded_rect(x, y, sw, sh, r,
       hovered and raised_color() or surface_color())
     -- heading strip
-    renderer.draw_rounded_rect(x, y, sw, fh * c.z + pad * c.z, 4 * SCALE,
-      common.lerp(style.background, style.accent or style.text, 0.18))
+    renderer.draw_rounded_rect(x, y, sw, (fh + pad) * c.z, r,
+      common.lerp(style.background, style.accent or style.text, 0.20))
     draw_text_clipped_canvas(style.font, style.text, lines and lines[1] or "md",
       x + pad * c.z, y + pad * c.z * 0.5, sw - pad * 2 * c.z, fh * c.z)
     for li = 2, #(lines or {}) do
@@ -706,10 +734,11 @@ function MindView:__tostring() return "MindView" end
 function MindView:new(path)
   MindView.super.new(self)
   self.path = path
-  self.cam = { x = 40, y = 40, z = 1.0 }
+  self.cam = { x = 0, y = 0, z = 1.0 }
   self.drag = nil
   self._mouse_x, self._mouse_y = 0, 0
   self:parse()
+  self:center_and_fit()
 end
 
 function MindView:get_name()
@@ -752,10 +781,11 @@ function MindView:parse()
   end
   -- tidy tree layout: leaves left-to-right, parents centred
   local fh = style.font:get_height()
-  local ygap, xgap = fh + 14, 230
+  local ygap = fh + 16
   local row = 0
   local nodes = {}
   local function layout(n, depth)
+    n.depth = depth
     if #n.children == 0 then
       n.y = row * ygap
       row = row + 1
@@ -763,13 +793,47 @@ function MindView:parse()
       for _, ch in ipairs(n.children) do layout(ch, depth + 1) end
       n.y = (n.children[1].y + n.children[#n.children].y) / 2
     end
-    n.x = depth * xgap
-    n.w = style.font:get_width(n.text) + style.padding.x * 2
+    n.w = style.font:get_width(n.text) + style.padding.x * 2.5
     nodes[#nodes + 1] = n
   end
   layout(root, 0)
   self.root = root
   self.nodes = nodes
+  -- proper column layout: cumulative x per depth
+  local xgap = 64
+  local col_x = { 0 }
+  local max_row_w = {}
+  for _, n in ipairs(nodes) do
+    max_row_w[n.depth] = math.max(max_row_w[n.depth] or 0, n.w)
+  end
+  local acc = 0
+  local max_depth = 0
+  for _, n in ipairs(nodes) do if n.depth > max_depth then max_depth = n.depth end end
+  for d = 0, max_depth do
+    col_x[d] = acc
+    acc = acc + (max_row_w[d] or 0) + xgap
+  end
+  for _, n in ipairs(nodes) do n.x = col_x[n.depth] or 0 end
+  -- branch colour index: first-level children get distinct colours
+  for i, ch in ipairs(root.children) do
+    local function tag(n) n.branch = i for _, cc in ipairs(n.children) do tag(cc) end end
+    tag(ch)
+  end
+  self._tree_w = acc - xgap
+  self._tree_h = math.max(row - 1, 0) * ygap + fh
+end
+
+-- Centre the tree in the viewport and pick a zoom that fits it.
+function MindView:center_and_fit()
+  if not self._tree_w or self.size.x <= 0 then return end
+  local tw, th = self._tree_w, self._tree_h
+  local vw, vh = self.size.x, self.size.y
+  local pad = 24 * SCALE
+  local z = math.min(1.0, (vw - pad * 2) / tw, (vh - pad * 2) / th)
+  z = math.max(z, 0.25)
+  self.cam.z = z
+  self.cam.x = (vw - tw * z) / 2
+  self.cam.y = (vh - th * z) / 2
 end
 
 function MindView:on_mouse_moved(mx, my, ...)
@@ -836,25 +900,56 @@ function MindView:on_mouse_wheel(dy, dx)
   return true
 end
 
+-- Branch palette: distinct theme hues per first-level branch.
+local MIND_PALETTE = {
+  "accent", "good", "warn", "modified", "error", "syntax_normal",
+}
+local function branch_color(n)
+  local key = MIND_PALETTE[((n.branch or 1) - 1) % #MIND_PALETTE + 1]
+  local col = style[key]
+  if type(col) ~= "table" and style.syntax then
+    col = style.syntax[key == "syntax_normal" and "normal" or "keyword"] or style.accent
+  end
+  return col or style.accent or style.text
+end
+
+-- Smooth horizontal-S link between parent edge and child edge,
+-- approximated with rect segments along a cubic bezier.
+local function draw_mind_link(x1, y1, x2, y2, color, z)
+  local t = math.max(1.5, 2 * SCALE * z)
+  local steps = 14
+  local dx = x2 - x1
+  local c1x = x1 + dx * 0.5
+  local c2x = x2 - dx * 0.5
+  local px, py
+  for i = 0, steps do
+    local s = i / steps
+    local u = 1 - s
+    local bx = u*u*u*x1 + 3*u*u*s*c1x + 3*u*s*s*c2x + s*s*s*x2
+    local by = u*u*u*y1 + 3*u*u*s*y1 + 3*u*s*s*y2 + s*s*s*y2
+    if px then
+      renderer.draw_rect(math.min(px, bx), math.min(py, by),
+        math.max(math.abs(bx - px), t), t, color)
+    end
+    px, py = bx, by
+  end
+end
+
 function MindView:draw()
   self:draw_background(style.background)
   local c = self.cam
   core.push_clip_rect(self.position.x, self.position.y, self.size.x, self.size.y)
   local fh = style.font:get_height()
 
-  -- connectors first
+  -- links (drawn under the nodes)
   local function link(n)
     for _, ch in ipairs(n.children) do
-      local x1 = (n.x + (n == self.root and 60 or n.w)) * c.z + c.x
+      local x1 = (n.x + n.w) * c.z + c.x
       local y1 = n.y * c.z + c.y
       local x2 = ch.x * c.z + c.x
       local y2 = ch.y * c.z + c.y
-      local mx_ = (x1 + x2) / 2
-      local col = common.lerp(style.background, style.accent or style.text, 0.4)
-      local t = 1.5 * SCALE
-      renderer.draw_rect(x1, y1 - t / 2, mx_ - x1, t, col)
-      renderer.draw_rect(mx_ - t / 2, math.min(y1, y2), t, math.abs(y2 - y1) + t, col)
-      renderer.draw_rect(mx_ - t / 2, y2 - t / 2, x2 - mx_ + t, t, col)
+      local bc = common.lerp(style.background, branch_color(ch), 0.62)
+      draw_mind_link(x1, y1, x2, y2, bc, c.z)
       link(ch)
     end
   end
@@ -863,15 +958,29 @@ function MindView:draw()
   -- nodes
   for _, n in ipairs(self.nodes) do
     local x, y = n.x * c.z + c.x, n.y * c.z + c.y
-    local w, h = n.w * c.z, (fh + 8) * c.z
     local is_root = (n == self.root)
+    local h = (fh + (is_root and 14 or 9)) * c.z
+    local w = n.w * c.z
     local hovered = (n == self.hover_node)
-    local bg = is_root and (style.accent or style.text)
-      or (hovered and raised_color() or surface_color())
+    local bc = branch_color(n)
+    local bg
+    if is_root then
+      bg = bc
+    elseif hovered then
+      bg = common.lerp(style.background, bc, 0.32)
+    else
+      bg = common.lerp(style.background, bc, 0.14)
+    end
     renderer.draw_rounded_rect(x, y - h / 2, w, h, h / 2, bg)
+    -- branch accent bar on the left of each node
+    if not is_root then
+      renderer.draw_rounded_rect(x, y - h / 2 + 2 * SCALE, 3 * SCALE, h - 4 * SCALE,
+        1.5 * SCALE, common.lerp(style.background, bc, 0.75))
+    end
     draw_text_clipped_canvas(style.font,
       is_root and style.background or style.text, n.text,
-      x + style.padding.x * c.z, y - fh * c.z / 2, w - style.padding.x * 2 * c.z, fh * c.z)
+      x + style.padding.x * 1.25 * c.z, y - fh * c.z / 2,
+      w - style.padding.x * 2.5 * c.z, fh * c.z)
   end
 
   core.pop_clip_rect()
