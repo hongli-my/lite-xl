@@ -220,12 +220,13 @@ function CanvasView:center_content()
   end
   local tw, th = max_x - min_x, max_y - min_y
   local vw, vh = self.size.x, self.size.y
+  local ox, oy = self.position.x, self.position.y
   local pad = 32 * SCALE
   local z = math.min(1.0, (vw - pad * 2) / tw, (vh - pad * 2) / th)
   z = math.max(z, 0.25)
   self.cam.z = z
-  self.cam.x = (vw - tw * z) / 2 - min_x * z
-  self.cam.y = (vh - th * z) / 2 - min_y * z
+  self.cam.x = ox + (vw - tw * z) / 2 - min_x * z
+  self.cam.y = oy + (vh - th * z) / 2 - min_y * z
   self._fitted = true
 end
 
@@ -830,13 +831,15 @@ function MindView:center_and_fit()
   if not self._tree_w or self.size.x <= 0 then return end
   local tw, th = self._tree_w, self._tree_h
   local vw, vh = self.size.x, self.size.y
+  -- drawable origin is self.position (TreeView on the left shifts us)
+  local ox, oy = self.position.x, self.position.y
   local pad = 24 * SCALE
   local z = math.min(1.0, (vw - pad * 2) / tw, (vh - pad * 2) / th)
   z = math.max(z, 0.25)
   self.cam.z = z
-  -- node coordinates run 0..tw / 0..th; centre that box in the viewport
-  self.cam.x = (vw - tw * z) / 2
-  self.cam.y = (vh - th * z) / 2
+  -- node coordinates run 0..tw / 0..th; centre that box in the drawable area
+  self.cam.x = ox + (vw - tw * z) / 2
+  self.cam.y = oy + (vh - th * z) / 2
   self._fitted = true
 end
 
@@ -853,9 +856,13 @@ function MindView:on_mouse_moved(mx, my, ...)
   end
   self.hover_node = nil
   local c = self.cam
+  local fh = style.font:get_height()
+  local hit_h = (fh + 12) / 2  -- half-height of the pill around its centre line
   for _, n in ipairs(self.nodes) do
-    local sx, sy = n.x + c.x, n.y + c.y
-    if mx >= sx and mx < sx + n.w and my >= sy - 10 and my < sy + 10 then
+    -- screen coords: same transform as draw (scale THEN offset)
+    local sx, sy = n.x * c.z + c.x, n.y * c.z + c.y
+    local sw, sh = n.w * c.z, (fh + 10) * c.z
+    if mx >= sx and mx < sx + sw and my >= sy - hit_h and my < sy + hit_h then
       self.hover_node = n
       break
     end
@@ -921,11 +928,11 @@ end
 -- approximated with square stamps along a cubic bezier. Squares (not
 -- horizontal rects) guarantee continuity for steep segments.
 local function draw_mind_link(x1, y1, x2, y2, color, z)
-  local t = math.max(2, 2.5 * SCALE * z)
+  local t = math.max(2.5, 3 * SCALE * z)
   local half = t / 2
-  -- sample so that consecutive stamps always overlap
+  -- dense stamps: each covers half the previous step -> solid line at any slope
   local dist = math.abs(x2 - x1) + math.abs(y2 - y1)
-  local steps = math.max(12, math.min(48, math.ceil(dist / (half * 0.8))))
+  local steps = math.max(24, math.min(120, math.ceil(dist / (half * 0.5))))
   local dx = x2 - x1
   local c1x = x1 + dx * 0.5
   local c2x = x2 - dx * 0.5
