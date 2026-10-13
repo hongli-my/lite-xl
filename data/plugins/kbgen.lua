@@ -56,6 +56,28 @@ end
 
 local function json_str(s) return '"' .. json_escape(s) .. '"' end
 
+local function json_encode_value(v)
+  local t = type(v)
+  if v == nil then return "null"
+  elseif t == "boolean" then return tostring(v)
+  elseif t == "number" then return string.format("%.14g", v)
+  elseif t == "string" then return json_str(v)
+  elseif t == "table" then
+    if #v > 0 or (next(v) == nil) then
+      local parts = {}
+      for _, item in ipairs(v) do parts[#parts + 1] = json_encode_value(item) end
+      return "[" .. table.concat(parts, ",") .. "]"
+    else
+      local parts = {}
+      for k, val in pairs(v) do
+        parts[#parts + 1] = json_str(k) .. ":" .. json_encode_value(val)
+      end
+      return "{" .. table.concat(parts, ",") .. "}"
+    end
+  end
+  return "null"
+end
+
 ---------------------------------------------------------------------
 -- 星图: 各目录 README.md 的标题层级 → markdown 大纲
 --   README 的 "# X"   → 导图一级分支
@@ -95,41 +117,129 @@ end
 --   sidecar 布局可以随手拖, 重新生成会覆盖
 ---------------------------------------------------------------------
 
-local function gen_canvas(root)
-  local cards, arrows = {}, {}
-  local col_w, gap = 340, 60
-  local cx = 40
+---------------------------------------------------------------------
+-- 驾驶舱 canvas: 增量合并生成
+--   * 卡片键 = file + heading (章节唯一)
+--   * 已存在的卡片(含手写便签/箭头/frame)原样保留, 位置不动
+--   * 新章节追加到画布右侧空白区; 消失的章节不删卡(由人手动删)
+--   => 你摆好的驾驶舱布局永远不会被重新生成冲掉
+---------------------------------------------------------------------
+
+-- minimal JSON decoder for reading back our own sidecar output
+-- (our encoder escapes non-ASCII and control chars to \uXXXX / \" so plain
+-- string capture is safe; handles compact and multiline layouts)
+local function json_decode(s)
+  local pos = 1
+  local function skip()
+    while true do
+      local c = s:sub(pos, pos)
+      if c == " " or c == "\t" or c == "\n" or c == "\r" or c == "," then pos = pos + 1
+      else break end
+    end
+  end
+  local parse
+  parse = function()
+    skip()
+    local ch = s:sub(pos, pos)
+    if ch == "{" then
+      pos = pos + 1
+      local obj = {}
+      while true do
+        skip()
+        if s:sub(pos, pos) == "}" then pos = pos + 1 return obj end
+        local key = s:match('^"([^"]*)"', pos)
+        pos = s:find('"', pos + 1) + 1  -- past closing quote of key
+        skip()
+        pos = pos + 1                   -- past colon
+        obj[key] = parse()
+      end
+    elseif ch == "[" then
+      pos = pos + 1
+      local arr = {}
+      while true do
+        skip()
+        if s:sub(pos, pos) == "]" then pos = pos + 1 return arr end
+        arr[#arr + 1] = parse()
+      end
+    elseif ch == '"' then
+      local str = s:match('^"([^"]*)"', pos)
+      pos = s:find('"', pos + 1) + 1
+      return str
+    else
+      local num = s:match("^%-?%d+%.?%d*", pos)
+      if num then pos = pos + #num return tonumber(num) end
+      if s:find("^true", pos) then pos = pos + 4 return true end
+      if s:find("^false", pos) then pos = pos + 5 return false end
+      if s:find("^null", pos) then pos = pos + 4 return nil end
+      pos = pos + 1
+      return nil
+    end
+  end
+  return parse()
+end
+
+local function gen_canvas(root, path)
+  -- read existing sidecar if present
+  local existing_cards, arrows, frames = {}, {}, {}
+  local by_section = {}
+  local fp = io.open(path, "r")
+  if fp then
+    local ok, data = pcall(json_decode, fp:read("*a"))
+    fp:close()
+    if ok and type(data) == "table" then
+      for _, c in ipairs(data.cards or {}) do
+        existing_cards[#existing_cards + 1] = c
+        if c.type == "md" then
+          by_section[(c.file or "?") .. "\t" .. (c.heading or "?")] = c
+        end
+      end
+      arrows = data.arrows or {}
+      frames = data.frames or {}
+    end
+  end
+
+  -- keep every user card (stickies, images, deleted-section md cards) as-is
+  local cards = {}
+  for _, c in ipairs(existing_cards) do
+    cards[#cards + 1] = c
+  end
+
+  -- append NEW sections only, in a fresh column right of everything
+  local max_x = 0
+  for _, c in ipairs(cards) do max_x = math.max(max_x, c.x or 0) end
+  local col_w = 300
+  local cx = max_x + col_w + 80
+  local next_id = #cards
   for _, dir in ipairs(config.plugins.kbgen.dirs) do
-    local ccol = 0
     local lines = read_lines(root .. "/" .. dir .. "/README.md")
     if lines then
       local y = 40
-      -- one sticky per dir as the column header
-      cards[#cards + 1] = string.format(
-        '    { "id": "h%s", "type": "sticky", "text": %s, "x": %d, "y": %d }',
-        dir, json_str(dir), cx, y)
-      y = y + 80
+      local n_in_col = 0
       for _, l in ipairs(lines) do
         local hashes, title = l:match("^(#+)%s+(.-)%s*$")
         if hashes and #hashes >= 2 then
-          cards[#cards + 1] = string.format(
-            '    { "id": "c%s%d", "type": "md", "file": %s, "heading": %s, "x": %d, "y": %d }',
-            dir, ccol, json_str(dir .. "/README.md"),
-            json_str(string.rep("#", #hashes) .. " " .. title), cx, y)
-          ccol = ccol + 1
-          y = y + 230
+          local file = dir .. "/README.md"
+          local heading = string.rep("#", #hashes) .. " " .. title
+          if not by_section[file .. "\t" .. heading] then
+            next_id = next_id + 1
+            cards[#cards + 1] = {
+              id = "k" .. tostring(next_id),
+              type = "md", file = file, heading = heading,
+              x = cx, y = y,
+            }
+            y = y + 200
+            n_in_col = n_in_col + 1
+          end
         end
       end
+      if n_in_col > 0 then cx = cx + col_w + 60 end
     end
-    cx = cx + col_w + gap
   end
   local parts = {
     "{",
-    '  "cards": [',
-    table.concat(cards, ",\n"),
-    "  ],",
-    '  "arrows": [],',
-    '  "frames": []',
+    '  "cards": ' .. json_encode_value(cards) .. ",",
+    '  "arrows": ' .. json_encode_value(arrows) .. ",",
+    '  "frames": ' .. json_encode_value(frames),
     "}",
   }
   return table.concat(parts, "\n")
@@ -149,7 +259,7 @@ command.add(nil, {
     local mf = write_file(root .. "/" .. config.plugins.kbgen.mind_file,
       gen_mindmap(root))
     local cf = write_file(root .. "/" .. config.plugins.kbgen.canvas_file,
-      gen_canvas(root))
+      gen_canvas(root, root .. "/" .. config.plugins.kbgen.canvas_file))
     if mf and cf then
       core.log("kbgen: 已生成 %s / %s (改各目录 README.md 后可重新生成)",
         config.plugins.kbgen.mind_file, config.plugins.kbgen.canvas_file)

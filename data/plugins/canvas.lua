@@ -1068,6 +1068,29 @@ command.add(nil, {
   end,
 })
 
+-- delete the hovered/selected card (and its arrows) from the active canvas
+command.add(function()
+  return core.active_view and core.active_view:is(CanvasView)
+end, {
+  ["canvas:delete-card"] = function()
+    local view = core.active_view
+    if not view or not view.hover then return end
+    local id = view.hover
+    view.cards[id] = nil
+    for i = #view.card_order, 1, -1 do
+      if view.card_order[i] == id then table.remove(view.card_order, i) end
+    end
+    for i = #view.arrows, 1, -1 do
+      local a = view.arrows[i]
+      if a.from == id or a.to == id then table.remove(view.arrows, i) end
+    end
+    view:save()
+    core.log("canvas: 已删除卡片")
+    core.redraw = true
+  end,
+})
+keymap.add({ ["cmd+backspace"] = "canvas:delete-card" })
+
 keymap.add({
   ["ctrl+shift+e"] = "mindmap:open",
 })
