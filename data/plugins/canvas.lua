@@ -1214,7 +1214,9 @@ command.add(nil, {
     core.redraw = true
   end,
   ["mindmap:open"] = function(path)
-    -- explicit path (treeview right-click) or the active doc
+    -- explicit path (treeview right-click) or the active doc; the context
+    -- menu may forward a non-string argument — ignore those
+    if type(path) ~= "string" then path = nil end
     if not path then
       local doc = core.active_view and core.active_view.doc
       path = doc and (doc.abs_filename or doc.filename)

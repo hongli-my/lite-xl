@@ -472,13 +472,19 @@ command.add(nil, {
   -- generate a dashboard scoped to one directory (treeview right-click):
   -- that dir's README becomes the whole tree
   ["kbgen:generate-dir"] = function(dir_path)
-    -- called from the treeview menu: pick up the hovered dir
+    -- the context menu forwards the view instance as an argument; only
+    -- accept strings, otherwise fall back to the hovered treeview item
+    if type(dir_path) ~= "string" then dir_path = nil end
     if not dir_path then
       local tv = package.loaded["plugins.treeview"]
-      dir_path = tv and tv.hovered_item and tv.hovered_item.abs_filename
+      local item = tv and (tv.hovered_item or tv.selected_item)
+      dir_path = item and item.type == "dir" and item.abs_filename or nil
     end
     local root = core.root_project() and core.root_project().path
-    if not root or not dir_path then return end
+    if not root or not dir_path then
+      core.log("kbgen: 未选中目录")
+      return
+    end
     local rel = dir_path:sub(#root + 1):gsub("^" .. PATHSEP, "")
     if rel == "" then rel = "." end
     local name = rel == "." and (root:match("[^/\\]+$") or "root")
