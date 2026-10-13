@@ -25,6 +25,12 @@ end
 local function rfile(path)
   local f = io.open(path, "r"); local s = f:read("*a"); f:close(); return s
 end
+package.preload["core.common"] = function()
+  return _G.common
+end
+package.preload["plugins.treeview"] = function()
+  return { on_context_menu = function() end }
+end
 
 os.execute("rm -rf /tmp/sbx && mkdir -p /tmp/sbx/agent")
 wfile("/tmp/sbx/agent/README.md", "# agent\n\n## A节\n- x\n\n## B节\n- y\n")

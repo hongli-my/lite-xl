@@ -11,6 +11,7 @@
 
 local core = require "core"
 local command = require "core.command"
+local common = require "core.common"
 local keymap = require "core.keymap"
 local config = require "core.config"
 
@@ -185,7 +186,7 @@ end
 --   * 新章节沿其父目录的分支追加; 手绘箭头/便签/frame 永不丢
 ---------------------------------------------------------------------
 
-local function gen_canvas(root, path)
+local function gen_canvas(root, path, dir_override, root_text)
   -- read existing sidecar if present
   local existing_cards, arrows, frames = {}, {}, {}
   local by_section, by_dir = {}, {}
@@ -221,9 +222,11 @@ local function gen_canvas(root, path)
   local function est_w(text) return #text * EM * 0.62 + 48 end
   local function est_h(n_lines) return n_lines * EM + 26 end
 
-  -- 1) collect the section tree from all dir READMEs
+  -- 1) collect the section tree from dir READMEs (dir_override scopes it:
+  --    {} = the project root README; nil = the configured dir list)
   local dirs = {}
-  for _, dir in ipairs(config.plugins.kbgen.dirs) do
+  local scan = dir_override or config.plugins.kbgen.dirs
+  for _, dir in ipairs(scan) do
     local lines = read_lines(root .. "/" .. dir .. "/README.md")
     if lines then
       local sections = {}
@@ -248,6 +251,31 @@ local function gen_canvas(root, path)
       if #sections > 0 then dirs[#dirs + 1] = { dir = dir, sections = sections } end
     end
   end
+  -- project-root README mode: one pseudo-dir named "" (root README itself)
+  if dir_override and #dir_override == 0 then
+    local lines = read_lines(root .. "/README.md")
+    if lines then
+      local sections = {}
+      for _, l in ipairs(lines) do
+        local hashes, title = l:match("^(#+)%s+(.-)%s*$")
+        if hashes and #hashes >= 2 then
+          sections[#sections + 1] = {
+            file = "README.md",
+            heading = string.rep("#", #hashes) .. " " .. title,
+            title = title,
+            links = {},
+          }
+        elseif #sections > 0 and l:match("^%s*-%s+") then
+          local s = sections[#sections]
+          local label, target = l:match("^%s*-%s+%[(.-)%]%((.-)%)")
+          if label and target then
+            s.links[#s.links + 1] = { label = label, target = target }
+          end
+        end
+      end
+      if #sections > 0 then dirs[#dirs + 1] = { dir = "", sections = sections } end
+    end
+  end
 
   -- 2) assign / create cards for the tree nodes (positions from layout below)
   local next_id = #cards
@@ -258,20 +286,28 @@ local function gen_canvas(root, path)
   -- the mindmap root card
   if not root_card then
     root_card = { id = new_id("r"), type = "sticky", is_root = true,
-      text = "📦 知识库", x = 0, y = 0 }
+      text = root_text or "📦 知识库", x = 0, y = 0 }
     cards[#cards + 1] = root_card
   end
   local struct_arrows = {}
+  -- scoped mode (dir_override): no dir layer, sections hang off the root
+  local scoped = dir_override ~= nil
   for _, d in ipairs(dirs) do
-    local dcard = by_dir[d.dir]
-    if not dcard then
-      dcard = { id = new_id("d"), type = "sticky", dir = d.dir,
-        text = "📂 " .. d.dir, x = 0, y = 0 }
-      cards[#cards + 1] = dcard
+    local dcard
+    if not scoped then
+      dcard = by_dir[d.dir]
+      if not dcard then
+        dcard = { id = new_id("d"), type = "sticky", dir = d.dir,
+          text = "📂 " .. d.dir, x = 0, y = 0 }
+        cards[#cards + 1] = dcard
+      end
+      d.card = dcard
+      struct_arrows[#struct_arrows + 1] =
+        { from = root_card.id, to = dcard.id, kind = "struct" }
     end
-    d.card = dcard
-    struct_arrows[#struct_arrows + 1] =
-      { from = root_card.id, to = dcard.id, kind = "struct" }
+    -- parent for sections: the dir card, or the root in scoped mode
+    local parent = dcard or root_card
+    d.parent = parent
     for _, s in ipairs(d.sections) do
       local key = s.file .. "\t" .. s.heading
       local scard = by_section[key]
@@ -286,7 +322,7 @@ local function gen_canvas(root, path)
       s.w = est_w(s.title)
       s.h = est_h(1)
       struct_arrows[#struct_arrows + 1] =
-        { from = dcard.id, to = scard.id, kind = "struct" }
+        { from = d.parent.id, to = scard.id, kind = "struct" }
       -- file sub-cards, one per README link, laid out horizontally
       s.link_cards = {}
       for li, lk in ipairs(s.links) do
@@ -341,16 +377,19 @@ local function gen_canvas(root, path)
   local extent = { right = 0, left = 0 }
   for _, d in ipairs(dirs) do
     local side = d.side
-    local sign = side == "right" and 1 or -1
-    d.card.w = est_w(d.card.text)
-    local dir_w = d.card.w
+    local card = d.card
+    if card then
+      card.w = est_w(card.text)
+    end
+    local dir_w = card and card.w or 0
     local top = cursor[side]
     -- dir subtree: sections stack; dir card centers on the subtree mid
     local span = span_of(d)
-    if not d.card.pinned then
-      d.card.x = side == "right" and (root_w + X_GAP) or (-X_GAP - dir_w)
-      d.card.y = top + span / 2 - H_ROW / 2
+    if card and not card.pinned then
+      card.x = side == "right" and (root_w + X_GAP) or (-X_GAP - dir_w)
+      card.y = top + span / 2 - H_ROW / 2
     end
+    local parent_x = card and card.x or 0
     local sy = top
     for _, s in ipairs(d.sections) do
       s.card.w = math.max(est_w(s.title), 110)
@@ -359,9 +398,9 @@ local function gen_canvas(root, path)
       local s_span = n * (H_ROW + Y_GAP) - Y_GAP
       if not s.card.pinned then
         if side == "right" then
-          s.card.x = d.card.x + dir_w + X_GAP
+          s.card.x = parent_x + dir_w + X_GAP
         else
-          s.card.x = d.card.x - X_GAP - s.card.w
+          s.card.x = parent_x - X_GAP - s.card.w
         end
         s.card.y = sy + s_span / 2 - H_ROW / 2
       end
@@ -429,6 +468,32 @@ command.add(nil, {
       core.log("kbgen: 写入失败 (项目目录只读?)")
     end
   end,
+
+  -- generate a dashboard scoped to one directory (treeview right-click):
+  -- that dir's README becomes the whole tree
+  ["kbgen:generate-dir"] = function(dir_path)
+    -- called from the treeview menu: pick up the hovered dir
+    if not dir_path then
+      local tv = package.loaded["plugins.treeview"]
+      dir_path = tv and tv.hovered_item and tv.hovered_item.abs_filename
+    end
+    local root = core.root_project() and core.root_project().path
+    if not root or not dir_path then return end
+    local rel = dir_path:sub(#root + 1):gsub("^" .. PATHSEP, "")
+    if rel == "" then rel = "." end
+    local name = rel == "." and (root:match("[^/\\]+$") or "root")
+      or rel:match("[^/\\]+$")
+    -- "." means the project root README itself
+    local dir_list = rel == "." and {} or { rel }
+    local out = (rel == "." and "" or rel .. "/") .. "驾驶舱-" .. name .. ".canvas"
+    local ok = write_file(root .. "/" .. out,
+      gen_canvas(root, root .. "/" .. out, dir_list, "📦 " .. name))
+    if ok then
+      core.log("kbgen: 已生成 %s", out)
+    else
+      core.log("kbgen: 写入失败")
+    end
+  end,
 })
 
-keymap.add { ["ctrl+shift+k"] = "kbgen:generate" }
+-- no global hotkey: generation lives in the treeview context menu

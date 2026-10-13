@@ -183,6 +183,9 @@ package.preload["core.rootview"] = function()
   return { open_doc = function() end }
 end
 package.preload["core.dirwatch"] = function() return { new = function() return {} end } end
+package.preload["plugins.treeview"] = function()
+  return { on_context_menu = function() end }
+end
 
 -- ---------------- load plugin ------------------------------------------------
 local plugin = assert(dofile(PLUGIN))
@@ -190,7 +193,8 @@ local CanvasView, MindView, json = plugin.CanvasView, plugin.MindView, plugin.js
 ok(CanvasView and MindView and json, "plugin exports CanvasView/MindView/json")
 ok(commands["canvas:open"], "canvas:open registered")
 ok(commands["mindmap:open"], "mindmap:open registered")
-eq(keymaps["ctrl+shift+e"], "mindmap:open", "keymap bound")
+ok(keymaps["ctrl+shift+e"] == nil,
+  "mindmap has NO global hotkey (treeview menu only)")
 
 -- ---------------- json round-trip --------------------------------------------
 local doc1 = {

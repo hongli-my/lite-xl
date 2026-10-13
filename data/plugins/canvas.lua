@@ -1213,12 +1213,13 @@ command.add(nil, {
     node:add_view(CanvasView(path))
     core.redraw = true
   end,
-  ["mindmap:open"] = function()
-    local doc = core.active_view and core.active_view.doc
-    local path
-    if doc and doc.filename then
-      path = doc.abs_filename or doc.filename
-    else
+  ["mindmap:open"] = function(path)
+    -- explicit path (treeview right-click) or the active doc
+    if not path then
+      local doc = core.active_view and core.active_view.doc
+      path = doc and (doc.abs_filename or doc.filename)
+    end
+    if not path or not path:match("%.[mM][dD]$") then
       core.log("mindmap: 请先打开一个 markdown 大纲文件")
       return
     end
@@ -1251,11 +1252,59 @@ end, {
 })
 keymap.add({ ["cmd+backspace"] = "canvas:delete-card" })
 
-keymap.add({
-  ["ctrl+shift+e"] = "mindmap:open",
+---------------------------------------------------------------------
+-- treeview right-click: open files as their views
+---------------------------------------------------------------------
+local TreeView = require "plugins.treeview"
+
+local old_treeview_menu_cv = TreeView.on_context_menu
+function TreeView:on_context_menu()
+  local args = { old_treeview_menu_cv(self) }
+  local cmds = args[1]
+  if cmds then
+    local item = self.hovered_item or self.selected_item
+    local items = cmds.items
+    if item and items then
+      local entry
+      if item.type == "dir" then
+        -- directory: generate a scoped dashboard from its README
+        entry = { text = "生成驾驶舱", icon = "\u{f0e8}",
+          command = "kbgen:generate-dir" }
+      elseif item.type == "file" then
+        local filename = item.abs_filename or ""
+        self._cv_target = filename
+        if filename:match("%.canvas$") then
+          entry = { text = "打开画布", icon = "\u{f009}", command = "canvas:open-treeview" }
+        elseif filename:match("%.[mM][dD]$") then
+          entry = { text = "思维导图", icon = "\u{f0e8}", command = "mindmap:open-treeview" }
+        end
+      end
+      if entry then
+        table.move(items, 2, #items, 3)
+        items[2] = entry
+      end
+    end
+  end
+  return table.unpack(args)
+end
+
+command.add(nil, {
+  ["canvas:open-treeview"] = function()
+    local tv = package.loaded["plugins.treeview"]
+    local path = tv and tv._cv_target
+    if path then
+      local node = core.root_view:get_active_node_default()
+      node:add_view(CanvasView(path))
+      core.redraw = true
+    end
+  end,
+  ["mindmap:open-treeview"] = function()
+    local tv = package.loaded["plugins.treeview"]
+    local path = tv and tv._cv_target
+    if path then command.perform("mindmap:open", path) end
+  end,
 })
 
----------------------------------------------------------------------
 -- opening a .canvas file from treeview / palette routes to CanvasView
 -- (same pattern as imageview), so the sidecar never shows raw JSON
 ---------------------------------------------------------------------
