@@ -26,6 +26,7 @@ local keymap = require "core.keymap"
 local style = require "core.style"
 local View = require "core.view"
 local Doc = require "core.doc"
+local RootView = require "core.rootview"
 
 config.plugins.canvas = common.merge({
   -- grid spacing of the background dots
@@ -1040,6 +1041,18 @@ command.add(nil, {
     node:add_view(CanvasView(path))
     core.redraw = true
   end,
+  -- open an existing .canvas file directly (as a view, not a JSON text doc)
+  ["canvas:open-file"] = function()
+    local doc = core.active_view and core.active_view.doc
+    local path = doc and (doc.abs_filename or doc.filename)
+    if not path or not path:match("%.canvas$") then
+      core.log("canvas: 请先打开/选中一个 .canvas 文件")
+      return
+    end
+    local node = core.root_view:get_active_node_default()
+    node:add_view(CanvasView(path))
+    core.redraw = true
+  end,
   ["mindmap:open"] = function()
     local doc = core.active_view and core.active_view.doc
     local path
@@ -1058,5 +1071,21 @@ command.add(nil, {
 keymap.add({
   ["ctrl+shift+e"] = "mindmap:open",
 })
+
+---------------------------------------------------------------------
+-- opening a .canvas file from treeview / palette routes to CanvasView
+-- (same pattern as imageview), so the sidecar never shows raw JSON
+---------------------------------------------------------------------
+local rootview_open_doc = RootView.open_doc
+function RootView:open_doc(doc)
+  local filename = doc and (doc.abs_filename or doc.filename) or ""
+  if filename:match("%.canvas$") then
+    local node = self:get_active_node_default()
+    node:add_view(CanvasView(filename))
+    self.root_node:update_layout()
+    return
+  end
+  return rootview_open_doc(self, doc)
+end
 
 return { CanvasView = CanvasView, MindView = MindView, json = json }

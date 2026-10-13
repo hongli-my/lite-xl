@@ -179,6 +179,9 @@ package.preload["core.keymap"] = function() return keymap end
 package.preload["core.style"] = function() return style end
 package.preload["core.view"] = function() return View end
 package.preload["core.doc"] = function() return Doc end
+package.preload["core.rootview"] = function()
+  return { open_doc = function() end }
+end
 package.preload["core.dirwatch"] = function() return { new = function() return {} end } end
 
 -- ---------------- load plugin ------------------------------------------------
