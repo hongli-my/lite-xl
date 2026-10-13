@@ -308,76 +308,84 @@ local function gen_canvas(root, path)
     end
   end
 
-  -- 3) balanced horizontal mindmap: root centred, dirs split left/right by
-  --    cumulative branch height, sections fan outward on each side.
+  -- 3) classic mindmap layout, recursive: every child gets its own vertical
+  --    row (siblings stack along y), each parent is centred on the mid of its
+  --    children's span. Branches alternate left/right of the root.
   --    Cards the user has dragged (pinned=true) keep their position.
-  local X_GAP, Y_GAP = 90, 26
-  -- render widths follow our estimates so layout matches drawing
+  local X_GAP, Y_GAP = 70, 14
   root_card.w = est_w(root_card.text)
   local root_w = root_card.w
-  local function branch_h(d)
+  local H_ROW = est_h(1)
+
+  -- subtree vertical span (with pinned children measured at their card size)
+  local function span_of(d)
     local h = 0
-    for _, s in ipairs(d.sections) do h = h + s.h + Y_GAP end
-    return math.max(h - Y_GAP, 0)
+    for _, s in ipairs(d.sections) do
+      local n = math.max(#s.link_cards, 1)
+      h = h + n * (H_ROW + Y_GAP)
+    end
+    return math.max(h - Y_GAP, H_ROW)
   end
-  -- greedy split: fill the right side up to half the total height
+
+  -- split dirs left/right by cumulative span (balanced halves)
   local total = 0
-  for _, d in ipairs(dirs) do total = total + branch_h(d) + Y_GAP * 2.5 end
+  for _, d in ipairs(dirs) do total = total + span_of(d) + Y_GAP * 3 end
   local half, acc = total / 2, 0
   for _, d in ipairs(dirs) do
     d.side = acc < half and "right" or "left"
-    acc = acc + branch_h(d) + Y_GAP * 2.5
+    acc = acc + span_of(d) + Y_GAP * 3
   end
-  -- lay out each side independently, top-down; parents vertically centred
+
+  -- recursive placement per side
   local cursor = { right = 0, left = 0 }
   local extent = { right = 0, left = 0 }
-  local LINK_X_GAP, LINK_Y_GAP, LINKS_PER_ROW = 14, 12, 4
   for _, d in ipairs(dirs) do
     local side = d.side
+    local sign = side == "right" and 1 or -1
     d.card.w = est_w(d.card.text)
     local dir_w = d.card.w
-    local bh = branch_h(d)
-    local dir_x = side == "right" and (root_w + X_GAP) or (-X_GAP - dir_w)
+    local top = cursor[side]
+    -- dir subtree: sections stack; dir card centers on the subtree mid
+    local span = span_of(d)
     if not d.card.pinned then
-      d.card.x = dir_x
-      d.card.y = cursor[side] + bh / 2 - est_h(1) / 2
+      d.card.x = side == "right" and (root_w + X_GAP) or (-X_GAP - dir_w)
+      d.card.y = top + span / 2 - H_ROW / 2
     end
-    local sy = cursor[side]
+    local sy = top
     for _, s in ipairs(d.sections) do
-      s.card.w = math.max(est_w(s.title), 120)
+      s.card.w = math.max(est_w(s.title), 110)
+      -- section subtree: its file cards stack vertically; section centers mid
+      local n = math.max(#s.link_cards, 1)
+      local s_span = n * (H_ROW + Y_GAP) - Y_GAP
       if not s.card.pinned then
         if side == "right" then
-          s.card.x = dir_x + dir_w + X_GAP
+          s.card.x = d.card.x + dir_w + X_GAP
         else
-          s.card.x = dir_x - X_GAP - s.card.w
+          s.card.x = d.card.x - X_GAP - s.card.w
         end
-        s.card.y = sy
+        s.card.y = sy + s_span / 2 - H_ROW / 2
       end
-      -- file sub-cards: a horizontal row of pills right of the section card
-      -- (4 per row, wrapping), mirrored to the left side
-      local row_y = s.card.y
-      for li, lcard in ipairs(s.link_cards) do
+      -- file cards: each on its own row (classic mindmap leaves)
+      local fy = sy
+      for _, lcard in ipairs(s.link_cards) do
         if not lcard.pinned then
-          local row = math.floor((li - 1) / LINKS_PER_ROW)
-          local col = (li - 1) % LINKS_PER_ROW
           if side == "right" then
-            lcard.x = s.card.x + s.card.w + 40 + col * (lcard.w + LINK_X_GAP)
+            lcard.x = s.card.x + s.card.w + X_GAP * 0.6
           else
-            lcard.x = s.card.x - 40 - lcard.w - col * (lcard.w + LINK_X_GAP)
+            lcard.x = s.card.x - X_GAP * 0.6 - lcard.w
           end
-          lcard.y = row_y + row * (lcard.h + LINK_Y_GAP)
+          lcard.y = fy
         end
+        fy = fy + H_ROW + Y_GAP
       end
-      -- section vertical footprint grows with its wrapped link rows
-      local n_rows_links = math.ceil(math.max(#s.link_cards, 1) / LINKS_PER_ROW)
-      sy = sy + math.max(s.h, n_rows_links * (est_h(1) + LINK_Y_GAP)) + Y_GAP
+      sy = sy + s_span + Y_GAP
     end
-    cursor[side] = sy + Y_GAP * 2.5
+    cursor[side] = top + span + Y_GAP * 3
     extent[side] = cursor[side]
   end
   if not root_card.pinned then
     root_card.x = 0
-    root_card.y = math.max(extent.right, extent.left) / 2 - est_h(1) / 2
+    root_card.y = math.max(extent.right, extent.left) / 2 - H_ROW / 2
   end
 
   -- 4) user-drawn arrows (no kind) are preserved; struct rebuilt
