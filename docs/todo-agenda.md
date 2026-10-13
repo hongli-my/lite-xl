@@ -5,8 +5,8 @@ AFFiNE 式任务工作台的第一阶段落地:同一个 markdown 真相源,三�
 ## 任务语法
 
 ```markdown
-- [ ] 线代作业 4 @due(2026-10-16) #作业
-- [x] 概率作业 3 @due(2026-10-12) #作业
+- [ ] 写季度报告 @due(2026-10-16) #工作
+- [x] 回复客户邮件 @due(2026-10-12) #工作
 - [ ] 无标签无日期任务
 ```
 
@@ -37,7 +37,7 @@ AFFiNE 式任务工作台的第一阶段落地:同一个 markdown 真相源,三�
 ```lua
 config.plugins.todo_agenda = {
   extensions = { "md", "markdown" },
-  kanban_columns = { "作业", "复习", "项目", "生活" },  -- 列顺序(空列也显示)
+  kanban_columns = { "工作", "生活" },  -- 列顺序(空列也显示)
   kanban_default_column = "其他",                      -- 无 tag 任务的列
   week_starts_monday = true,
 }

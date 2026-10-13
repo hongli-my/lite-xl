@@ -37,7 +37,7 @@ config.plugins.todo_agenda = common.merge({
   -- show completed tasks below the open ones (list view)
   show_completed = true,
   -- kanban: column order for known tags; unknown tags are appended after
-  kanban_columns = { "作业", "复习", "项目", "生活" },
+  kanban_columns = { "工作", "生活" },
   -- kanban: fallback column for tasks without a tag
   kanban_default_column = "其他",
   -- calendar: week starts on monday

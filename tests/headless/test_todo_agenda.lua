@@ -364,37 +364,49 @@ eq(disk_line, "- [ ] 线代作业 4 @due(2026-10-16) #作业",
 -- 3) retag (kanban drag) writes through the Doc model
 ---------------------------------------------------------------------
 
--- simulate kanban drag to #复习: press on card, move to another column, release.
+-- simulate kanban drag to #生活: press on card, move to another column, release.
 view.view_mode = "kanban"
--- geometry mirrors kanban_geometry(): col_w = max(200, min(260, 784/n)),
--- gap = padding.x*1.5 = 12, head_h = fh+12 = 27, y0 = header+6,
--- card_h = fh+20 = 35.  Columns: 4 configured + default = 5.
-local n_cols = 5
+-- Column layout: configured (工作 生活) + unknown tags in first-seen order
+-- of the SORTED item list + default.  After the toggle test the open group
+-- comes first, so 复习 may precede 作业 — never hardcode column indices;
+-- probe kanban_hit across columns to find the dragged card.
+local n_tags = 0
+do
+  local set = {}
+  for _, it in ipairs(view.items) do set[it.tag or "__default"] = true end
+  for _ in pairs(set) do n_tags = n_tags + 1 end
+end
+local n_cols = 2 + n_tags  -- configured 2 + all distinct tags + default
 local col_w = math.max(200, math.min(260, (800 - 24) / n_cols))
 local gap = 12
-local x_col1 = 8                          -- 作业 column left edge
-local x_col2 = x_col1 + col_w + gap       -- 复习 column left edge
 local head_h = 27
 local y0 = view.position.y + view:get_header_height() + 6
-local card_y = y0 + head_h + 17           -- middle of the first card
-local hit = view:kanban_hit(x_col1 + 20, card_y)
+local card_y = y0 + head_h + 17
+-- find the 线代作业 card by probing across columns
+local hit
+for ci = 0, n_cols - 1 do
+  local h2 = view:kanban_hit(8 + ci * (col_w + gap) + 20, card_y)
+  if h2 and h2.kind == "card" and h2.item.display:find("线代作业", 1, true) then
+    hit = h2
+    break
+  end
+end
 ok(hit and hit.kind == "card", "kanban hit-test finds a card")
 if hit then
   ok(hit.item ~= nil, "hit carries the item")
-  -- press on the card body (not the checkbox): x inside, beyond checkbox zone
   view:on_mouse_pressed("left", hit.x + 60, hit.y + 5, 1)
   ok(view.drag ~= nil, "drag started")
   if view.drag then
     eq(view.drag.item, hit.item, "dragging the hit item")
-    -- move over the 复习 column and release
-    local target_x = x_col2 + 10
+    -- drop on column 2 (configured 生活)
+    local target_x = 8 + 1 * (col_w + gap) + 10
     view:on_mouse_moved(target_x, hit.y + 5)
-    ok(view.drag.target_col == 2, "target column tracked (col 2 = 复习)")
+    ok(view.drag.target_col == 2, "target column tracked (col 2 = 生活)")
     view:on_mouse_released("left", target_x, hit.y + 5)
     ok(view.drag == nil, "drag cleared on release")
-    eq(doc.lines[3], "- [x] 线代作业 4 @due(2026-10-16) #复习",
+    eq(doc.lines[3], "- [x] 线代作业 4 @due(2026-10-16) #生活",
       "retag wrote through Doc model")
-    eq(view.items[1].tag, "复习", "item.tag updated in view")
+    eq(find_item("线代作业").tag, "生活", "item.tag updated in view")
   end
 end
 
