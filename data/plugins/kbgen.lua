@@ -181,7 +181,7 @@ end
 local function gen_canvas(root, path)
   -- read existing sidecar if present
   local existing_cards, arrows, frames = {}, {}, {}
-  local by_section = {}
+  local by_section, by_dir = {}, {}
   local fp = io.open(path, "r")
   if fp then
     local ok, data = pcall(json_decode, fp:read("*a"))
@@ -191,6 +191,8 @@ local function gen_canvas(root, path)
         existing_cards[#existing_cards + 1] = c
         if c.type == "md" then
           by_section[(c.file or "?") .. "\t" .. (c.heading or "?")] = c
+        elseif c.type == "sticky" and c.dir then
+          by_dir[c.dir] = c
         end
       end
       arrows = data.arrows or {}
@@ -204,7 +206,8 @@ local function gen_canvas(root, path)
     cards[#cards + 1] = c
   end
 
-  -- append NEW sections only, in a fresh column right of everything
+  -- per-dir: sticky entry card + section cards + struct arrows dir->section
+  local struct_arrows = {}
   local max_x = 0
   for _, c in ipairs(cards) do max_x = math.max(max_x, c.x or 0) end
   local col_w = 300
@@ -213,32 +216,56 @@ local function gen_canvas(root, path)
   for _, dir in ipairs(config.plugins.kbgen.dirs) do
     local lines = read_lines(root .. "/" .. dir .. "/README.md")
     if lines then
-      local y = 40
+      -- directory entry card (sticky, clickable through to the README)
+      local dcard = by_dir[dir]
+      if not dcard then
+        next_id = next_id + 1
+        dcard = { id = "d" .. tostring(next_id), type = "sticky",
+          dir = dir, text = "📂 " .. dir, x = cx, y = 40 }
+        cards[#cards + 1] = dcard
+      end
+      -- section cards for NEW sections only (existing keep their positions)
+      local y = 160
       local n_in_col = 0
       for _, l in ipairs(lines) do
         local hashes, title = l:match("^(#+)%s+(.-)%s*$")
         if hashes and #hashes >= 2 then
           local file = dir .. "/README.md"
           local heading = string.rep("#", #hashes) .. " " .. title
-          if not by_section[file .. "\t" .. heading] then
+          local key = file .. "\t" .. heading
+          local scard = by_section[key]
+          if not scard then
             next_id = next_id + 1
-            cards[#cards + 1] = {
-              id = "k" .. tostring(next_id),
+            scard = { id = "k" .. tostring(next_id),
               type = "md", file = file, heading = heading,
-              x = cx, y = y,
-            }
+              x = cx, y = y }
+            cards[#cards + 1] = scard
+            by_section[key] = scard
             y = y + 200
             n_in_col = n_in_col + 1
           end
+          -- struct arrows always rebuilt from current ids
+          struct_arrows[#struct_arrows + 1] =
+            { from = dcard.id, to = by_section[key].id, kind = "struct" }
         end
       end
       if n_in_col > 0 then cx = cx + col_w + 60 end
     end
   end
+
+  -- user-drawn arrows (no kind field) are preserved; struct arrows rebuilt
+  local final_arrows = {}
+  for _, a in ipairs(arrows) do
+    if not a.kind then final_arrows[#final_arrows + 1] = a end
+  end
+  for _, a in ipairs(struct_arrows) do
+    final_arrows[#final_arrows + 1] = a
+  end
+
   local parts = {
     "{",
     '  "cards": ' .. json_encode_value(cards) .. ",",
-    '  "arrows": ' .. json_encode_value(arrows) .. ",",
+    '  "arrows": ' .. json_encode_value(final_arrows) .. ",",
     '  "frames": ' .. json_encode_value(frames),
     "}",
   }

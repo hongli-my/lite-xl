@@ -279,7 +279,7 @@ do
 
 ## M2 进度
 
-- 卡片拖拽
+- [卡片拖拽](docs/drag.md)
 - 箭头连接
 - Frame 放映
 
@@ -295,14 +295,23 @@ cv2.cards["m1"] = card
 cv2.card_order[1] = "m1"
 cv2:refresh_md_card(card)
 eq(card._md_lines[1], "## M2 进度", "md card heading kept")
-eq(card._md_lines[2], "卡片拖拽", "md card first bullet")
+eq(card._md_lines[2], "▸ 卡片拖拽", "md link bullet shown with marker")
+eq(card._links[2], "docs/drag.md", "md link target extracted")
+eq(card._links[3], nil, "plain bullet has no link")
 eq(card._md_lines[3], "箭头连接", "md card second bullet")
+eq(card._md_lines[4], "Frame 放映", "md card third bullet")
 -- heading scope ends at M3
 local found_m3 = false
 for _, l in ipairs(card._md_lines) do
   if l:find("Yjs", 1, true) then found_m3 = true end
 end
 ok(not found_m3, "md card stops at next heading of same level")
+-- collapse: geometry shrinks to the heading strip only
+local w_open, h_open = cv2:card_geometry(card)
+card.collapsed = true
+local w_col, h_col = cv2:card_geometry(card)
+ok(h_col < h_open, "collapsed card is shorter")
+card.collapsed = false
 
 -- ---------------- mindmap ----------------------------------------------------
 local mindfile = "/tmp/test_mind.md"

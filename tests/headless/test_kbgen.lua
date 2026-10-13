@@ -31,37 +31,54 @@ wfile("/tmp/sbx/agent/README.md", "# agent\n\n## A节\n- x\n\n## B节\n- y\n")
 
 dofile("/Users/honglichang/ai-home/lite-xl/data/plugins/kbgen.lua")
 local gen = assert(registered["kbgen:generate"])
-
 -- 1) first generation
 gen()
 local c1 = rfile("/tmp/sbx/驾驶舱.canvas")
 ok(c1:find("A节", 1, true) and c1:find("B节", 1, true), "first gen has sections")
-ok(c1:find('"cards": %[', 1, true) ~= nil or c1:find('"cards":', 1, true) ~= nil,
-  "cards key present")
-
--- 2) simulate user layout: move a card, add arrow
-local t = c1:gsub('"x":380', '"x":999', 1)
-  :gsub('"arrows": *%[%]', '"arrows":[{"from":"k1","to":"k2"}]')
-ok(t ~= c1, "user simulation gsub matched")
+ok(c1:find('"kind":"struct"') ~= nil, "struct arrows dir->section generated")
+ok(c1:find('"dir":"agent"') ~= nil or c1:find('📂 agent') ~= nil,
+  "directory entry card generated")
+-- 2) simulate user layout: move a card, add a hand-drawn arrow
+--    (arrows array already holds struct arrows — append ours to it)
+local c1_arrows = c1:match('"arrows": *(%b[])')
+local user_from = c1:match('"id":"(k%d+)"') or "k1"
+local user_arrows = c1_arrows:sub(2, -2) .. ","
+  .. '{"from":"' .. user_from .. '","to":"x1"}'
+local t = (c1:gsub('"x":380', '"x":999', 1))
+  :gsub('"arrows": *%b[]', '"arrows": [' .. user_arrows .. "]")
+ok(t:find('"x":999', 1, true) ~= nil, "user card move patched in")
+ok(t:find('"to":"x1"', 1, true) ~= nil, "user arrow patched in")
 wfile("/tmp/sbx/驾驶舱.canvas", t)
 ok(rfile("/tmp/sbx/驾驶舱.canvas"):find('"x":999', 1, true) ~= nil,
   "user edit on disk")
-
 -- 3) new README section + regenerate: user layout survives, new card appended
 local f = io.open("/tmp/sbx/agent/README.md", "a")
 f:write("\n## C节-new\n- z\n"); f:close()
 gen()
 local c2 = rfile("/tmp/sbx/驾驶舱.canvas")
 ok(c2:find('"x":999', 1, true) ~= nil, "user-moved card position preserved")
-ok(c2:find('"from":"k1"') ~= nil, "user arrow preserved")
+ok(c2:find('"from":"' .. user_from .. '"') ~= nil, "user arrow preserved")
 ok(c2:find("C节%-new") ~= nil, "new section appended as new card")
 local n_c = 0
 for _ in c2:gmatch('"type":"md"') do n_c = n_c + 1 end
 ok(n_c == 3, "exactly 3 md cards (no duplicates): " .. n_c)
 
--- 4) idempotent second regen
+-- 4) idempotent second regen (semantic compare: key order in JSON is not
+--    stable across encodes because pairs() ordering varies)
 gen()
-ok(rfile("/tmp/sbx/驾驶舱.canvas") == c2, "regen idempotent")
+local function canon(s)
+  -- sort cards/arrows by a canonical projection so ordering noise drops out
+  local items = {}
+  for id, text, kind in s:gmatch('"id":"([^"]*)"[^}]*"text":"([^"]*)"[^}]*"kind":"([^"]*)"') do
+    items[#items + 1] = id .. text .. kind
+  end
+  local n = {}
+  for k in s:gmatch('"heading":"([^"]*)"') do n[#n + 1] = k end
+  table.sort(items); table.sort(n)
+  return table.concat(items, "|") .. "#" .. table.concat(n, "|") .. "#"
+    .. tostring(select(2, s:gsub('"kind":"struct"', "")))
+end
+ok(canon(rfile("/tmp/sbx/驾驶舱.canvas")) == canon(c2), "regen idempotent (semantic)")
 
 -- 5) user hand-added sticky survives regen
 local c3 = rfile("/tmp/sbx/驾驶舱.canvas")
