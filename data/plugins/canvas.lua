@@ -317,7 +317,12 @@ end
 function CanvasView:card_geometry(card)
   local fh = style.font:get_height()
   local pad = style.padding.x
-  if card.type == "sticky" then
+  if card.type == "file" then
+    -- compact pill: label text on one line
+    local w = card.w or (style.font:get_width(card.text or "?") + pad * 2)
+    local h = card.h or (fh + 8)
+    return w, h, { card.text }
+  elseif card.type == "sticky" then
     local w = card.w or 170
     local lines = wrap_text(style.font, card.text or "", w - pad * 2)
     local h = card.h or (#lines * fh + pad * 2 + 8)
@@ -549,6 +554,13 @@ end
 -- single click on a md card row: heading strip toggles collapse, a link
 -- row opens the target document (jumping to it in the editor)
 function CanvasView:card_click(card, row)
+  -- file pill (kbgen): open the file it points at
+  if card.type == "file" and card.file then
+    local doc = core.open_doc(card.file)
+    local dv = core.root_view:open_doc(doc)
+    if dv and dv.scroll_to_line then dv:scroll_to_line(1, false, true) end
+    return
+  end
   -- directory entry card (kbgen sticky with .dir): jump to that README
   if card.type == "sticky" and card.dir then
     local doc = core.open_doc(card.dir .. "/README.md")
@@ -591,6 +603,11 @@ end
 -- Card double-click (dispatched from on_mouse_pressed with clicks == 2):
 -- md cards open their file at the heading; stickies edit via the command line.
 function CanvasView:card_double_click(card)
+  if card.type == "file" and card.file then
+    local doc = core.open_doc(card.file)
+    core.root_view:open_doc(doc)
+    return
+  end
   if card.type == "md" and card.file then
     local doc = core.open_doc(card.file)
     local dv = core.root_view:open_doc(doc)
@@ -793,6 +810,19 @@ function CanvasView:draw_card(card)
   -- soft drop shadow under every card (offset copy, theme-safe)
   local sh_col = common.lerp(style.background, style.text, 0.06)
   renderer.draw_rounded_rect(x + 2 * SCALE, y + 3 * SCALE, sw, sh, r, sh_col)
+
+  if card.type == "file" then
+    -- compact pill with an accent dot; click opens the file
+    renderer.draw_rounded_rect(x, y, sw, sh, sh / 2,
+      hovered and raised_color() or surface_color())
+    renderer.draw_rect(x + 5 * SCALE, y + sh / 2 - 2 * SCALE, 4 * SCALE,
+      4 * SCALE,
+      hovered and style.accent
+        or common.lerp(style.background, style.accent or style.text, 0.6))
+    draw_text_clipped_canvas(style.font, style.text, card.text or "?",
+      x + 12 * SCALE, y + (sh - fh * c.z) / 2, sw - 14 * SCALE, fh * c.z)
+    return
+  end
 
   if card.type == "sticky" then
     local bg = sticky_color(card.id)

@@ -234,10 +234,15 @@ local function gen_canvas(root, path)
             file = dir .. "/README.md",
             heading = string.rep("#", #hashes) .. " " .. title,
             title = title,
-            n_rows = 0,
+            links = {},
           }
         elseif #sections > 0 and l:match("^%s*-%s+") then
-          sections[#sections].n_rows = sections[#sections].n_rows + 1
+          local s = sections[#sections]
+          -- file links become their own cards: [label](target)
+          local label, target = l:match("^%s*-%s+%[(.-)%]%((.-)%)")
+          if label and target then
+            s.links[#s.links + 1] = { label = label, target = target }
+          end
         end
       end
       if #sections > 0 then dirs[#dirs + 1] = { dir = dir, sections = sections } end
@@ -276,12 +281,30 @@ local function gen_canvas(root, path)
         cards[#cards + 1] = scard
         by_section[key] = scard
       end
-      -- estimated card size: heading strip + up to 5 rows
       s.card = scard
-      s.w = math.max(est_w(s.title), est_w("共 " .. math.max(s.n_rows,1) .. " 项") )
-      s.h = est_h(math.min(s.n_rows, 5) + 1)
+      -- compact pill: section cards only show the title now (links are cards)
+      s.w = est_w(s.title)
+      s.h = est_h(1)
       struct_arrows[#struct_arrows + 1] =
         { from = dcard.id, to = scard.id, kind = "struct" }
+      -- file sub-cards, one per README link, laid out horizontally
+      s.link_cards = {}
+      for li, lk in ipairs(s.links) do
+        local lkey = s.file .. "\t" .. s.heading .. "\t" .. lk.target
+        local lcard = by_section[lkey]
+        if not lcard then
+          lcard = { id = new_id("f"), type = "file",
+            file = s.file:match("^(.*)[/\\]") .. "/" .. lk.target,
+            text = lk.label, x = 0, y = 0 }
+          cards[#cards + 1] = lcard
+          by_section[lkey] = lcard
+        end
+        lcard.w = est_w(lk.label) * 0.7 + 20
+        lcard.h = est_h(1)
+        s.link_cards[#s.link_cards + 1] = lcard
+        struct_arrows[#struct_arrows + 1] =
+          { from = scard.id, to = lcard.id, kind = "struct" }
+      end
     end
   end
 
@@ -308,6 +331,7 @@ local function gen_canvas(root, path)
   -- lay out each side independently, top-down; parents vertically centred
   local cursor = { right = 0, left = 0 }
   local extent = { right = 0, left = 0 }
+  local LINK_X_GAP, LINK_Y_GAP, LINKS_PER_ROW = 14, 12, 4
   for _, d in ipairs(dirs) do
     local side = d.side
     d.card.w = est_w(d.card.text)
@@ -320,7 +344,7 @@ local function gen_canvas(root, path)
     end
     local sy = cursor[side]
     for _, s in ipairs(d.sections) do
-      s.card.w = math.max(est_w(s.title), 200)
+      s.card.w = math.max(est_w(s.title), 120)
       if not s.card.pinned then
         if side == "right" then
           s.card.x = dir_x + dir_w + X_GAP
@@ -329,7 +353,24 @@ local function gen_canvas(root, path)
         end
         s.card.y = sy
       end
-      sy = sy + s.h + Y_GAP
+      -- file sub-cards: a horizontal row of pills right of the section card
+      -- (4 per row, wrapping), mirrored to the left side
+      local row_y = s.card.y
+      for li, lcard in ipairs(s.link_cards) do
+        if not lcard.pinned then
+          local row = math.floor((li - 1) / LINKS_PER_ROW)
+          local col = (li - 1) % LINKS_PER_ROW
+          if side == "right" then
+            lcard.x = s.card.x + s.card.w + 40 + col * (lcard.w + LINK_X_GAP)
+          else
+            lcard.x = s.card.x - 40 - lcard.w - col * (lcard.w + LINK_X_GAP)
+          end
+          lcard.y = row_y + row * (lcard.h + LINK_Y_GAP)
+        end
+      end
+      -- section vertical footprint grows with its wrapped link rows
+      local n_rows_links = math.ceil(math.max(#s.link_cards, 1) / LINKS_PER_ROW)
+      sy = sy + math.max(s.h, n_rows_links * (est_h(1) + LINK_Y_GAP)) + Y_GAP
     end
     cursor[side] = sy + Y_GAP * 2.5
     extent[side] = cursor[side]
