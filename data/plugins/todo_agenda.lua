@@ -94,10 +94,33 @@ local function raised_color()
   return common.lerp(style.background, style.text, 0.13)
 end
 
--- Text on our surfaces: style.text when the theme defines a dark editor bg
--- with light text (the norm); fall back to chrome_text for light themes.
+-- Text on our surfaces: chrome text when the theme defines one (light
+-- chrome themes), else the editor text colour.
 local function surface_text()
   return style.chrome_text or style.text
+end
+
+-- Wrap text into lines that fit `w` pixels (word-aware; CJK text has no
+-- spaces so a single long word is hard-cut by the caller's clip).
+local function wrap_text(font, text, w)
+  local lines = {}
+  for para in (text .. "\n"):gmatch("([^\n]*)\n") do
+    if para == "" then lines[#lines + 1] = "" end
+    local cur = ""
+    for word in para:gmatch("%S+") do
+      if cur == "" then
+        cur = word
+      elseif font:get_width(cur .. " " .. word) <= w then
+        cur = cur .. " " .. word
+      else
+        lines[#lines + 1] = cur
+        cur = word
+      end
+    end
+    if cur ~= "" then lines[#lines + 1] = cur end
+  end
+  if #lines == 0 then lines[1] = "" end
+  return lines
 end
 
 TodoView.context = "session"
@@ -109,6 +132,9 @@ function TodoView:new()
   self.searching = false
   self.selected_idx = 0
   self.hover_idx = 0
+  -- tooltip: full text shown after the cursor rests on a card
+  self._tip_item = nil
+  self._tip_since = nil
   self._rescan_pending = false
   self._last_rescan = 0
   self.watches = {}
@@ -560,8 +586,9 @@ local function col_scroll(self, col_idx, n_cols)
   return s[col_idx] or 0
 end
 
--- Kanban geometry, Trello proportions: cards are 1.5 lines tall with real
--- padding, columns are rounded containers with a colored dot header.
+-- Kanban geometry, Trello proportions: cards show up to two text lines
+-- (word-wrapped); a card taller than one line reports its own height via
+-- card_height_for() so stacking stays gap-consistent.
 local function kanban_geometry(self)
   local cols = kanban_columns_with_items(self.items)
   local lh = self:get_line_height()
@@ -576,6 +603,39 @@ local function kanban_geometry(self)
   local x0 = self.position.x + style.padding.x + self.kanban_x
   local y0 = self.position.y + self:get_header_height() + style.padding.y * 1.5
   return cols, lh, card_h, col_w, gap, x0, y0, head_h
+end
+
+-- Text lines a card shows (max 2), given the card's inner width.
+local function card_text_lines(item, inner_w)
+  local label = (item.checked and "✓ " or "") .. item.display
+  local lines = wrap_text(style.font, label, inner_w)
+  if #lines > 2 then return 2 end
+  return #lines
+end
+
+-- Full card height for an item (grows by one line when text wraps).
+local function card_height_for(item, base_h, inner_w)
+  if card_text_lines(item, inner_w) >= 2 then
+    return base_h + style.font:get_height() + style.padding.y
+  end
+  return base_h
+end
+
+-- Iterate a column's cards with variable heights: yields
+--   (item, card_index, y, h)  with the column scroll applied.
+local function each_card(self, col, i, n_cols, card_h, col_w, y0, head_h, gap)
+  local sy = col_scroll(self, i, n_cols)
+  local inner_w = col_w - style.padding.x * 2
+    - style.padding.x * 1.5 - 4 * SCALE - math.floor(card_h * 0.34)
+    - style.padding.x - style.padding.x
+  local y = y0 + head_h
+  local out = {}
+  for j, item in ipairs(col.items) do
+    local h = card_height_for(item, card_h, inner_w)
+    out[j] = { item = item, y = y - sy, h = h }
+    y = y + h + gap
+  end
+  return out
 end
 
 -- Hit-test the kanban layout at view coords (mx, my).
@@ -593,13 +653,12 @@ function TodoView:kanban_hit(mx, my)
         return { kind = "column", tag = col.tag, col_idx = i,
           x = cx, y = y0, w = col_w, h = head_h }
       end
-      -- cards (offset by this column's scroll)
-      local sy = col_scroll(self, i, #cols)
-      for j, item in ipairs(col.items) do
-        local cy = y0 + head_h + (j - 1) * (card_h + gap) - sy
-        if my >= cy and my < cy + card_h then
-          return { kind = "card", item = item, col_idx = i, card_idx = j,
-            x = cx, y = cy, w = col_w, h = card_h }
+      -- cards (variable heights, column scroll applied)
+      local cards = each_card(self, col, i, #cols, card_h, col_w, y0, head_h, gap)
+      for j, c in ipairs(cards) do
+        if my >= c.y and my < c.y + c.h then
+          return { kind = "card", item = c.item, col_idx = i, card_idx = j,
+            x = cx, y = c.y, w = col_w, h = c.h }
         end
       end
     end
@@ -617,14 +676,17 @@ function TodoView:on_mouse_wheel(dy, dx)
       return true
     end
     local mx, my = self._mouse_x or 0, self._mouse_y or 0
-    local cols, lh, card_h, col_w, gap, x0, y0 = kanban_geometry(self)
+    local cols, lh, card_h, col_w, gap, x0, y0, head_h = kanban_geometry(self)
     for i, col in ipairs(cols) do
       local cx = x0 + (i - 1) * (col_w + gap)
       if mx >= cx and mx < cx + col_w then
         local sy = col_scroll(self, i, #cols)
-        local head_h = lh + style.padding.y
         local body_h = self.position.y + self.size.y - (y0 + head_h) - style.padding.y
-        local content_h = #col.items * (card_h + gap)
+        -- content height with variable card heights
+        local content_h = 0
+        for _, c in ipairs(each_card(self, col, i, #cols, card_h, col_w, y0, head_h, gap)) do
+          content_h = c.y + c.h + sy
+        end
         local max_scroll = math.max(0, content_h - body_h)
         local ny = math.max(0, math.min(max_scroll, sy - dy * 3))
         self.col_scroll[i] = ny
@@ -702,16 +764,14 @@ function TodoView:draw_kanban()
       cnt_w, cnt_h, radius, common.lerp(style.background, tcol, 0.32))
     common.draw_text(style.code_font, tcol, cnt, "center",
       cx + col_w - cnt_w - style.padding.x, cnt_y, cnt_w, cnt_h)
-    -- cards (scrolled per column, clipped to the column body)
-    local sy = col_scroll(self, i, #cols)
+    -- cards (variable heights, clipped to the column body)
     core.push_clip_rect(cx, y0 + head_h, col_w, view_h - head_h)
-    for j, item in ipairs(col.items) do
-      local cy = y0 + head_h + (j - 1) * (card_h + gap) - sy
-      local hovered = self.hover_item == item
-      local dragging = self.drag and self.drag.item == item
+    for _, c in ipairs(each_card(self, col, i, #cols, card_h, col_w, y0, head_h, gap)) do
+      local hovered = self.hover_item == c.item
+      local dragging = self.drag and self.drag.item == c.item
       if not dragging then
-        self:draw_card(cx + style.padding.x, cy,
-          col_w - style.padding.x * 2, card_h, item, hovered, today, tcol)
+        self:draw_card(cx + style.padding.x, c.y,
+          col_w - style.padding.x * 2, c.h, c.item, hovered, today, tcol)
       end
     end
     core.pop_clip_rect()
@@ -728,9 +788,51 @@ function TodoView:draw_kanban()
     local w = col_w - style.padding.x * 2
     local tcol = tag_color(d.item.tag
       or config.plugins.todo_agenda.kanban_default_column)
-    self:draw_card(d.x - w / 2, d.y - card_h / 2, w, card_h, d.item,
-      true, today, tcol)
+    local dh = card_height_for(d.item, card_h, w - style.padding.x * 4
+      - math.floor(card_h * 0.34))
+    self:draw_card(d.x - w / 2, d.y - dh / 2, w, dh, d.item, true, today, tcol)
   end
+  self:draw_card_tooltip()
+end
+
+-- Full-text tooltip near the cursor after it rests on a card for 0.4s:
+-- complete task text plus source file:line, so nothing is lost to the
+-- card's two-line limit.
+function TodoView:draw_card_tooltip()
+  local item = self.hover_item
+  if not item or not self._tip_since then return end
+  if system.get_time() - self._tip_since < 0.4 then return end
+  local mx, my = self._mouse_x or 0, self._mouse_y or 0
+  local fh = style.font:get_height()
+  local pad = style.padding.x
+  local label = (item.checked and "✓ " or "") .. item.display
+  if item.due then label = label .. "  @due(" .. item.due .. ")" end
+  local max_w = self.size.x * 0.6
+  local lines = wrap_text(style.font, label, max_w - pad * 2)
+  local tw = 0
+  for _, l in ipairs(lines) do
+    tw = math.max(tw, style.font:get_width(l))
+  end
+  local th = #lines * fh + pad * 2
+  local total_h = th + fh + pad * 0.5  -- plus the source hint line
+  local tx = mx + 14
+  if tx + tw + pad * 2 > self.position.x + self.size.x then
+    tx = mx - 14 - tw - pad * 2
+  end
+  local ty = my + 14
+  if ty + total_h > self.position.y + self.size.y then ty = my - total_h - 8 end
+  local tcol = tag_color(item.tag
+    or config.plugins.todo_agenda.kanban_default_column)
+  renderer.draw_rounded_rect(tx, ty, tw + pad * 2, total_h, 4 * SCALE,
+    raised_color())
+  renderer.draw_rounded_rect(tx, ty, 2 * SCALE, total_h, 1 * SCALE, tcol)
+  for li, l in ipairs(lines) do
+    common.draw_text(style.font, style.text, l, "left", tx + pad + 2 * SCALE,
+      ty + pad + (li - 1) * fh, tw, fh)
+  end
+  common.draw_text(style.code_font, style.dim,
+    string.format("%s:%d", item.rel, item.line), "left",
+    tx + pad + 2 * SCALE, ty + pad + #lines * fh + pad * 0.25, tw, fh)
 end
 
 -- One kanban card, Trello style: raised rounded rectangle with a soft
@@ -741,11 +843,10 @@ function TodoView:draw_card(x, y, w, h, item, hovered, today, tcol)
   -- soft shadow under the card
   renderer.draw_rounded_rect(x, y + 1.5 * SCALE, w, h, radius,
     common.lerp(style.background, style.text, 0.03))
-  -- card body: raised, faintly tinted with the column colour (stronger on
-  -- hover so cards feel alive)
-  local bg = common.lerp(style.background,
-    hovered and style.text or tcol,
-    hovered and 0.22 or 0.12)
+  -- card body: raised, tinted with the column colour; hover deepens the
+  -- SAME hue (no jump between different colours — that caused the flicker)
+  local bg = common.lerp(style.background, tcol,
+    hovered and 0.24 or 0.12)
   renderer.draw_rounded_rect(x, y, w, h, radius, bg)
   -- colored left bar: 4px, full column colour (dimmed when done)
   local bar = item.checked and common.lerp(style.background, tcol, 0.30)
@@ -765,16 +866,28 @@ function TodoView:draw_card(x, y, w, h, item, hovered, today, tcol)
     renderer.draw_rect(cx - len, cy, len, 1 * SCALE, style.accent or style.text)
     renderer.draw_rect(cx, cy, 1 * SCALE, len, style.accent or style.text)
   end
-  -- text
+  -- text: up to two wrapped lines (height already accounts for them)
   local tx = bx + box + style.padding.x
   local tcolor = item.checked and style.dim or style.text
   local label = (item.checked and "✓ " or "") .. item.display
   local avail = w - (tx - x) - style.padding.x
-  -- due chip at the bottom-right of the card when there is room
+  local fh = style.font:get_height()
+  local lines = wrap_text(style.font, label, avail)
+  -- reserve the due chip's strip at the bottom when present
+  local chip_h = 0
+  if item.due then
+    chip_h = style.code_font:get_height() + style.padding.y * 0.5
+  end
+  local text_top = y + style.padding.y
+  local max_lines = math.max(1, math.floor((h - chip_h - style.padding.y * 2) / fh))
+  for li = 1, math.min(#lines, max_lines) do
+    draw_text_clipped(style.font, tcolor, lines[li], "left", tx,
+      text_top + (li - 1) * fh, avail, fh)
+  end
+  -- due chip at the bottom-right
   if item.due then
     local overdue = (not item.checked) and date_lt(item.due, today)
     local chip = "⏰ " .. item.due:sub(6)
-    local chip_h = style.code_font:get_height() + style.padding.y * 0.5
     local chip_w = style.code_font:get_width(chip) + style.padding.x * 1.5
     if chip_w < avail then
       local ch_y = y + h - chip_h - style.padding.y * 0.5
@@ -784,14 +897,8 @@ function TodoView:draw_card(x, y, w, h, item, hovered, today, tcol)
         common.lerp(style.background, chip_col, 0.40))
       common.draw_text(style.code_font, chip_col, chip, "center",
         x + w - chip_w - style.padding.x * 0.5, ch_y, chip_w, chip_h)
-      -- text stays on the upper half when a chip is present
-      local text_h = h - chip_h - style.padding.y
-      draw_text_clipped(style.font, tcolor, label, "left", tx, y,
-        avail, text_h)
-      return
     end
   end
-  draw_text_clipped(style.font, tcolor, label, "left", tx, y, avail, h)
 end
 
 -----------------------------------------------------------------------
@@ -1013,6 +1120,11 @@ function TodoView:on_mouse_moved(mx, my, ...)
     end
     local hit = self:kanban_hit(mx, my)
     self.hover_item = hit and hit.kind == "card" and hit.item or nil
+    -- tooltip timer resets whenever the hovered card changes
+    if self.hover_item ~= self._tip_item then
+      self._tip_item = self.hover_item
+      self._tip_since = self.hover_item and system.get_time() or nil
+    end
     self.hover_col = hit and hit.kind == "column" and hit.tag or nil
     self.cursor = (self.hover_item or self.hover_col) and "hand" or "arrow"
     core.redraw = true
@@ -1094,16 +1206,11 @@ function TodoView:on_mouse_pressed(button, x, y, clicks)
     if x >= ix and y >= iy and x < ix + w and y < iy + h then
       local bx, by, bw, bh = checkbox_rect(ix, iy, h)
       if x >= bx and x < bx + bw and y >= by and y < by + bh then
-        -- toggle the checkbox
-        toggle_task_in_source(item)
-        -- re-sort so toggled items move to the other group
-        table.sort(self.items, function(a, b)
-          if a.checked ~= b.checked then return not a.checked end
-          if a.rel ~= b.rel then return a.rel < b.rel end
-          return a.line < b.line
-        end)
-        core.redraw = true
-        return true
+      -- toggle the checkbox in place; the item moves to the done group on
+      -- the next rescan, not instantly (instant re-sort made rows jump)
+      toggle_task_in_source(item)
+      core.redraw = true
+      return true
       end
       -- click on the text: jump to the source line
       core.try(function()
@@ -1140,6 +1247,11 @@ function TodoView:on_mouse_released(button, x, y)
 end
 
 function TodoView:update()
+  -- show the full-text tooltip once the cursor has rested 0.4s on a card
+  if self._tip_item and self._tip_since
+     and system.get_time() - self._tip_since > 0.4 then
+    core.redraw = true
+  end
   -- debounce the dirwatch-triggered rescan
   if self._rescan_pending then
     local now = system.get_time()
