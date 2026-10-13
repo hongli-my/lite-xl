@@ -285,41 +285,58 @@ local function gen_canvas(root, path)
     end
   end
 
-  -- 3) tree layout: classic mindmap (right-growing), parents vertically centred.
-  --    Cards the user has dragged (pinned=true, saved by canvas) keep their
-  --    position; only unpinned struct cards get re-laid-out.
+  -- 3) balanced horizontal mindmap: root centred, dirs split left/right by
+  --    cumulative branch height, sections fan outward on each side.
+  --    Cards the user has dragged (pinned=true) keep their position.
   local X_GAP, Y_GAP = 90, 26
-  local x_root = 0
-  local x_dirs = x_root + est_w(root_card.text) + X_GAP
-  local cursor = 0
+  -- render widths follow our estimates so layout matches drawing
+  root_card.w = est_w(root_card.text)
+  local root_w = root_card.w
+  local function branch_h(d)
+    local h = 0
+    for _, s in ipairs(d.sections) do h = h + s.h + Y_GAP end
+    return math.max(h - Y_GAP, 0)
+  end
+  -- greedy split: fill the right side up to half the total height
+  local total = 0
+  for _, d in ipairs(dirs) do total = total + branch_h(d) + Y_GAP * 2.5 end
+  local half, acc = total / 2, 0
   for _, d in ipairs(dirs) do
-    local total_h = 0
-    for _, s in ipairs(d.sections) do
-      total_h = total_h + s.h + Y_GAP
+    d.side = acc < half and "right" or "left"
+    acc = acc + branch_h(d) + Y_GAP * 2.5
+  end
+  -- lay out each side independently, top-down; parents vertically centred
+  local cursor = { right = 0, left = 0 }
+  local extent = { right = 0, left = 0 }
+  for _, d in ipairs(dirs) do
+    local side = d.side
+    d.card.w = est_w(d.card.text)
+    local dir_w = d.card.w
+    local bh = branch_h(d)
+    local dir_x = side == "right" and (root_w + X_GAP) or (-X_GAP - dir_w)
+    if not d.card.pinned then
+      d.card.x = dir_x
+      d.card.y = cursor[side] + bh / 2 - est_h(1) / 2
     end
-    total_h = math.max(total_h - Y_GAP, 0)
-    d.y_mid = cursor + total_h / 2
-    local dcard_y = cursor + total_h / 2 - est_h(1) / 2
-    d.card_y = dcard_y
-    local sy = cursor
+    local sy = cursor[side]
     for _, s in ipairs(d.sections) do
+      s.card.w = math.max(est_w(s.title), 200)
       if not s.card.pinned then
-        s.card.x = x_dirs + est_w(d.dir) + X_GAP
+        if side == "right" then
+          s.card.x = dir_x + dir_w + X_GAP
+        else
+          s.card.x = dir_x - X_GAP - s.card.w
+        end
         s.card.y = sy
       end
       sy = sy + s.h + Y_GAP
     end
-    cursor = sy + Y_GAP * 2.5
-  end
-  for _, d in ipairs(dirs) do
-    if not d.card.pinned then
-      d.card.x = x_dirs
-      d.card.y = d.card_y
-    end
+    cursor[side] = sy + Y_GAP * 2.5
+    extent[side] = cursor[side]
   end
   if not root_card.pinned then
-    root_card.x = x_root
-    root_card.y = (cursor - Y_GAP * 2.5) / 2 - est_h(1) / 2
+    root_card.x = 0
+    root_card.y = math.max(extent.right, extent.left) / 2 - est_h(1) / 2
   end
 
   -- 4) user-drawn arrows (no kind) are preserved; struct rebuilt

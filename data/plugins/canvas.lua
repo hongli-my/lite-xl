@@ -690,13 +690,22 @@ function CanvasView:draw()
     renderer.draw_rect(x2 - ah / 2, y2 - dir * ah / 2, ah / 2 + t / 2, t, col)
   end
   -- organic mindmap curve for structural links (same L-coverage raster as
-  -- MindView links): from parent's right edge into child's left edge
+  -- MindView links). Direction-aware: curves leave the parent's right edge
+  -- for right-side children and its LEFT edge for left-side children, so the
+  -- balanced horizontal layout reads like a classic mindmap.
   local function draw_struct_curve(from, to, col)
     local fw, fh = self:card_geometry(from)
     local tw, th = self:card_geometry(to)
-    local x1 = (from.x + fw) * c.z + c.x
+    local left_side = to.x + tw / 2 < from.x + fw / 2
+    local x1, x2
+    if left_side then
+      x1 = from.x * c.z + c.x
+      x2 = (to.x + tw) * c.z + c.x
+    else
+      x1 = (from.x + fw) * c.z + c.x
+      x2 = to.x * c.z + c.x
+    end
     local y1 = (from.y + fh / 2) * c.z + c.y
-    local x2 = to.x * c.z + c.x
     local y2 = (to.y + th / 2) * c.z + c.y
     local z = c.z
     local t = math.max(2, 2.5 * SCALE * z)

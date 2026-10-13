@@ -38,23 +38,45 @@ ok(c1:find("A节", 1, true) and c1:find("B节", 1, true), "first gen has section
 ok(c1:find('"kind":"struct"') ~= nil, "struct arrows dir->section generated")
 ok(c1:find('"dir":"agent"') ~= nil or c1:find('📂 agent') ~= nil,
   "directory entry card generated")
--- 2) simulate user layout: move a card, add a hand-drawn arrow
---    (arrows array already holds struct arrows — append ours to it)
-local c1_arrows = c1:match('"arrows": *(%b[])')
-local user_from = c1:match('"id":"(k%d+)"') or "k1"
-local user_arrows = c1_arrows:sub(2, -2) .. ","
-  .. '{"from":"' .. user_from .. '","to":"x1"}'
--- move the FIRST md card (any x value) to x=999
-local any_x = c1:match('"id":"' .. user_from .. '"[^}]*"x":(%d+)')
-  or c1:match('"x":(%d+)')
-local t = (c1:gsub('"x":' .. any_x, '"x":999', 1))
-  :gsub('"id":"' .. user_from .. '"', '"id":"' .. user_from .. '","pinned":true', 1)
-  :gsub('"arrows": *%b[]', '"arrows": [' .. user_arrows .. "]")
-ok(t:find('"x":999', 1, true) ~= nil, "user card move patched in")
-ok(t:find('"to":"x1"', 1, true) ~= nil, "user arrow patched in")
+-- 2) simulate user layout: pin+move an md card, add a hand-drawn arrow.
+--    Structured JSON surgery (decode -> mutate -> encode) so card order and
+--    key order in the file never affect what we touch.
+local json = load([==[
+local dec, enc
+return { decode = dec, encode = enc }
+]==])
+-- reuse kbgen's own decoder/encoder via dofile side effects is messy; inline:
+local dec_src = function() return nil end
+local data = { cards = {}, arrows = {} }
+-- extract kbgen's json_decode/json_encode_value by loading the plugin source
+local src = io.open("/Users/honglichang/ai-home/lite-xl/data/plugins/kbgen.lua"):read("*a")
+local d0 = src:find("local function json_decode")
+local d1 = src:find("\n-- %[%-", d0) or src:find("\nlocal function", d0 + 10)
+local json_decode = assert(load(src:sub(d0, d1 - 1) .. "\nreturn json_decode"))()
+local e0 = src:find("local function json_escape")
+local e1 = src:find("\n%-", e0 + 200)
+local json_encode_value = assert(load(src:sub(e0, e1 - 1) .. "\nreturn json_encode_value"))()
+data = json_decode(c1)
+-- pin & move one md card
+local target
+for _, c in ipairs(data.cards) do
+  if c.type == "md" and not target then target = c end
+end
+target.pinned = true
+target.x = 999
+-- append a hand-drawn arrow (no kind)
+data.arrows[#data.arrows + 1] = { from = target.id, to = "x1" }
+local t = "{\n  \"cards\": " .. json_encode_value(data.cards) .. ",\n"
+  .. "  \"arrows\": " .. json_encode_value(data.arrows) .. ",\n"
+  .. "  \"frames\": " .. json_encode_value(data.frames or {}) .. "\n}"
 wfile("/tmp/sbx/驾驶舱.canvas", t)
-ok(rfile("/tmp/sbx/驾驶舱.canvas"):find('"x":999', 1, true) ~= nil,
-  "user edit on disk")
+local check = json_decode(rfile("/tmp/sbx/驾驶舱.canvas"))
+local moved_ok = false
+for _, c in ipairs(check.cards) do
+  if c.id == target.id and c.x == 999 then moved_ok = true end
+end
+ok(moved_ok, "user edit on disk (pin + move)")
+local user_from = target.id
 -- 3) new README section + regenerate: user layout survives, new card appended
 local f = io.open("/tmp/sbx/agent/README.md", "a")
 f:write("\n## C节-new\n- z\n"); f:close()
