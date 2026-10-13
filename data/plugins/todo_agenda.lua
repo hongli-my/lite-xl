@@ -821,105 +821,138 @@ local function tasks_by_due(items)
   return by
 end
 
+-- Calendar redesign notes:
+--   * pill hover state (self.hover_cal_item) highlights the exact pill
+--   * pill hit rects are recorded per cell for precise click targets
+--   * weekend columns get a slightly darker tint to structure the week
+--   * today = small colored dot under the day number (no full-cell ring)
+--   * month nav = ◀ ▶ pill buttons flanking the centered title
 function TodoView:draw_calendar()
   local conf = config.plugins.todo_agenda
   local first, lead, days = month_grid(self.cal_year, self.cal_month,
     conf.week_starts_monday)
   local by_due = tasks_by_due(self.items)
   local today = today_str()
-  local _, tmonth, tyear = today:match("^(%d+)-(%d+)-(%d+)$")
   local x0 = self.position.x + style.padding.x
   local y0 = self.position.y + self:get_header_height() + style.padding.y
   local w = self.size.x - style.padding.x * 2
   local cw = w / 7
   local fh = style.font:get_height()
-  local row_h = math.max(fh * 2, (self.size.y - (y0 - self.position.y) - fh * 2) / 6)
+  local cfh = style.code_font:get_height()
   local cw_i = math.floor(cw)
 
-  -- month navigation header: ◀ 2026年10月 ▶
+  -- month navigation: pill buttons flanking the centered title
   local title = string.format("%d年%d月", self.cal_year, self.cal_month)
-  local tw = style.font:get_width(title)
   local nav_y = y0
-  local prev_r = { x = x0, y = nav_y, w = fh, h = fh }
-  local next_r = { x = x0 + w - fh, y = nav_y, w = fh, h = fh }
+  local btn_h = fh + style.padding.y
+  local btn_w = btn_h
+  local prev_r = { x = x0, y = nav_y, w = btn_w, h = btn_h }
+  local next_r = { x = x0 + w - btn_w, y = nav_y, w = btn_w, h = btn_h }
   self._cal_nav_rects = { prev = prev_r, next = next_r }
-  common.draw_text(style.font, style.dim, "◀", "center", prev_r.x, prev_r.y, prev_r.w, prev_r.h)
-  common.draw_text(style.font, style.dim, "▶", "center", next_r.x, next_r.y, next_r.w, next_r.h)
-  common.draw_text(style.font, style.accent or style.text, title, "center",
-    x0, nav_y, w, fh)
-  local grid_y = nav_y + fh + style.padding.y
+  local nav_hover = self._cal_nav_hover
+  for _, r in ipairs({ { r = prev_r, lbl = "◀" }, { r = next_r, lbl = "▶" } }) do
+    renderer.draw_rounded_rect(r.r.x, r.r.y, r.r.w, r.r.h, 3 * SCALE,
+      nav_hover == r.lbl and raised_color() or surface_color())
+    common.draw_text(style.font, nav_hover == r.lbl and style.text or style.dim,
+      r.lbl, "center", r.r.x, r.r.y, r.r.w, r.r.h)
+  end
+  common.draw_text(style.font, style.text, title, "center", x0, nav_y, w, btn_h)
 
-  -- weekday labels
+  -- weekday labels (weekend in dim-er tint)
+  local grid_y = nav_y + btn_h + style.padding.y
   local wdays = conf.week_starts_monday
     and { "一", "二", "三", "四", "五", "六", "日" }
     or { "日", "一", "二", "三", "四", "五", "六" }
+  local weekend = conf.week_starts_monday and { 6, 7 } or { 1, 7 }
   for i = 1, 7 do
-    common.draw_text(style.code_font, style.dim, wdays[i], "center",
-      x0 + (i - 1) * cw, grid_y, cw, fh)
+    common.draw_text(style.code_font,
+      weekend[i] and style.dim or style.text, wdays[i], "left",
+      x0 + (i - 1) * cw, grid_y, cw, cfh)
   end
-  grid_y = grid_y + fh + style.padding.y / 2
+  grid_y = grid_y + cfh + style.padding.y / 2
 
   -- day cells
   self._cal_cells = {}
-  local cell_h = math.max(fh * 2, (self.position.y + self.size.y - grid_y - style.padding.y) / 6)
+  local cell_h = math.max(fh * 2,
+    (self.position.y + self.size.y - grid_y - style.padding.y) / 6)
+  local pill_h = fh + style.padding.y * 0.5
   for row = 0, 5 do
     for col = 0, 6 do
       local idx = row * 7 + col          -- 0-based day slot
       local day = idx - lead + 1
       local cx, cy = x0 + col * cw, grid_y + row * cell_h
       local in_month = day >= 1 and day <= days
+      local is_weekend = col == 5 or col == 6
+      if not conf.week_starts_monday then
+        is_weekend = col == 0 or col == 6
+      end
       local ds
       if in_month then
         ds = string.format("%04d-%02d-%02d", self.cal_year, self.cal_month, day)
       end
-      -- cell background: rounded, theme-safe surface for in-month days
-      renderer.draw_rounded_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2,
-        4 * SCALE, in_month and surface_color() or style.background)
       local is_today = ds == today
-      if is_today then
-        -- today: raised cell with a colored ring (two-pass rounded stroke)
-        renderer.draw_rounded_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2,
-          4 * SCALE, tag_color(today))
-        renderer.draw_rounded_rect(cx + 2.5 * SCALE, cy + 2.5 * SCALE,
-          cw_i - 5 * SCALE, cell_h - 5 * SCALE, 3 * SCALE, raised_color())
+      -- cell background: flat, weekends one step darker; out-of-month
+      -- days keep the plain view background and draw nothing else
+      local cell_bg
+      if not in_month then
+        cell_bg = style.background
+      elseif is_weekend then
+        cell_bg = common.lerp(style.background, style.text, 0.03)
+      else
+        cell_bg = surface_color()
       end
-      -- day number
+      renderer.draw_rect(cx, cy, cw_i, cell_h, cell_bg)
+      -- hairline separators only between cells (not around the grid edge)
+      if col > 0 then
+        renderer.draw_rect(cx, cy, 1, cell_h, style.background)
+      end
+      if row > 0 then
+        renderer.draw_rect(cx, cy, cw_i, 1, style.background)
+      end
       if in_month then
-        common.draw_text(style.code_font, is_today and (style.accent or style.text)
-          or style.dim, tostring(day), "right",
-          cx, cy + 1, cw - style.padding.x, fh)
-        -- due tasks
+        -- day number + today dot
+        local dnum_color = is_today and (style.accent or style.text) or style.dim
+        common.draw_text(style.code_font, dnum_color, tostring(day), "left",
+          cx + style.padding.x, cy + 2, cw - style.padding.x, cfh)
+        if is_today then
+          local dot_r = 1.5 * SCALE
+          local nw = style.code_font:get_width(tostring(day))
+          renderer.draw_rounded_rect(cx + style.padding.x + nw + 4, cy + cfh - dot_r,
+            dot_r * 2, dot_r * 2, dot_r, tag_color(today))
+        end
+        -- due tasks as pills; record hit rects for precise clicks
         local list = by_due[ds]
         if list then
-          local ly = cy + fh + 1
-          local lh = fh
-          core.push_clip_rect(cx + 1, cy + 1, cw_i - 2, cell_h - 2)
-          for k = 1, math.min(#list, math.floor((cell_h - fh - 2) / lh)) do
+          local cell = { ds = ds, x = cx, y = cy, w = cw_i, h = cell_h,
+            items = list, pills = {} }
+          self._cal_cells[#self._cal_cells + 1] = cell
+          local max_rows = math.max(0, math.floor((cell_h - cfh - 4) / pill_h))
+          for k = 1, math.min(#list, max_rows) do
             local it = list[k]
             local overdue = (not it.checked) and date_lt(it.due, today)
-            -- event pill: rounded chip tinted with the task's tag colour
+            local hovered = (self.hover_cal_item == it)
+            local ly = cy + cfh + 3 + (k - 1) * pill_h
             local tcol = tag_color(it.tag
               or config.plugins.todo_agenda.kanban_default_column)
             local pill_bg = common.lerp(style.background,
-              overdue and error_color() or tcol, 0.22)
-            renderer.draw_rounded_rect(cx + 3, ly + 1, cw_i - 6, lh - 3,
+              overdue and error_color() or tcol, hovered and 0.42 or 0.22)
+            renderer.draw_rounded_rect(cx + 2, ly, cw_i - 4, pill_h - 2,
               3 * SCALE, pill_bg)
-            renderer.draw_rect(cx + 3, ly + 1, 2 * SCALE, lh - 3,
+            renderer.draw_rect(cx + 2, ly, 2 * SCALE, pill_h - 2,
               overdue and error_color() or tcol)
             draw_text_clipped(style.font,
               it.checked and style.dim or style.text,
               (it.checked and "✓ " or "") .. it.display, "left",
-              cx + 3 + 2 * SCALE + 4, ly - 1, cw_i - 14, lh)
-            ly = ly + lh
+              cx + 2 + 2 * SCALE + 4, ly, cw_i - 12, pill_h)
+            cell.pills[#cell.pills + 1] = { item = it, x = cx + 2, y = ly,
+              w = cw_i - 4, h = pill_h - 2 }
           end
-          if #list > math.floor((cell_h - fh - 2) / lh) then
+          if #list > max_rows then
             common.draw_text(style.code_font, style.dim,
-              string.format("+%d", #list - math.floor((cell_h - fh - 2) / lh)),
-              "left", cx + 4, ly, cw - 8, fh)
+              string.format("+%d 项", #list - max_rows),
+              "left", cx + style.padding.x, cy + cfh + 3 + max_rows * pill_h,
+              cw - 8, cfh)
           end
-          core.pop_clip_rect()
-          self._cal_cells[#self._cal_cells + 1] =
-            { ds = ds, x = cx, y = cy, w = cw_i, h = cell_h, items = list }
         end
       end
     end
@@ -935,6 +968,29 @@ function TodoView:on_mouse_moved(mx, my, ...)
   -- remember the last mouse position: on_mouse_wheel receives no
   -- coordinates; we need them to find the column under the cursor
   self._mouse_x, self._mouse_y = mx, my
+  -- calendar hover: exact pill rects + nav buttons
+  if self.view_mode == "calendar" then
+    self.hover_cal_item = nil
+    self._cal_nav_hover = nil
+    local nav = self._cal_nav_rects or {}
+    for lbl, r in pairs({ prev = nav.prev, next = nav.next }) do
+      if r and mx >= r.x and mx < r.x + r.w and my >= r.y and my < r.y + r.h then
+        self._cal_nav_hover = (lbl == "prev") and "◀" or "▶"
+      end
+    end
+    for _, cell in ipairs(self._cal_cells or {}) do
+      for _, pill in ipairs(cell.pills or {}) do
+        if mx >= pill.x and mx < pill.x + pill.w
+           and my >= pill.y and my < pill.y + pill.h then
+          self.hover_cal_item = pill.item
+          break
+        end
+      end
+    end
+    self.cursor = (self.hover_cal_item or self._cal_nav_hover) and "hand" or "arrow"
+    core.redraw = true
+    return
+  end
   if self.view_mode == "kanban" then
     if self.drag then
       self.drag.x, self.drag.y = mx, my
@@ -980,7 +1036,9 @@ function TodoView:on_mouse_pressed(button, x, y, clicks)
       return true
     end
   end
-  -- calendar: month nav
+  -- calendar: nav buttons, then pills.  Clicks anywhere else in the calendar
+  -- are swallowed (return true) — falling through to the list-view branch
+  -- used to interpret calendar coordinates as list rows and open files.
   if self.view_mode == "calendar" then
     local nav = self._cal_nav_rects or {}
     for _, r in ipairs({ nav.prev, nav.next }) do
@@ -993,21 +1051,18 @@ function TodoView:on_mouse_pressed(button, x, y, clicks)
         return true
       end
     end
-    -- click a task in a day cell: toggle it
+    -- exact pill hit: toggle only when a pill was clicked
     for _, cell in ipairs(self._cal_cells or {}) do
-      if x >= cell.x and x < cell.x + cell.w
-         and y >= cell.y and y < cell.y + cell.h then
-        -- find which task row was hit
-        local fh = style.font:get_height()
-        local row = math.floor((y - cell.y - fh) / fh) + 1
-        local it = cell.items[row]
-        if it then
-          toggle_task_in_source(it)
+      for _, pill in ipairs(cell.pills or {}) do
+        if x >= pill.x and x < pill.x + pill.w
+           and y >= pill.y and y < pill.y + pill.h then
+          toggle_task_in_source(pill.item)
           core.redraw = true
           return true
         end
       end
     end
+    return true  -- swallow clicks on empty calendar space
   end
   -- kanban: press on a card starts a drag; click on checkbox toggles
   if self.view_mode == "kanban" then

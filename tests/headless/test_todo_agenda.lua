@@ -446,6 +446,23 @@ view:on_mouse_pressed("left", 8 + 7, nav_y + 7, 1)
 eq(view.cal_year, 2026, "year decrements when January goes back")
 eq(view.cal_month, 12, "month wraps to December")
 
+-- clicking EMPTY calendar space must NOT fall through to the list branch
+-- (regression: it used to open a file at a nonsense line)
+view.cal_year, view.cal_month = 2026, 10
+view:draw()
+local opened = false
+local orig_open = core.root_view.open_doc
+core.root_view.open_doc = function(doc)
+  opened = true
+  return { doc = doc, scroll_to_line = function() end }
+end
+-- click in the middle of an empty area (below the day numbers of week 2)
+local clicked = view:on_mouse_pressed("left", 400,
+  view.position.y + view:get_header_height() + 120, 1)
+eq(clicked, true, "empty calendar click is swallowed")
+eq(opened, false, "empty calendar click does not open a file")
+core.root_view.open_doc = orig_open
+
 ---------------------------------------------------------------------
 -- 5) switch-view command cycles modes
 ---------------------------------------------------------------------
