@@ -485,7 +485,7 @@ bool gpu_init(void) {
   g_ctx.glyph_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
     "lite_glyph_vertex", gpu_shaders_msl, code_size, 0, 1);
   g_ctx.glyph_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
-    "lite_glyph_fragment", gpu_shaders_msl, code_size, GPU_ATLAS_COUNT, 1);
+    "lite_glyph_fragment", gpu_shaders_msl, code_size, GPU_ATLAS_COUNT, 0);
   g_ctx.image_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
     "lite_image_vertex", gpu_shaders_msl, code_size, 0, 1);
   g_ctx.image_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
@@ -1047,13 +1047,16 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   /* in_array: sampled from the bound texture array via per-vertex tex_index.
    * Otherwise (array overflow) fall back to a dedicated single-texture draw. */
   bool in_array = (tex_index >= 0);
+  /* tex_index packs the atlas slot (low 16 bits) and mode (high 16 bits). */
+  Uint32 packed_index = (Uint32)(in_array ? tex_index : 0) | ((Uint32)mode << 16);
 
-  /* Merge with the previous glyph draw when it is an array draw sharing mode
-   * and clip. Per-vertex colour + tex_index make both tint and texture
-   * independent of the draw, so differently coloured/fonted runs merge. */
+  /* Merge with the previous glyph draw when it is an array draw sharing the
+   * clip. Per-vertex colour + tex_index + mode make tint, texture and mode all
+   * independent of the draw, so differently coloured/fonted/formatted runs
+   * merge. */
   GpuDrawCmd *last = (s->draws_count > 0) ? &s->draws[s->draws_count - 1] : NULL;
   bool merge = in_array && last && last->kind == GPU_DRAW_TEXT &&
-               last->texture == NULL && last->funiform[4] == (float)mode &&
+               last->texture == NULL &&
                last->clip.x == (float)clip.x && last->clip.y == (float)clip.y &&
                last->clip.w == (float)clip.width && last->clip.h == (float)clip.height;
 
@@ -1061,7 +1064,7 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   GpuVertex *v = &s->vbuf_mapped[off];
   for (int i = 0; i < vert_count; i++) {
     v[i] = (GpuVertex){ verts[i].x, verts[i].y, verts[i].u, verts[i].v, packed,
-                        (Uint32)(in_array ? tex_index : 0) };
+                        packed_index };
   }
   s->vbuf_used = off + (Uint32)vert_count;
 
@@ -1077,16 +1080,6 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   d->vert_count = (Uint32)vert_count;
   d->clip = (SDL_FRect){ (float)clip.x, (float)clip.y,
                          (float)clip.width, (float)clip.height };
-  /* Fragment uniform is mode only (colour is per-vertex); slots [0..3] are
-   * the unused `color` member, kept for layout. */
-  d->funiform[0] = 0;
-  d->funiform[1] = 0;
-  d->funiform[2] = 0;
-  d->funiform[3] = 0;
-  d->funiform[4] = (float)mode;
-  d->funiform[5] = 0;
-  d->funiform[6] = 0;
-  d->funiform[7] = 0;
   /* texture == NULL -> bind the atlas array; otherwise single-texture draw. */
   d->texture = in_array ? NULL : tex;
 }
@@ -1346,11 +1339,11 @@ void gpu_end_frame(RenWindow *ren) {
         }
       }
 
-      if (d->kind == GPU_DRAW_TEXT || d->kind == GPU_DRAW_RRECT) {
+      if (d->kind == GPU_DRAW_RRECT) {
         SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
         SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
       } else {
-        /* rect/image: no fragment uniform (colour per-vertex / fixed mode) */
+        /* rect/glyph/image: no fragment uniform (per-vertex / fixed mode) */
         SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
       }
     }

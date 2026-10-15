@@ -201,23 +201,17 @@ lite_glyph_vertex(GlyphVertexIn in [[stage_in]],
   return out;
 }
 
-/* Fragment uniform for glyph text. std140: vec4 + vec4 = 32 bytes.
- *   color: unused (tint is per-vertex now), kept for std140 layout
- *   mode:  x = 0 grayscale, 1 subpixel, 2 color (emoji) */
-typedef struct {
-  float4 color;
-  float4 mode;
-} GlyphFragmentUniform;
-
+/* tex_index packs the atlas slot (low 16 bits) and the glyph mode
+ * (high 16 bits: 0 grayscale, 1 subpixel LCD, 2 color) into one uint. */
 fragment float4
 lite_glyph_fragment(GlyphVertexOut in [[stage_in]],
-                    constant GlyphFragmentUniform &u [[buffer(0)]],
                     array<texture2d<float>, GPU_ATLAS_COUNT> atlases [[texture(0)]],
                     array<sampler, GPU_ATLAS_COUNT> atlasSamplers [[sampler(0)]])
 {
-  float4 glyph = atlases[in.tex_index].sample(atlasSamplers[in.tex_index], in.texcoord);
+  uint tex_index = in.tex_index & 0xFFFFu;
+  int mode = int(in.tex_index >> 16);
+  float4 glyph = atlases[tex_index].sample(atlasSamplers[tex_index], in.texcoord);
   float4 tint = in.color;
-  int mode = int(u.mode.x);
   float coverage;
   float3 src_color;
 
