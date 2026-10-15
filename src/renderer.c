@@ -860,6 +860,13 @@ double ren_draw_text_gpu(RenWindow *ren, RenFont **fonts, const char *text,
   int font_height = ren_font_group_get_height(fonts) * surface_scale;
   int baseline = fonts[0]->baseline * surface_scale;
 
+  /* Vertical culling: a small dirty rect (cursor blink, single-line edit)
+   * still visits every DRAW_TEXT command during replay. Skip lines whose
+   * vertical extent falls entirely outside the clip instead of laying out
+   * their glyphs only for the scissor to drop them. */
+  if (y + font_height <= clip_phys.y || y >= clip_phys.y + clip_phys.height)
+    return pen_x / surface_scale;
+
   /* Batch consecutive glyph quads that share the same atlas texture + format
    * into a single draw call. Reduces draw calls from O(glyphs) to
    * O(atlas-surface-changes). Uses TRIANGLE_LIST (6 verts/quad). */
