@@ -235,7 +235,7 @@ static SDL_GPUGraphicsPipeline *make_rect_pipeline(void) {
   ci.vertex_input_state.num_vertex_buffers = 1;
   ci.vertex_input_state.vertex_attributes = attrs;
   ci.vertex_input_state.num_vertex_attributes = 3;
-  ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+  ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
   ci.rasterizer_state = (SDL_GPURasterizerState){
     .fill_mode = SDL_GPU_FILLMODE_FILL,
     .cull_mode = SDL_GPU_CULLMODE_NONE,
@@ -642,14 +642,16 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   GpuWindowState *s = ren->gpu_state;
   if (!s || !s->vbuf_mapped || !s->cmd) return;
   if (clip.width <= 0 || clip.height <= 0) return;
-  if (s->vbuf_used + 4 > s->vbuf_capacity) return;
+  if (s->vbuf_used + 6 > s->vbuf_capacity) return;
 
   /* rencache commands use logical (HiDPI-divided) coordinates; the GPU
    * render target is in physical pixels, so scale up. */
   RenSurface rs = renwin_get_surface(ren);
   int ss = rs.scale;
 
-  /* Triangle strip quad: TL, BL, TR, BR (Y-down, top-left origin in pixels). */
+  /* Triangle list quad (6 verts): TL, BL, TR + TR, BL, BR. We use a list,
+   * not a strip, so merged quads stay disjoint — a strip would connect them
+   * with degenerate diagonal triangles. */
   float x0 = (float)(rect.x * ss), y0 = (float)(rect.y * ss);
   float x1 = (float)((rect.x + rect.width) * ss), y1 = (float)((rect.y + rect.height) * ss);
   Uint32 packed = pack_rgba(color.r, color.g, color.b, color.a);
@@ -666,11 +668,13 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   v[0] = (GpuVertex){ x0, y0, 0, 0, packed };
   v[1] = (GpuVertex){ x0, y1, 0, 1, packed };
   v[2] = (GpuVertex){ x1, y0, 1, 0, packed };
-  v[3] = (GpuVertex){ x1, y1, 1, 1, packed };
-  s->vbuf_used = off + 4;
+  v[3] = (GpuVertex){ x1, y0, 1, 0, packed };
+  v[4] = (GpuVertex){ x0, y1, 0, 1, packed };
+  v[5] = (GpuVertex){ x1, y1, 1, 1, packed };
+  s->vbuf_used = off + 6;
 
   if (merge) {
-    last->vert_count += 4;
+    last->vert_count += 6;
     return;
   }
 
@@ -678,7 +682,7 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   if (!d) return;
   d->kind = GPU_DRAW_RECT;
   d->vert_offset = off;
-  d->vert_count = 4;
+  d->vert_count = 6;
   d->clip = (SDL_FRect){ cx, cy, cw, ch };
   d->texture = NULL;
 }
