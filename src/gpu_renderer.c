@@ -39,17 +39,35 @@
 /* A streamed vertex. position in pixels; texcoord for text (unused for rect).
  * `color` is a packed RGBA8 tint read only by the text pipeline (per-vertex,
  * so differently-coloured text runs merge into one draw); rect/rrect ignore
- * it. 20-byte stride (16 + packed u8x4). */
+ * it. `tex_index` selects the atlas texture array slot (glyph path only).
+ * 24-byte stride (16 + packed u8x4 + u32). */
 typedef struct {
   float x, y;    /* position (pixels, top-left origin) */
   float u, v;    /* texcoord (0..1); rrect carries local pixel coords here */
   Uint32 color;  /* packed RGBA8 tint: r | g<<8 | b<<16 | a<<24 */
+  Uint32 tex_index; /* atlas texture array index (glyph path) */
 } GpuVertex;
 
 /* Pack an RGBA8 tint into the byte order UBYTE4_NORM expects (R in the low
  * byte, A in the high byte) so the shader reads float4(r,g,b,a)/255. */
 static Uint32 pack_rgba(Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
   return (Uint32)r | ((Uint32)g << 8) | ((Uint32)b << 16) | ((Uint32)a << 24);
+}
+
+/* Number of atlas textures bound as an array for glyph rendering. Must match
+ * GPU_ATLAS_COUNT in gpu_shaders.msl. */
+#define GPU_ATLAS_COUNT 16
+
+/* Atlas texture registry: each GPU atlas surface gets a stable slot index into
+ * the bound texture array (see glyph shader). Textures are registered on
+ * create and unregistered on destroy; slot index == array index. */
+static SDL_GPUTexture *g_atlas_textures[GPU_ATLAS_COUNT];
+static int g_atlas_texture_count = 0;
+
+static int atlas_texture_index(SDL_GPUTexture *tex) {
+  for (int i = 0; i < g_atlas_texture_count; i++)
+    if (g_atlas_textures[i] == tex) return i;
+  return -1;
 }
 
 /* A deferred draw command. We collect these during the frame (while the
@@ -60,7 +78,8 @@ static Uint32 pack_rgba(Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
 typedef enum {
   GPU_DRAW_RECT,
   GPU_DRAW_RRECT,
-  GPU_DRAW_TEXT,
+  GPU_DRAW_TEXT,   /* glyphs: texture array, per-vertex tex_index */
+  GPU_DRAW_IMAGE,  /* single texture (colour mode) */
 } GpuDrawKind;
 
 typedef struct {
@@ -70,8 +89,8 @@ typedef struct {
   SDL_FRect clip;      /* scissor in pixels (0,0,0,0 = full target) */
   float funiform[8];   /* fragment uniform: rect={color.rgba,_,_,_,_},
                         * rrect={color.rgba, radius, width, height, _},
-                        * text={color.rgba, mode.x,0,0,0} */
-  void *texture;       /* SDL_GPUTexture* for text; NULL for rect */
+                        * text/image={_,_,_,_, mode.x,0,0,0} */
+  void *texture;       /* SDL_GPUTexture* for image; NULL for glyph/rect */
 } GpuDrawCmd;
 
 /* Per-window GPU state. */
@@ -155,10 +174,12 @@ typedef struct {
   SDL_GPUDevice *device;
   SDL_GPUShader *rect_vs, *rect_fs;
   SDL_GPUShader *rrect_vs, *rrect_fs;
-  SDL_GPUShader *text_vs, *text_fs;
+  SDL_GPUShader *glyph_vs, *glyph_fs;
+  SDL_GPUShader *image_vs, *image_fs;
   SDL_GPUGraphicsPipeline *rect_pipeline;
   SDL_GPUGraphicsPipeline *rrect_pipeline;
-  SDL_GPUGraphicsPipeline *text_pipeline;
+  SDL_GPUGraphicsPipeline *glyph_pipeline;
+  SDL_GPUGraphicsPipeline *image_pipeline;
   SDL_GPUSampler *atlas_sampler;
 } GpuContext;
 
@@ -316,17 +337,69 @@ static SDL_GPUGraphicsPipeline *make_rrect_pipeline(void) {
   return p;
 }
 
-static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
-  /* Same vertex layout as rect (float2 pos + float2 texcoord, 16 bytes).
-   * Blend is ENABLED with premultiplied alpha: the fragment shader outputs
-   *   (color.rgb * coverage, coverage)
-   * so the colour source factor must be ONE -- SRC_ALPHA would multiply the
-   * coverage in a second time (color.rgb * coverage^2), which washes out
-   * every antialiased edge.  With ONE:
-   *   result = src + dst * (1 - src.a)
-   *          = color.rgb * coverage + dst.rgb * (1 - coverage)
-   * which matches the CPU grayscale formula exactly.  The rect pipeline keeps
-   * SRC_ALPHA because lite_rect_fragment outputs straight alpha. */
+static SDL_GPUGraphicsPipeline *make_glyph_pipeline(void) {
+  /* Vertex layout: float2 pos + float2 texcoord + u8x4 color + u32 tex_index
+   * = 24 bytes. Blend is premultiplied alpha (ONE / ONE_MINUS_SRC_ALPHA); the
+   * fragment outputs (color.rgb * coverage, coverage). */
+  static const SDL_GPUVertexBufferDescription vbuf_desc = {
+    .slot = 0,
+    .pitch = sizeof(GpuVertex),
+    .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX,
+    .instance_step_rate = 0,
+  };
+  static const SDL_GPUVertexAttribute attrs[4] = {
+    { .location = 0, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
+    { .location = 1, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 8 },
+    { .location = 2, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, .offset = 16 },
+    { .location = 3, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_UINT, .offset = 20 },
+  };
+  SDL_GPUColorTargetBlendState blend = {0};
+  blend.enable_blend = true;  /* premultiplied alpha: colour factor is ONE */
+  blend.src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+  blend.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+  blend.color_blend_op = SDL_GPU_BLENDOP_ADD;
+  blend.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+  blend.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+  blend.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+  blend.enable_color_write_mask = false;
+
+  SDL_GPUGraphicsPipelineCreateInfo ci = {0};
+  ci.vertex_shader = g_ctx.glyph_vs;
+  ci.fragment_shader = g_ctx.glyph_fs;
+  ci.vertex_input_state.vertex_buffer_descriptions = &vbuf_desc;
+  ci.vertex_input_state.num_vertex_buffers = 1;
+  ci.vertex_input_state.vertex_attributes = attrs;
+  ci.vertex_input_state.num_vertex_attributes = 4;
+  ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+  ci.rasterizer_state = (SDL_GPURasterizerState){
+    .fill_mode = SDL_GPU_FILLMODE_FILL,
+    .cull_mode = SDL_GPU_CULLMODE_NONE,
+  };
+  ci.multisample_state = (SDL_GPUMultisampleState){
+    .sample_count = SDL_GPU_SAMPLECOUNT_1,
+  };
+  ci.target_info = (SDL_GPUGraphicsPipelineTargetInfo){0};
+  SDL_GPUColorTargetDescription ctd = {0};
+  ctd.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+  ctd.blend_state = blend;
+  ci.target_info.color_target_descriptions = &ctd;
+  ci.target_info.num_color_targets = 1;
+
+  SDL_GPUGraphicsPipeline *p =
+    SDL_CreateGPUGraphicsPipeline(g_ctx.device, &ci);
+  if (!p)
+    fprintf(stderr, "gpu: CreateGPUGraphicsPipeline(glyph) failed: %s\n",
+            SDL_GetError());
+  return p;
+}
+
+static SDL_GPUGraphicsPipeline *make_image_pipeline(void) {
+  /* Same vertex layout minus tex_index (3 attributes, 24-byte stride shared
+   * with the glyph pipeline). Single texture, colour mode, premultiplied. */
   static const SDL_GPUVertexBufferDescription vbuf_desc = {
     .slot = 0,
     .pitch = sizeof(GpuVertex),
@@ -342,7 +415,7 @@ static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
       .format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, .offset = 16 },
   };
   SDL_GPUColorTargetBlendState blend = {0};
-  blend.enable_blend = true;  /* premultiplied alpha: colour factor is ONE */
+  blend.enable_blend = true;
   blend.src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
   blend.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
   blend.color_blend_op = SDL_GPU_BLENDOP_ADD;
@@ -352,8 +425,8 @@ static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
   blend.enable_color_write_mask = false;
 
   SDL_GPUGraphicsPipelineCreateInfo ci = {0};
-  ci.vertex_shader = g_ctx.text_vs;
-  ci.fragment_shader = g_ctx.text_fs;
+  ci.vertex_shader = g_ctx.image_vs;
+  ci.fragment_shader = g_ctx.image_fs;
   ci.vertex_input_state.vertex_buffer_descriptions = &vbuf_desc;
   ci.vertex_input_state.num_vertex_buffers = 1;
   ci.vertex_input_state.vertex_attributes = attrs;
@@ -376,7 +449,7 @@ static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
   SDL_GPUGraphicsPipeline *p =
     SDL_CreateGPUGraphicsPipeline(g_ctx.device, &ci);
   if (!p)
-    fprintf(stderr, "gpu: CreateGPUGraphicsPipeline(text) failed: %s\n",
+    fprintf(stderr, "gpu: CreateGPUGraphicsPipeline(image) failed: %s\n",
             SDL_GetError());
   return p;
 }
@@ -409,13 +482,17 @@ bool gpu_init(void) {
     "lite_rrect_vertex", gpu_shaders_msl, code_size, 0, 1);
   g_ctx.rrect_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
     "lite_rrect_fragment", gpu_shaders_msl, code_size, 0, 1);
-  g_ctx.text_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
-    "lite_text_vertex", gpu_shaders_msl, code_size, 0, 1);
-  g_ctx.text_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
-    "lite_text_fragment", gpu_shaders_msl, code_size, 1, 1);
+  g_ctx.glyph_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
+    "lite_glyph_vertex", gpu_shaders_msl, code_size, 0, 1);
+  g_ctx.glyph_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
+    "lite_glyph_fragment", gpu_shaders_msl, code_size, GPU_ATLAS_COUNT, 1);
+  g_ctx.image_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
+    "lite_image_vertex", gpu_shaders_msl, code_size, 0, 1);
+  g_ctx.image_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
+    "lite_image_fragment", gpu_shaders_msl, code_size, 1, 0);
 
-  if (!g_ctx.rect_vs || !g_ctx.rect_fs || !g_ctx.text_vs || !g_ctx.text_fs ||
-      !g_ctx.rrect_vs || !g_ctx.rrect_fs) {
+  if (!g_ctx.rect_vs || !g_ctx.rect_fs || !g_ctx.rrect_vs || !g_ctx.rrect_fs ||
+      !g_ctx.glyph_vs || !g_ctx.glyph_fs || !g_ctx.image_vs || !g_ctx.image_fs) {
     fprintf(stderr, "gpu_init: shader compilation failed\n");
     GPU_INIT_FAIL();
   }
@@ -426,8 +503,11 @@ bool gpu_init(void) {
   g_ctx.rrect_pipeline = make_rrect_pipeline();
   if (!g_ctx.rrect_pipeline) GPU_INIT_FAIL();
 
-  g_ctx.text_pipeline = make_text_pipeline();
-  if (!g_ctx.text_pipeline) GPU_INIT_FAIL();
+  g_ctx.glyph_pipeline = make_glyph_pipeline();
+  if (!g_ctx.glyph_pipeline) GPU_INIT_FAIL();
+
+  g_ctx.image_pipeline = make_image_pipeline();
+  if (!g_ctx.image_pipeline) GPU_INIT_FAIL();
 
   /* Shared sampler for glyph atlas (Stage 2b). */
   SDL_GPUSamplerCreateInfo sci = {0};
@@ -455,18 +535,23 @@ void gpu_free(void) {
   SDL_WaitForGPUIdle(g_ctx.device);
   if (g_ctx.rect_pipeline)  SDL_ReleaseGPUGraphicsPipeline(g_ctx.device, g_ctx.rect_pipeline);
   if (g_ctx.rrect_pipeline) SDL_ReleaseGPUGraphicsPipeline(g_ctx.device, g_ctx.rrect_pipeline);
-  if (g_ctx.text_pipeline)  SDL_ReleaseGPUGraphicsPipeline(g_ctx.device, g_ctx.text_pipeline);
+  if (g_ctx.glyph_pipeline) SDL_ReleaseGPUGraphicsPipeline(g_ctx.device, g_ctx.glyph_pipeline);
+  if (g_ctx.image_pipeline) SDL_ReleaseGPUGraphicsPipeline(g_ctx.device, g_ctx.image_pipeline);
   if (g_ctx.atlas_sampler)  SDL_ReleaseGPUSampler(g_ctx.device, g_ctx.atlas_sampler);
   if (g_ctx.rect_vs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.rect_vs);
   if (g_ctx.rect_fs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.rect_fs);
   if (g_ctx.rrect_vs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.rrect_vs);
   if (g_ctx.rrect_fs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.rrect_fs);
-  if (g_ctx.text_vs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.text_vs);
-  if (g_ctx.text_fs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.text_fs);
+  if (g_ctx.glyph_vs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.glyph_vs);
+  if (g_ctx.glyph_fs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.glyph_fs);
+  if (g_ctx.image_vs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.image_vs);
+  if (g_ctx.image_fs) SDL_ReleaseGPUShader(g_ctx.device, g_ctx.image_fs);
   if (g_atlas_xfer) { SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer); g_atlas_xfer = NULL; }
   g_atlas_xfer_size = 0;
   SDL_free(g_uploads); g_uploads = NULL; g_upload_count = g_upload_cap = 0;
   SDL_free(g_upload_offsets); g_upload_offsets = NULL; g_upload_offsets_cap = 0;
+  memset(g_atlas_textures, 0, sizeof(g_atlas_textures));
+  g_atlas_texture_count = 0;
   SDL_DestroyGPUDevice(g_ctx.device);
   g_ctx.device = NULL;
   memset(&g_ctx, 0, sizeof(g_ctx));
@@ -757,14 +842,32 @@ void *gpu_atlas_create_texture(int w, int h, int fmt) {
   tci.num_levels = 1;
   tci.sample_count = SDL_GPU_SAMPLECOUNT_1;
   SDL_GPUTexture *tex = SDL_CreateGPUTexture(g_ctx.device, &tci);
-  if (!tex)
+  if (!tex) {
     fprintf(stderr, "gpu: atlas CreateGPUTexture failed: %s\n", SDL_GetError());
+    return NULL;
+  }
+  /* Register in the texture array. If the array is full the glyph path falls
+   * back to a dedicated single-texture draw for this surface (see
+   * gpu_draw_text_quads). */
+  if (g_atlas_texture_count < GPU_ATLAS_COUNT)
+    g_atlas_textures[g_atlas_texture_count++] = tex;
   return tex;
 }
 
 void gpu_atlas_destroy_texture(void *tex) {
-  if (g_ctx.device && tex)
+  if (g_ctx.device && tex) {
+    /* Compact the registry so the array stays dense (no NULL slots). Slot
+     * indices are recomputed each frame, so shifting is safe. */
+    for (int i = 0; i < g_atlas_texture_count; i++) {
+      if (g_atlas_textures[i] == (SDL_GPUTexture *)tex) {
+        for (int j = i; j < g_atlas_texture_count - 1; j++)
+          g_atlas_textures[j] = g_atlas_textures[j + 1];
+        g_atlas_texture_count--;
+        break;
+      }
+    }
     SDL_ReleaseGPUTexture(g_ctx.device, (SDL_GPUTexture *)tex);
+  }
 }
 
 /* Forget pending uploads that read from a surface the caller is about to
@@ -940,22 +1043,25 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   if (s->vbuf_used + (Uint32)vert_count > s->vbuf_capacity) return;
 
   Uint32 packed = pack_rgba(color.r, color.g, color.b, color.a);
+  int tex_index = atlas_texture_index((SDL_GPUTexture *)tex);
+  /* in_array: sampled from the bound texture array via per-vertex tex_index.
+   * Otherwise (array overflow) fall back to a dedicated single-texture draw. */
+  bool in_array = (tex_index >= 0);
 
-  /* Coalesce with the immediately-previous text draw when it shares texture,
-   * mode and clip. Per-vertex colour makes the tint independent of the draw,
-   * so adjacent syntax-coloured runs (different colours) merge into one draw.
-   * A rect drawn in between (underline / missing-glyph box) breaks the chain
-   * and preserves painter's-order. */
+  /* Merge with the previous glyph draw when it is an array draw sharing mode
+   * and clip. Per-vertex colour + tex_index make both tint and texture
+   * independent of the draw, so differently coloured/fonted runs merge. */
   GpuDrawCmd *last = (s->draws_count > 0) ? &s->draws[s->draws_count - 1] : NULL;
-  bool merge = last && last->kind == GPU_DRAW_TEXT && last->texture == tex &&
-               last->funiform[4] == (float)mode &&
+  bool merge = in_array && last && last->kind == GPU_DRAW_TEXT &&
+               last->texture == NULL && last->funiform[4] == (float)mode &&
                last->clip.x == (float)clip.x && last->clip.y == (float)clip.y &&
                last->clip.w == (float)clip.width && last->clip.h == (float)clip.height;
 
   Uint32 off = s->vbuf_used;
   GpuVertex *v = &s->vbuf_mapped[off];
   for (int i = 0; i < vert_count; i++) {
-    v[i] = (GpuVertex){ verts[i].x, verts[i].y, verts[i].u, verts[i].v, packed };
+    v[i] = (GpuVertex){ verts[i].x, verts[i].y, verts[i].u, verts[i].v, packed,
+                        (Uint32)(in_array ? tex_index : 0) };
   }
   s->vbuf_used = off + (Uint32)vert_count;
 
@@ -972,7 +1078,7 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   d->clip = (SDL_FRect){ (float)clip.x, (float)clip.y,
                          (float)clip.width, (float)clip.height };
   /* Fragment uniform is mode only (colour is per-vertex); slots [0..3] are
-   * the unused `color` member of TextFragmentUniform, kept for layout. */
+   * the unused `color` member, kept for layout. */
   d->funiform[0] = 0;
   d->funiform[1] = 0;
   d->funiform[2] = 0;
@@ -981,7 +1087,8 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   d->funiform[5] = 0;
   d->funiform[6] = 0;
   d->funiform[7] = 0;
-  d->texture = tex;
+  /* texture == NULL -> bind the atlas array; otherwise single-texture draw. */
+  d->texture = in_array ? NULL : tex;
 }
 
 /*----------------------------------------------------------------------------
@@ -1088,32 +1195,22 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   float umax = (float)iw / s->image_tex_w;
   float vmax = (float)ih / s->image_tex_h;
   GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
-  v[0] = (GpuVertex){ x0, y0, 0, 0, 0xFFFFFFFFu };
-  v[1] = (GpuVertex){ x0, y1, 0, vmax, 0xFFFFFFFFu };
-  v[2] = (GpuVertex){ x1, y0, umax, 0, 0xFFFFFFFFu };
-  v[3] = (GpuVertex){ x1, y0, umax, 0, 0xFFFFFFFFu };
-  v[4] = (GpuVertex){ x0, y1, 0, vmax, 0xFFFFFFFFu };
-  v[5] = (GpuVertex){ x1, y1, umax, vmax, 0xFFFFFFFFu };
+  v[0] = (GpuVertex){ x0, y0, 0, 0, 0xFFFFFFFFu, 0 };
+  v[1] = (GpuVertex){ x0, y1, 0, vmax, 0xFFFFFFFFu, 0 };
+  v[2] = (GpuVertex){ x1, y0, umax, 0, 0xFFFFFFFFu, 0 };
+  v[3] = (GpuVertex){ x1, y0, umax, 0, 0xFFFFFFFFu, 0 };
+  v[4] = (GpuVertex){ x0, y1, 0, vmax, 0xFFFFFFFFu, 0 };
+  v[5] = (GpuVertex){ x1, y1, umax, vmax, 0xFFFFFFFFu, 0 };
   Uint32 off = s->vbuf_used;
   s->vbuf_used += 6;
 
   GpuDrawCmd *d = push_draw(s);
   if (!d) return;
-  d->kind = GPU_DRAW_TEXT;  /* reuse text pipeline (color mode) */
+  d->kind = GPU_DRAW_IMAGE;
   d->vert_offset = off;
   d->vert_count = 6;
   d->clip = (SDL_FRect){ (float)(clip.x * ss), (float)(clip.y * ss),
                          (float)(clip.width * ss), (float)(clip.height * ss) };
-  /* Fragment uniform is mode only (tint is per-vertex white); slots [0..3]
-   * are the unused `color` member, kept for layout. */
-  d->funiform[0] = 0;
-  d->funiform[1] = 0;
-  d->funiform[2] = 0;
-  d->funiform[3] = 0;
-  d->funiform[4] = 2.0f;  /* mode = color */
-  d->funiform[5] = 0;
-  d->funiform[6] = 0;
-  d->funiform[7] = 0;
   d->texture = s->image_tex;
 }
 
@@ -1188,7 +1285,9 @@ void gpu_end_frame(RenWindow *ren) {
     SDL_PushGPUVertexUniformData(s->cmd, 0, vuniform, sizeof(vuniform));
 
     SDL_GPUGraphicsPipeline *bound_pipeline = NULL;
-    void *bound_texture = NULL;
+    /* texture binding state: 0 = none, 1 = atlas array, 2 = single texture */
+    int bound_tex_mode = 0;
+    void *bound_single_tex = NULL;
     bool have_scissor = false;
     SDL_Rect bound_scissor = {0};
 
@@ -1210,27 +1309,48 @@ void gpu_end_frame(RenWindow *ren) {
 
       SDL_GPUGraphicsPipeline *pipe =
         (d->kind == GPU_DRAW_RECT) ? g_ctx.rect_pipeline :
-        (d->kind == GPU_DRAW_RRECT) ? g_ctx.rrect_pipeline : g_ctx.text_pipeline;
+        (d->kind == GPU_DRAW_RRECT) ? g_ctx.rrect_pipeline :
+        (d->kind == GPU_DRAW_IMAGE) ? g_ctx.image_pipeline : g_ctx.glyph_pipeline;
       if (pipe != bound_pipeline) {
         SDL_BindGPUGraphicsPipeline(s->pass, pipe);
         bound_pipeline = pipe;
       }
 
-      if (d->kind == GPU_DRAW_TEXT && d->texture) {
-        if (d->texture != bound_texture) {
-          SDL_GPUTextureSamplerBinding tsb = {0};
-          tsb.texture = (SDL_GPUTexture *)d->texture;
-          tsb.sampler = g_ctx.atlas_sampler;
-          SDL_BindGPUFragmentSamplers(s->pass, 0, &tsb, 1);
-          bound_texture = d->texture;
+      /* Bind textures for glyph/image draws. */
+      if (d->kind == GPU_DRAW_TEXT || d->kind == GPU_DRAW_IMAGE) {
+        if (d->kind == GPU_DRAW_TEXT && d->texture == NULL) {
+          /* Glyph array: bind all 16 slots (shader array is fixed-size).
+           * Real atlas textures fill slots 0..N-1; the rest are padded with a
+           * valid texture (never sampled, since tex_index < N). */
+          if (bound_tex_mode != 1) {
+            SDL_GPUTextureSamplerBinding tsb[GPU_ATLAS_COUNT];
+            int n = g_atlas_texture_count; /* >= 1 here */
+            for (int k = 0; k < GPU_ATLAS_COUNT; k++) {
+              tsb[k].texture = g_atlas_textures[k < n ? k : 0];
+              tsb[k].sampler = g_ctx.atlas_sampler;
+            }
+            SDL_BindGPUFragmentSamplers(s->pass, 0, tsb, GPU_ATLAS_COUNT);
+            bound_tex_mode = 1;
+          }
+        } else {
+          /* Single texture at slot 0 (overflow glyph or image). */
+          void *tex = d->texture;
+          if (bound_tex_mode != 2 || bound_single_tex != tex) {
+            SDL_GPUTextureSamplerBinding tsb = {0};
+            tsb.texture = (SDL_GPUTexture *)tex;
+            tsb.sampler = g_ctx.atlas_sampler;
+            SDL_BindGPUFragmentSamplers(s->pass, 0, &tsb, 1);
+            bound_tex_mode = 2;
+            bound_single_tex = tex;
+          }
         }
-        SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
-        SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
-      } else if (d->kind == GPU_DRAW_RRECT) {
+      }
+
+      if (d->kind == GPU_DRAW_TEXT || d->kind == GPU_DRAW_RRECT) {
         SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
         SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
       } else {
-        /* rect: colour is per-vertex, no fragment uniform */
+        /* rect/image: no fragment uniform (colour per-vertex / fixed mode) */
         SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
       }
     }
