@@ -27,10 +27,12 @@ using namespace metal;
 typedef struct {
   float2 position [[attribute(0)]];
   float2 texcoord [[attribute(1)]];
+  float4 color    [[attribute(2)]];  /* per-vertex tint (UBYTE4_NORM) */
 } RectVertexIn;
 
 typedef struct {
   float4 position [[position]];
+  float4 color;
 } RectVertexOut;
 
 /* Vertex uniform: viewport size in pixels (zw unused, vec4 for std140). */
@@ -46,18 +48,14 @@ lite_rect_vertex(RectVertexIn in [[stage_in]],
   float x = (in.position.x / u.viewport.x) * 2.0 - 1.0;
   float y = 1.0 - (in.position.y / u.viewport.y) * 2.0;
   out.position = float4(x, y, 0.0, 1.0);
+  out.color = in.color;
   return out;
 }
 
-typedef struct {
-  float4 color; /* straight alpha */
-} RectFragmentUniform;
-
 fragment float4
-lite_rect_fragment(RectVertexOut in [[stage_in]],
-                   constant RectFragmentUniform &u [[buffer(0)]])
+lite_rect_fragment(RectVertexOut in [[stage_in]])
 {
-  return u.color;
+  return in.color; /* per-vertex tint (straight alpha) */
 }
 
 /*=============================================================================
@@ -121,7 +119,7 @@ lite_rrect_fragment(RRectVertexOut in [[stage_in]],
  *
  * Uses premultiplied-alpha blending instead of Metal framebuffer fetch.
  * The shader outputs (color.rgb * coverage, coverage) and the pipeline
- * blends with SRC_ALPHA / ONE_MINUS_SRC_ALPHA, giving:
+ * blends with ONE / ONE_MINUS_SRC_ALPHA (premultiplied), giving:
  *   result = color.rgb * coverage + dst.rgb * (1 - coverage)
  * which exactly matches the CPU grayscale formula.
  *
@@ -133,11 +131,13 @@ lite_rrect_fragment(RRectVertexOut in [[stage_in]],
 typedef struct {
   float2 position [[attribute(0)]];
   float2 texcoord [[attribute(1)]];
+  float4 color    [[attribute(2)]];  /* per-vertex tint (UBYTE4_NORM) */
 } TextVertexIn;
 
 typedef struct {
   float4 position [[position]];
   float2 texcoord;
+  float4 color;
 } TextVertexOut;
 
 typedef struct {
@@ -153,11 +153,12 @@ lite_text_vertex(TextVertexIn in [[stage_in]],
   float y = 1.0 - (in.position.y / u.viewport.y) * 2.0;
   out.position = float4(x, y, 0.0, 1.0);
   out.texcoord = in.texcoord;
+  out.color = in.color;
   return out;
 }
 
 /* Fragment uniform for text. std140: vec4 + vec4 = 32 bytes.
- *   color: foreground tint (straight alpha)
+ *   color: unused (tint is per-vertex now), kept for std140 layout
  *   mode:  x = 0 grayscale, 1 subpixel, 2 color (emoji) */
 typedef struct {
   float4 color;
@@ -171,22 +172,23 @@ lite_text_fragment(TextVertexOut in [[stage_in]],
                    sampler atlasSampler [[sampler(0)]])
 {
   float4 glyph = atlas.sample(atlasSampler, in.texcoord);
+  float4 tint = in.color;
   int mode = int(u.mode.x);
   float coverage;
   float3 src_color;
 
   if (mode == 2) {
     /* Color emoji: glyph provides RGB + alpha coverage */
-    coverage = glyph.a * u.color.a;
+    coverage = glyph.a * tint.a;
     src_color = glyph.rgb;
   } else if (mode == 1) {
     /* Subpixel LCD: average R/G/B coverage (approximation) */
-    coverage = (glyph.r + glyph.g + glyph.b) / 3.0 * u.color.a;
-    src_color = u.color.rgb;
+    coverage = (glyph.r + glyph.g + glyph.b) / 3.0 * tint.a;
+    src_color = tint.rgb;
   } else {
     /* Grayscale: glyph.r is uniform coverage */
-    coverage = glyph.r * u.color.a;
-    src_color = u.color.rgb;
+    coverage = glyph.r * tint.a;
+    src_color = tint.rgb;
   }
   /* Premultiplied output: blend does result = src + dst*(1-alpha) */
   return float4(src_color * coverage, coverage);

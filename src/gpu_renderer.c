@@ -36,11 +36,21 @@
  * Types
  *--------------------------------------------------------------------------*/
 
-/* A streamed vertex. position in pixels; texcoord for text (unused for rect). */
+/* A streamed vertex. position in pixels; texcoord for text (unused for rect).
+ * `color` is a packed RGBA8 tint read only by the text pipeline (per-vertex,
+ * so differently-coloured text runs merge into one draw); rect/rrect ignore
+ * it. 20-byte stride (16 + packed u8x4). */
 typedef struct {
   float x, y;    /* position (pixels, top-left origin) */
-  float u, v;    /* texcoord (0..1) */
+  float u, v;    /* texcoord (0..1); rrect carries local pixel coords here */
+  Uint32 color;  /* packed RGBA8 tint: r | g<<8 | b<<16 | a<<24 */
 } GpuVertex;
+
+/* Pack an RGBA8 tint into the byte order UBYTE4_NORM expects (R in the low
+ * byte, A in the high byte) so the shader reads float4(r,g,b,a)/255. */
+static Uint32 pack_rgba(Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
+  return (Uint32)r | ((Uint32)g << 8) | ((Uint32)b << 16) | ((Uint32)a << 24);
+}
 
 /* A deferred draw command. We collect these during the frame (while the
  * vertex transfer buffer is mapped) and replay them inside the render pass in
@@ -131,6 +141,10 @@ typedef struct {
 
 static AtlasUpload *g_uploads = NULL;
 static int g_upload_count = 0, g_upload_cap = 0;
+/* Byte offset of each upload in the staging buffer; sized to g_upload_count
+ * (a fixed 64-slot stack array silently dropped glyphs past 64 per frame). */
+static Uint32 *g_upload_offsets = NULL;
+static int g_upload_offsets_cap = 0;
 
 /* Transfer buffer for atlas uploads (grown as needed). */
 static SDL_GPUTransferBuffer *g_atlas_xfer = NULL;
@@ -184,20 +198,22 @@ static SDL_GPUShader *create_shader_named(SDL_GPUShaderStage stage,
 }
 
 static SDL_GPUGraphicsPipeline *make_rect_pipeline(void) {
-  /* Vertex layout: float2 position, float2 texcoord = 16 bytes/vertex.
-   * (rect shader only reads position, but sharing the layout with text
-   * lets us reuse one vertex buffer.) */
+  /* Vertex layout: float2 position, float2 texcoord, u8x4 color = 20 bytes.
+   * (rect shader only reads position + color, but sharing the layout with
+   * text lets us reuse one vertex buffer.) */
   static const SDL_GPUVertexBufferDescription vbuf_desc = {
     .slot = 0,
     .pitch = sizeof(GpuVertex),
     .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX,
     .instance_step_rate = 0,
   };
-  static const SDL_GPUVertexAttribute attrs[2] = {
+  static const SDL_GPUVertexAttribute attrs[3] = {
     { .location = 0, .buffer_slot = 0,
       .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
     { .location = 1, .buffer_slot = 0,
       .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 8 },
+    { .location = 2, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, .offset = 16 },
   };
   SDL_GPUColorTargetBlendState blend = {0};
   blend.enable_blend = true;
@@ -218,7 +234,7 @@ static SDL_GPUGraphicsPipeline *make_rect_pipeline(void) {
   ci.vertex_input_state.vertex_buffer_descriptions = &vbuf_desc;
   ci.vertex_input_state.num_vertex_buffers = 1;
   ci.vertex_input_state.vertex_attributes = attrs;
-  ci.vertex_input_state.num_vertex_attributes = 2;
+  ci.vertex_input_state.num_vertex_attributes = 3;
   ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
   ci.rasterizer_state = (SDL_GPURasterizerState){
     .fill_mode = SDL_GPU_FILLMODE_FILL,
@@ -317,11 +333,13 @@ static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
     .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX,
     .instance_step_rate = 0,
   };
-  static const SDL_GPUVertexAttribute attrs[2] = {
+  static const SDL_GPUVertexAttribute attrs[3] = {
     { .location = 0, .buffer_slot = 0,
       .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
     { .location = 1, .buffer_slot = 0,
       .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 8 },
+    { .location = 2, .buffer_slot = 0,
+      .format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, .offset = 16 },
   };
   SDL_GPUColorTargetBlendState blend = {0};
   blend.enable_blend = true;  /* premultiplied alpha: colour factor is ONE */
@@ -339,7 +357,7 @@ static SDL_GPUGraphicsPipeline *make_text_pipeline(void) {
   ci.vertex_input_state.vertex_buffer_descriptions = &vbuf_desc;
   ci.vertex_input_state.num_vertex_buffers = 1;
   ci.vertex_input_state.vertex_attributes = attrs;
-  ci.vertex_input_state.num_vertex_attributes = 2;
+  ci.vertex_input_state.num_vertex_attributes = 3;
   ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
   ci.rasterizer_state = (SDL_GPURasterizerState){
     .fill_mode = SDL_GPU_FILLMODE_FILL,
@@ -386,7 +404,7 @@ bool gpu_init(void) {
   g_ctx.rect_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
     "lite_rect_vertex", gpu_shaders_msl, code_size, 0, 1);
   g_ctx.rect_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
-    "lite_rect_fragment", gpu_shaders_msl, code_size, 0, 1);
+    "lite_rect_fragment", gpu_shaders_msl, code_size, 0, 0);
   g_ctx.rrect_vs = create_shader_named(SDL_GPU_SHADERSTAGE_VERTEX,
     "lite_rrect_vertex", gpu_shaders_msl, code_size, 0, 1);
   g_ctx.rrect_fs = create_shader_named(SDL_GPU_SHADERSTAGE_FRAGMENT,
@@ -448,6 +466,7 @@ void gpu_free(void) {
   if (g_atlas_xfer) { SDL_ReleaseGPUTransferBuffer(g_ctx.device, g_atlas_xfer); g_atlas_xfer = NULL; }
   g_atlas_xfer_size = 0;
   SDL_free(g_uploads); g_uploads = NULL; g_upload_count = g_upload_cap = 0;
+  SDL_free(g_upload_offsets); g_upload_offsets = NULL; g_upload_offsets_cap = 0;
   SDL_DestroyGPUDevice(g_ctx.device);
   g_ctx.device = NULL;
   memset(&g_ctx, 0, sizeof(g_ctx));
@@ -633,25 +652,34 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   /* Triangle strip quad: TL, BL, TR, BR (Y-down, top-left origin in pixels). */
   float x0 = (float)(rect.x * ss), y0 = (float)(rect.y * ss);
   float x1 = (float)((rect.x + rect.width) * ss), y1 = (float)((rect.y + rect.height) * ss);
-  GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
-  v[0] = (GpuVertex){ x0, y0, 0, 0 };
-  v[1] = (GpuVertex){ x0, y1, 0, 1 };
-  v[2] = (GpuVertex){ x1, y0, 1, 0 };
-  v[3] = (GpuVertex){ x1, y1, 1, 1 };
+  Uint32 packed = pack_rgba(color.r, color.g, color.b, color.a);
+
+  float cx = (float)(clip.x * ss), cy = (float)(clip.y * ss);
+  float cw = (float)(clip.width * ss), ch = (float)(clip.height * ss);
+  GpuDrawCmd *last = (s->draws_count > 0) ? &s->draws[s->draws_count - 1] : NULL;
+  bool merge = last && last->kind == GPU_DRAW_RECT &&
+               last->clip.x == cx && last->clip.y == cy &&
+               last->clip.w == cw && last->clip.h == ch;
+
   Uint32 off = s->vbuf_used;
-  s->vbuf_used += 4;
+  GpuVertex *v = &s->vbuf_mapped[off];
+  v[0] = (GpuVertex){ x0, y0, 0, 0, packed };
+  v[1] = (GpuVertex){ x0, y1, 0, 1, packed };
+  v[2] = (GpuVertex){ x1, y0, 1, 0, packed };
+  v[3] = (GpuVertex){ x1, y1, 1, 1, packed };
+  s->vbuf_used = off + 4;
+
+  if (merge) {
+    last->vert_count += 4;
+    return;
+  }
 
   GpuDrawCmd *d = push_draw(s);
   if (!d) return;
   d->kind = GPU_DRAW_RECT;
   d->vert_offset = off;
   d->vert_count = 4;
-  d->clip = (SDL_FRect){ (float)(clip.x * ss), (float)(clip.y * ss),
-                         (float)(clip.width * ss), (float)(clip.height * ss) };
-  d->funiform[0] = color.r / 255.0f;
-  d->funiform[1] = color.g / 255.0f;
-  d->funiform[2] = color.b / 255.0f;
-  d->funiform[3] = color.a / 255.0f;
+  d->clip = (SDL_FRect){ cx, cy, cw, ch };
   d->texture = NULL;
 }
 
@@ -843,15 +871,20 @@ static bool ensure_xfer(SDL_GPUTransferBuffer **buf, Uint32 *cap, Uint32 size) {
 static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
   if (g_upload_count == 0) return;
 
-  Uint32 offsets[64];
-  int n = g_upload_count < 64 ? g_upload_count : 64;
+  int n = g_upload_count;
+  if (n > g_upload_offsets_cap) {
+    Uint32 *nd = SDL_realloc(g_upload_offsets, (size_t)n * sizeof(Uint32));
+    if (!nd) { g_upload_count = 0; return; }
+    g_upload_offsets = nd;
+    g_upload_offsets_cap = n;
+  }
   Uint32 total = 0;
   for (int i = 0; i < n; i++) {
     int bpp = (g_uploads[i].fmt == 0) ? 1 : 4;
     Uint32 size = (Uint32)(g_uploads[i].dirty.w * g_uploads[i].dirty.h * bpp);
     size = (size + 3u) & ~3u;   /* Metal requires 4-byte-aligned offsets */
     if (total + size < total) { /* overflow */ n = i; break; }
-    offsets[i] = total;
+    g_upload_offsets[i] = total;
     total += size;
   }
 
@@ -867,7 +900,7 @@ static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
   for (int i = 0; i < n; i++) {
     AtlasUpload *u = &g_uploads[i];
     int bpp = (u->fmt == 0) ? 1 : 4;
-    copy_atlas_region(mapped + offsets[i], u->dirty.w * bpp, u->surf, &u->dirty, u->fmt);
+    copy_atlas_region(mapped + g_upload_offsets[i], u->dirty.w * bpp, u->surf, &u->dirty, u->fmt);
   }
   SDL_UnmapGPUTransferBuffer(g_ctx.device, g_atlas_xfer);
 
@@ -877,7 +910,7 @@ static void flush_atlas_uploads(SDL_GPUCommandBuffer *cmd) {
     AtlasUpload *u = &g_uploads[i];
     SDL_GPUTextureTransferInfo tsrc = {0};
     tsrc.transfer_buffer = g_atlas_xfer;
-    tsrc.offset = offsets[i];
+    tsrc.offset = g_upload_offsets[i];
     tsrc.pixels_per_row = (Uint32)u->dirty.w;
     tsrc.rows_per_layer = (Uint32)u->dirty.h;
     SDL_GPUTextureRegion tdst = {0};
@@ -902,12 +935,30 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   if (clip.width <= 0 || clip.height <= 0) return;
   if (s->vbuf_used + (Uint32)vert_count > s->vbuf_capacity) return;
 
-  GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
-  for (int i = 0; i < vert_count; i++) {
-    v[i] = (GpuVertex){ verts[i].x, verts[i].y, verts[i].u, verts[i].v };
-  }
+  Uint32 packed = pack_rgba(color.r, color.g, color.b, color.a);
+
+  /* Coalesce with the immediately-previous text draw when it shares texture,
+   * mode and clip. Per-vertex colour makes the tint independent of the draw,
+   * so adjacent syntax-coloured runs (different colours) merge into one draw.
+   * A rect drawn in between (underline / missing-glyph box) breaks the chain
+   * and preserves painter's-order. */
+  GpuDrawCmd *last = (s->draws_count > 0) ? &s->draws[s->draws_count - 1] : NULL;
+  bool merge = last && last->kind == GPU_DRAW_TEXT && last->texture == tex &&
+               last->funiform[4] == (float)mode &&
+               last->clip.x == (float)clip.x && last->clip.y == (float)clip.y &&
+               last->clip.w == (float)clip.width && last->clip.h == (float)clip.height;
+
   Uint32 off = s->vbuf_used;
-  s->vbuf_used += vert_count;
+  GpuVertex *v = &s->vbuf_mapped[off];
+  for (int i = 0; i < vert_count; i++) {
+    v[i] = (GpuVertex){ verts[i].x, verts[i].y, verts[i].u, verts[i].v, packed };
+  }
+  s->vbuf_used = off + (Uint32)vert_count;
+
+  if (merge) {
+    last->vert_count += (Uint32)vert_count;
+    return;
+  }
 
   GpuDrawCmd *d = push_draw(s);
   if (!d) return;
@@ -916,10 +967,12 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   d->vert_count = (Uint32)vert_count;
   d->clip = (SDL_FRect){ (float)clip.x, (float)clip.y,
                          (float)clip.width, (float)clip.height };
-  d->funiform[0] = color.r / 255.0f;
-  d->funiform[1] = color.g / 255.0f;
-  d->funiform[2] = color.b / 255.0f;
-  d->funiform[3] = color.a / 255.0f;
+  /* Fragment uniform is mode only (colour is per-vertex); slots [0..3] are
+   * the unused `color` member of TextFragmentUniform, kept for layout. */
+  d->funiform[0] = 0;
+  d->funiform[1] = 0;
+  d->funiform[2] = 0;
+  d->funiform[3] = 0;
   d->funiform[4] = (float)mode;
   d->funiform[5] = 0;
   d->funiform[6] = 0;
@@ -1031,12 +1084,12 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   float umax = (float)iw / s->image_tex_w;
   float vmax = (float)ih / s->image_tex_h;
   GpuVertex *v = &s->vbuf_mapped[s->vbuf_used];
-  v[0] = (GpuVertex){ x0, y0, 0, 0 };
-  v[1] = (GpuVertex){ x0, y1, 0, vmax };
-  v[2] = (GpuVertex){ x1, y0, umax, 0 };
-  v[3] = (GpuVertex){ x1, y0, umax, 0 };
-  v[4] = (GpuVertex){ x0, y1, 0, vmax };
-  v[5] = (GpuVertex){ x1, y1, umax, vmax };
+  v[0] = (GpuVertex){ x0, y0, 0, 0, 0xFFFFFFFFu };
+  v[1] = (GpuVertex){ x0, y1, 0, vmax, 0xFFFFFFFFu };
+  v[2] = (GpuVertex){ x1, y0, umax, 0, 0xFFFFFFFFu };
+  v[3] = (GpuVertex){ x1, y0, umax, 0, 0xFFFFFFFFu };
+  v[4] = (GpuVertex){ x0, y1, 0, vmax, 0xFFFFFFFFu };
+  v[5] = (GpuVertex){ x1, y1, umax, vmax, 0xFFFFFFFFu };
   Uint32 off = s->vbuf_used;
   s->vbuf_used += 6;
 
@@ -1047,10 +1100,12 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   d->vert_count = 6;
   d->clip = (SDL_FRect){ (float)(clip.x * ss), (float)(clip.y * ss),
                          (float)(clip.width * ss), (float)(clip.height * ss) };
-  d->funiform[0] = 1.0f;  /* white tint */
-  d->funiform[1] = 1.0f;
-  d->funiform[2] = 1.0f;
-  d->funiform[3] = 1.0f;
+  /* Fragment uniform is mode only (tint is per-vertex white); slots [0..3]
+   * are the unused `color` member, kept for layout. */
+  d->funiform[0] = 0;
+  d->funiform[1] = 0;
+  d->funiform[2] = 0;
+  d->funiform[3] = 0;
   d->funiform[4] = 2.0f;  /* mode = color */
   d->funiform[5] = 0;
   d->funiform[6] = 0;
@@ -1128,6 +1183,11 @@ void gpu_end_frame(RenWindow *ren) {
     float vuniform[4] = { (float)s->target_w, (float)s->target_h, 0, 0 };
     SDL_PushGPUVertexUniformData(s->cmd, 0, vuniform, sizeof(vuniform));
 
+    SDL_GPUGraphicsPipeline *bound_pipeline = NULL;
+    void *bound_texture = NULL;
+    bool have_scissor = false;
+    SDL_Rect bound_scissor = {0};
+
     for (Uint32 i = 0; i < s->draws_count; i++) {
       GpuDrawCmd *d = &s->draws[i];
       SDL_Rect sc;
@@ -1137,23 +1197,36 @@ void gpu_end_frame(RenWindow *ren) {
       } else {
         sc = (SDL_Rect){ 0, 0, s->target_w, s->target_h };
       }
-      SDL_SetGPUScissor(s->pass, &sc);
+      if (!have_scissor || sc.x != bound_scissor.x || sc.y != bound_scissor.y ||
+          sc.w != bound_scissor.w || sc.h != bound_scissor.h) {
+        SDL_SetGPUScissor(s->pass, &sc);
+        bound_scissor = sc;
+        have_scissor = true;
+      }
 
-      if (d->kind == GPU_DRAW_RECT) {
-        SDL_BindGPUGraphicsPipeline(s->pass, g_ctx.rect_pipeline);
+      SDL_GPUGraphicsPipeline *pipe =
+        (d->kind == GPU_DRAW_RECT) ? g_ctx.rect_pipeline :
+        (d->kind == GPU_DRAW_RRECT) ? g_ctx.rrect_pipeline : g_ctx.text_pipeline;
+      if (pipe != bound_pipeline) {
+        SDL_BindGPUGraphicsPipeline(s->pass, pipe);
+        bound_pipeline = pipe;
+      }
+
+      if (d->kind == GPU_DRAW_TEXT && d->texture) {
+        if (d->texture != bound_texture) {
+          SDL_GPUTextureSamplerBinding tsb = {0};
+          tsb.texture = (SDL_GPUTexture *)d->texture;
+          tsb.sampler = g_ctx.atlas_sampler;
+          SDL_BindGPUFragmentSamplers(s->pass, 0, &tsb, 1);
+          bound_texture = d->texture;
+        }
         SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
         SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
       } else if (d->kind == GPU_DRAW_RRECT) {
-        SDL_BindGPUGraphicsPipeline(s->pass, g_ctx.rrect_pipeline);
         SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
         SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
-      } else if (d->kind == GPU_DRAW_TEXT && d->texture) {
-        SDL_BindGPUGraphicsPipeline(s->pass, g_ctx.text_pipeline);
-        SDL_GPUTextureSamplerBinding tsb = {0};
-        tsb.texture = (SDL_GPUTexture *)d->texture;
-        tsb.sampler = g_ctx.atlas_sampler;
-        SDL_BindGPUFragmentSamplers(s->pass, 0, &tsb, 1);
-        SDL_PushGPUFragmentUniformData(s->cmd, 0, d->funiform, sizeof(d->funiform));
+      } else {
+        /* rect: colour is per-vertex, no fragment uniform */
         SDL_DrawGPUPrimitives(s->pass, d->vert_count, 1, d->vert_offset, 0);
       }
     }
@@ -1211,6 +1284,7 @@ void gpu_end_frame(RenWindow *ren) {
             avg, mn, mx);
     g_perf_sum_ns = 0; g_perf_min_ns = 0; g_perf_max_ns = 0;
   }
+
   s->cmd = NULL;
   s->vbuf_used = 0;
   s->draws_count = 0;
