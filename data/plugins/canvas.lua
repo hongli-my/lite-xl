@@ -319,7 +319,9 @@ function CanvasView:card_geometry(card)
   local pad = style.padding.x
   if card.type == "file" then
     -- compact pill: label text on one line
-    local w = card.w or (style.font:get_width(card.text or "?") + pad * 2)
+    -- stored w is a floor: grow to fit the full label (dot + text)
+    local tw = style.font:get_width(card.text or "?") + 14 * SCALE
+    local w = math.max(card.w or tw, tw)
     local h = card.h or (fh + 8)
     return w, h, { card.text }
   elseif card.type == "sticky" then
@@ -349,15 +351,14 @@ function CanvasView:card_geometry(card)
       h = w * card._aspect
     end
     return w, h + fh + 6, nil
-  else -- md card
-    local w = card.w or 220
-    local lines = card._md_lines or {}
-    -- collapsed cards show only the heading strip
-    local n = card.collapsed and 1 or #lines
-    local want = fh + n * (fh + 2) + pad * 2 + 6
-    -- stored h is a floor (min height), content can always grow past it
-    local h = math.max(card.h or 0, want)
-    return w, h, lines
+  else -- md card: mindmap node - heading only; the links are the file
+       -- pills connected by arrows (list body intentionally not rendered)
+    local label = (card.heading or (card._md_lines or {})[1] or "md")
+      :gsub("^#+%s*", "")
+    local w = math.max(card.w or 220,
+      style.font:get_width(label) + pad * 2 + fh * 0.9 + 4)
+    local h = fh + pad  -- same height as the old heading strip
+    return w, h, { label }
   end
 end
 
@@ -456,17 +457,9 @@ function CanvasView:on_mouse_moved(mx, my, ...)
     local w, h = self:card_geometry(card)
     if wx >= card.x and wx < card.x + w and wy >= card.y and wy < card.y + h then
       self.hover = card.id
-      -- md card: which row (heading strip = 1, body rows 2+) is under cursor?
-      if card.type == "md" and card._md_lines then
-        local fh = style.font:get_height()
-        local pad = style.padding.x
-        local ry = wy - card.y
-        if ry < (fh + pad) then
-          self._hover_link = 1  -- heading strip: collapse toggle
-        elseif not card.collapsed then
-          local row = math.floor((ry - pad - fh) / (fh + 2)) + 2
-          if card._md_lines[row] then self._hover_link = row end
-        end
+      -- md mindmap node: the whole node opens its file at the heading
+      if card.type == "md" then
+        self._hover_link = 1
       end
       break
     end
@@ -551,8 +544,23 @@ function CanvasView:on_mouse_released(button, mx, my)
   CanvasView.super.on_mouse_released(self, button, mx, my)
 end
 
--- single click on a md card row: heading strip toggles collapse, a link
--- row opens the target document (jumping to it in the editor)
+-- open the md card's file and jump to its heading
+function CanvasView:open_md_at_heading(card)
+  if card.type ~= "md" or not card.file then return false end
+  local doc = core.open_doc(card.file)
+  local dv = core.root_view:open_doc(doc)
+  for li, line in ipairs(doc.lines) do
+    if line:find(card.heading or "", 1, true) then
+      doc:set_selection(li, 1)
+      dv:scroll_to_line(li, false, true)
+      break
+    end
+  end
+  return true
+end
+
+-- single click on a md node opens its file at the heading; a link row
+-- (legacy cards) or a file pill opens the target document
 function CanvasView:card_click(card, row)
   -- file pill (kbgen): open the file it points at
   if card.type == "file" and card.file then
@@ -567,10 +575,9 @@ function CanvasView:card_click(card, row)
     core.root_view:open_doc(doc)
     return
   end
-  if row == 1 then
-    card.collapsed = not card.collapsed
-    self:save()
-    return
+  -- md mindmap node: single click opens the file at its heading
+  if card.type == "md" then
+    return self:open_md_at_heading(card)
   end
   local target = card._links and card._links[row]
   if target then
@@ -601,23 +608,15 @@ function CanvasView:on_mouse_wheel(dy, dx)
 end
 
 -- Card double-click (dispatched from on_mouse_pressed with clicks == 2):
--- md cards open their file at the heading; stickies edit via the command line.
+-- md nodes open their file at the heading; stickies edit via the command line.
 function CanvasView:card_double_click(card)
   if card.type == "file" and card.file then
     local doc = core.open_doc(card.file)
     core.root_view:open_doc(doc)
     return
   end
-  if card.type == "md" and card.file then
-    local doc = core.open_doc(card.file)
-    local dv = core.root_view:open_doc(doc)
-    for li, line in ipairs(doc.lines) do
-      if line:find(card.heading or "", 1, true) then
-        doc:set_selection(li, 1)
-        dv:scroll_to_line(li, false, true)
-        break
-      end
-    end
+  if self:open_md_at_heading(card) then
+    return
   elseif card.type == "sticky" then
     core.command:enter("编辑便签", function(text)
       if text ~= "" then
@@ -854,35 +853,13 @@ function CanvasView:draw_card(card)
       draw_text_clipped_canvas(style.font, style.dim, card.caption,
         x + pad * c.z, y + sh - (fh + 2) * c.z, sw - pad * 2 * c.z, fh * c.z)
     end
-  else -- md card
+  else -- md card: mindmap node (heading only)
     renderer.draw_rounded_rect(x, y, sw, sh, r,
-      hovered and raised_color() or surface_color())
-    -- heading strip
-    renderer.draw_rounded_rect(x, y, sw, (fh + pad) * c.z, r,
-      common.lerp(style.background, style.accent or style.text, 0.20))
-    -- collapse toggle in the heading strip
-    local toggle = card.collapsed and "▸" or "▾"
-    draw_text_clipped_canvas(style.font, style.text, toggle,
-      x + pad * c.z * 0.4, y + pad * c.z * 0.5, fh * c.z, fh * c.z)
+      common.lerp(style.background, style.accent or style.text,
+        hovered and 0.32 or 0.20))
     draw_text_clipped_canvas(style.font, style.text, lines and lines[1] or "md",
-      x + (pad + fh * 0.8) * c.z, y + pad * c.z * 0.5,
-      sw - (pad + fh) * c.z, fh * c.z)
-    if not card.collapsed then
-      for li = 2, #(lines or {}) do
-        local is_link = card._links and card._links[li]
-        local row_y = y + (pad + fh + (li - 2) * (fh + 2)) * c.z
-        -- hover feedback on clickable rows
-        if is_link and self.hover == card.id
-          and self._hover_link == li then
-          renderer.draw_rect(x + pad * c.z, row_y - 1 * SCALE,
-            sw - pad * 2 * c.z, fh * c.z + 2 * SCALE,
-            common.lerp(style.background, style.accent or style.text, 0.10))
-        end
-        draw_text_clipped_canvas(style.font,
-          is_link and style.text or style.dim, lines[li],
-          x + pad * c.z * 1.5, row_y, sw - pad * 2.5 * c.z, fh * c.z)
-      end
-    end
+      x + pad * 0.9 * c.z, y + (sh - fh * c.z) / 2,
+      sw - pad * 1.4 * c.z, fh * c.z)
   end
 end
 

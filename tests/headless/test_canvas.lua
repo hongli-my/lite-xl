@@ -310,12 +310,15 @@ for _, l in ipairs(card._md_lines) do
   if l:find("Yjs", 1, true) then found_m3 = true end
 end
 ok(not found_m3, "md card stops at next heading of same level")
--- collapse: geometry shrinks to the heading strip only
-local w_open, h_open = cv2:card_geometry(card)
-card.collapsed = true
-local w_col, h_col = cv2:card_geometry(card)
-ok(h_col < h_open, "collapsed card is shorter")
-card.collapsed = false
+-- md cards render as mindmap nodes: heading only, no list body
+local w_node, h_node, lines_node = cv2:card_geometry(card)
+eq(#lines_node, 1, "md card renders heading only")
+eq(lines_node[1], "M2 进度", "heading markdown prefix stripped")
+local style_ = require "core.style"
+eq(h_node, style_.font:get_height() + style_.padding.x,
+  "md node height is the heading strip only")
+ok(w_node > style_.font:get_width("M2 进度"),
+  "md node width fits its label")
 
 -- ---------------- mindmap ----------------------------------------------------
 local mindfile = "/tmp/test_mind.md"
