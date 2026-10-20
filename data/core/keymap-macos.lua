@@ -7,6 +7,7 @@ local function keymap_macos(keymap)
     ["cmd+shift+o"] = "core:open-project-folder",
     ["cmd+option+r"] = "core:restart",
     ["cmd+ctrl+return"] = "core:toggle-fullscreen",
+    ["cmd+option+shift+r"] = "remote-projects:open-dialog",
 
     ["cmd+ctrl+shift+j"] = "root:split-left",
     ["cmd+ctrl+shift+l"] = "root:split-right",

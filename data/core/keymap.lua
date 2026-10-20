@@ -304,6 +304,7 @@ keymap.add_direct {
   ["ctrl+alt+r"] = "core:restart",
   ["alt+return"] = "core:toggle-fullscreen",
   ["f11"] = "core:toggle-fullscreen",
+  ["ctrl+shift+alt+r"] = "remote-projects:open-dialog",
 
   ["alt+shift+j"] = "root:split-left",
   ["alt+shift+l"] = "root:split-right",

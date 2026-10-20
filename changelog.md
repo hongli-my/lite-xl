@@ -1,5 +1,26 @@
 # Changes Log
 
+## Unreleased
+
+### Features
+
+* Remote projects: open a directory on a remote machine over SSH and edit
+  it like a local project, with fully manual per-file synchronization.
+  * `remote-projects:open-dialog` (macOS menu 文件 → 打开远端目录…) shows a
+    form for host, user, password (optional), port and directory; accounts
+    and directories are stored separately under `USERDIR/remote/`
+    (accounts.lua / dirs.lua) and offered as a clickable ▾ dropdown history.
+  * The remote tree is listed once and opened as a local project;
+    unretrieved files appear dimmed in the treeview and are pulled
+    transparently when opened, or on demand via the right-click
+    拉取 (Pull) / 推送 (Push) entries.
+  * Reopening an existing remote directory (app restart, recents, sidebar)
+    restores the session from a manifest in its cache directory, without
+    the connect dialog and without touching the network; choosing a saved
+    directory from the dialog's history fills the form in one click.
+  * Passwords are fed to ssh through a temporary `SSH_ASKPASS` script
+    (OpenSSH >= 8.4); key/agent authentication needs no password.
+
 ## [2.1.7] - 2024-12-05
 
 This release fixes a bug related to scaling on macOS,

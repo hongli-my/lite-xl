@@ -115,7 +115,7 @@ static void install_main_menu(void) {
     add_menu_item(m, @"新建文件",   @"core:new-doc",          @"n");
     add_menu_item(m, @"打开文件…",  @"core:open-file",         @"o");
     add_menu_item(m, @"打开目录…",  @"core:open-project-folder",@"O");
-    add_menu_item(m, @"保存",       @"doc:save",               @"s");
+    add_menu_item(m, @"打开远端目录…", @"remote-projects:open-dialog", nil);
     add_menu_item(m, @"另存为…",    @"doc:save-as",            @"S");
     add_menu_item(m, @"关闭标签",   @"root:close",             @"w");
     add_menu_item(m, @"退出",       @"core:quit",              @"q");
