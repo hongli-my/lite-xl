@@ -310,12 +310,26 @@ function View:update()
   end
 
   self:clamp_scroll_position()
-  -- Sublime-like glide: the default rate eases over ~250ms instead of
-  -- snapping in ~130ms.  Scrollbar dragging bypasses this (scroll.y is set
-  -- directly when animate_drag_scroll is off).
+  -- Sublime-like glide with a jitter-free tail.  A plain exponential lerp
+  -- (move_towards) enters a low-speed zone near the target where the per-frame
+  -- movement rounds to 0/1 physical px on alternating frames: the text
+  -- "wobbles like water".  Keep the exponential glide while it still moves a
+  -- full logical px per frame, then finish at a constant 1 px/frame pace and
+  -- snap once within a px of the target.  Monotonic, no empty frames, no
+  -- back-and-forth: the wobble is gone at any display scale.
   local rate = config.scroll_animation_rate or 0.3
   self:move_towards(self.scroll, "x", self.scroll.to.x, rate, "scroll")
-  self:move_towards(self.scroll, "y", self.scroll.to.y, rate, "scroll")
+  local dy = self.scroll.to.y - self.scroll.y
+  if dy ~= 0 then
+    local step = dy * rate
+    if math.abs(step) < 1 then step = common.round(dy) end
+    if math.abs(dy) <= 1 or math.abs(step) >= math.abs(dy) then
+      self.scroll.y = self.scroll.to.y
+    else
+      self.scroll.y = self.scroll.y + step
+      core.redraw = true
+    end
+  end
   if not self.scrollable then return end
   self:update_scrollbar()
 end

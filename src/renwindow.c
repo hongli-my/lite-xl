@@ -31,6 +31,13 @@ static void setup_renderer(RenWindow *ren, int w, int h) {
 #endif
   if (!ren->renderer) {
     ren->renderer = SDL_CreateRenderer(ren->window, NULL);
+    /* VSync on: without it SDL_RenderPresent submits immediately and the
+     * display samples frames at its own cadence.  The render loop's
+     * sleep-based 60fps then beats against the monitor refresh (periodic
+     * repeated frames mixed with double steps), which shows up as a
+     * water-like wobble while scrolling.  With vsync, present blocks until
+     * the refresh point and every rendered frame is shown exactly once. */
+    if (ren->renderer) SDL_SetRenderVSync(ren->renderer, 1);
   }
   if (ren->texture) {
     SDL_DestroyTexture(ren->texture);
