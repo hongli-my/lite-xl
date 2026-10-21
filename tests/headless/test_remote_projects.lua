@@ -189,14 +189,16 @@ core.root_view.root_node = fake_treeview
 
 system = {
   get_file_info = function(path)
+    -- Check the directory type FIRST: io.open() succeeds on directories on
+    -- macOS and would misclassify them as files.
+    local ok, _, code = os.execute("test -d '" .. path .. "'")
+    if ok == true or code == 0 then return { type = "dir", modified = 1 } end
     local f = io.open(path, "rb")
     if f then
       local s = f:seek("end")
       f:close()
       return { type = "file", size = s, modified = 1 }
     end
-    local ok, _, code = os.execute("test -d " .. path)
-    if ok or code == 0 then return { type = "dir", modified = 1 } end
     return nil
   end,
   list_dir = function(path)
@@ -376,7 +378,7 @@ fake_treeview.hovered_item = {
   type = "file", filename = "hello.txt", abs_filename = cache_dir .. "/hello.txt",
 }
 local menu = fake_treeview:on_context_menu()
-local found_pull, found_push = false, false
+local found_pull, found_push, found_refresh = false, false, false
 for _, entry in ipairs(menu.items) do
   if type(entry) == "table" and entry.command == "remote-projects:pull-file" then
     found_pull = true
@@ -384,8 +386,12 @@ for _, entry in ipairs(menu.items) do
   if type(entry) == "table" and entry.command == "remote-projects:push-file" then
     found_push = true
   end
+  if type(entry) == "table" and entry.command == "remote-projects:refresh-this-tree" then
+    found_refresh = true
+  end
 end
 ok(found_pull and found_push, "context menu offers pull/push")
+ok(found_refresh, "context menu offers refresh on a file")
 -- and NOT for unrelated files
 fake_treeview.hovered_item = {
   type = "file", filename = "x", abs_filename = "/elsewhere/x.txt",
@@ -399,6 +405,17 @@ for _, entry in ipairs(menu2.items) do
   end
 end
 ok(not stray, "context menu untouched for non-remote files")
+
+-- the project root (a directory) also offers a tree refresh
+fake_treeview.hovered_item = { type = "dir", abs_filename = cache_dir }
+local menu_dir = fake_treeview:on_context_menu()
+local dir_refresh = false
+for _, entry in ipairs(menu_dir.items) do
+  if type(entry) == "table" and entry.command == "remote-projects:refresh-this-tree" then
+    dir_refresh = true
+  end
+end
+ok(dir_refresh, "context menu offers refresh on the remote directory")
 
 -- 8) greying: not-yet-pulled files report as ignored, which is what the
 -- treeview renders dimmed (item.ignored -> style.sidebar_dim)
@@ -453,6 +470,30 @@ local co4 = coroutine.create(function()
     "pull still works after reattach")
 end)
 coroutine.resume(co4)
+
+-- 11) tree refresh: new remote files appear, stale unpulled placeholders are
+-- pruned, and pulled files survive a remote deletion.
+wfile(ROOT .. "/machine/proj/newfile.txt", "new remote\n")
+wfile(cache_dir .. "/stale.txt", "")
+mkdirp(cache_dir .. "/staledir")
+wfile(cache_dir .. "/staledir/child.txt", "")
+os.remove(ROOT .. "/machine/proj/hello.txt")
+os.remove(ROOT .. "/machine/proj/sub/deep.txt")
+fake_treeview.cache = { stale = true }
+local co5 = coroutine.create(function()
+  ok(M2._internal.refresh_session_tree(session2) == true,
+    "refresh_session_tree succeeds")
+end)
+while coroutine.status(co5) ~= "dead" do
+  local okr, err = coroutine.resume(co5)
+  if not okr then print("THREAD ERR: " .. tostring(err)); break end
+end
+ok(exists(cache_dir .. "/newfile.txt"), "new remote file materialized on refresh")
+ok(not exists(cache_dir .. "/stale.txt"), "stale unpulled placeholder removed")
+ok(not exists(cache_dir .. "/staledir"), "stale empty directory removed")
+ok(not exists(cache_dir .. "/sub/deep.txt"), "deleted unpulled remote file removed")
+ok(exists(cache_dir .. "/hello.txt"), "pulled file kept even if deleted remotely")
+ok(fake_treeview.cache.stale == nil, "treeview cache cleared after refresh")
 
 print(string.format("checks: %d, fails: %d", checks, fails))
 if fails > 0 then os.exit(1) end

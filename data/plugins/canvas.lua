@@ -1247,15 +1247,15 @@ function TreeView:on_context_menu()
       local entry
       if item.type == "dir" then
         -- directory: generate a scoped dashboard from its README
-        entry = { text = "生成驾驶舱", icon = "\u{f0e8}",
+        entry = { text = "生成驾驶舱", icon = "\u{f15c}",
           command = "kbgen:generate-dir" }
       elseif item.type == "file" then
         local filename = item.abs_filename or ""
         self._cv_target = filename
         if filename:match("%.canvas$") then
-          entry = { text = "打开画布", icon = "\u{f009}", command = "canvas:open-treeview" }
+          entry = { text = "打开画布", icon = "\u{25C6}", command = "canvas:open-treeview" }
         elseif filename:match("%.[mM][dD]$") then
-          entry = { text = "思维导图", icon = "\u{f0e8}", command = "mindmap:open-treeview" }
+          entry = { text = "思维导图", icon = "\u{e609}", command = "mindmap:open-treeview" }
         end
       end
       if entry then

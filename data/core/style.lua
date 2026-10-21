@@ -53,6 +53,14 @@ style.syntax = {}
 style.syntax_fonts = {}
 -- style.syntax_fonts["comment"] = renderer.font.load(path_to_font, size_of_font, rendering_options)
 
+-- Git status colours used by plugins/git_status.lua.  Themes with a light
+-- sidebar (sublime_dark, slate) override the sidebar variants below.
+style.git_added = { common.color "#73c991" }
+style.git_modified = { common.color "#e2c08d" }
+style.git_deleted = { common.color "#f14c4c" }
+style.git_renamed = { common.color "#73a9ff" }
+style.git_conflict = { common.color "#c792ea" }
+
 style.log = {}
 
 return style

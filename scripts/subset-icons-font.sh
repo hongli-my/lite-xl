@@ -38,7 +38,7 @@ fi
 
 # Codepoints come from every UI file that draws Nerd Font glyphs: the shared
 # file-icon module (file type icons) plus the menus (context menu icons).
-icons=$(cat data/plugins/file_icons.lua "$TREEVIEW" data/core/docview.lua data/core/contextmenu.lua \
+icons=$(cat data/plugins/file_icons.lua "$TREEVIEW" data/core/docview.lua data/core/contextmenu.lua data/plugins/remote_projects.lua data/plugins/canvas.lua \
   | grep -o '\\u{[0-9a-fA-F]*}' \
   | sed 's/\\u{/U+/; s/}$//' \
   | sort -u \

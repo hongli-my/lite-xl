@@ -675,7 +675,7 @@ function TreeView:on_context_menu()
     { text = "Rename", icon = "\u{f044}", command = "treeview:rename" },
     { text = "Delete", icon = "\u{f014}", command = "treeview:delete" },
     { text = "New File", icon = "\u{f016}", command = "treeview:new-file" },
-    { text = "New Folder", icon = "\u{f65f}", command = "treeview:new-folder" },
+    { text = "New Folder", icon = "\u{f07b}", command = "treeview:new-folder" },
     { text = "Remove directory", icon = "\u{f068}", command = "treeview:remove-project-directory" },
     { text = "Find in Directory", icon = "\u{f002}", command = "treeview:search-in-directory" }
   } }, self

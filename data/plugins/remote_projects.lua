@@ -25,6 +25,13 @@
 -- Passwords, when given, are fed to ssh through a temporary SSH_ASKPASS
 -- script (OpenSSH >= 8.4, SSH_ASKPASS_REQUIRE=force); no password is
 -- ever passed on a command line.
+--
+-- The remote tree is a snapshot when connecting.  It is re-listed in the
+-- background every `tree_refresh_interval` seconds (default 60; 0 disables),
+-- or on demand with `remote-projects:refresh-tree` (ctrl+shift+alt+t) or
+-- right-click -> 刷新远端目录.  New remote files appear as unpulled
+-- placeholders; stale unpulled placeholders and empty directories are
+-- removed.  Pulled files and files with local content are never deleted.
 
 -- The plugin loader executes this file with dofile(), while other modules
 -- (and the dialog) use require(). Both paths must yield the same instance,
@@ -47,6 +54,9 @@ local style = require "core.style"
 local Doc = require "core.doc"
 
 config.plugins.remote_projects = common.merge({
+  -- Re-list the remote tree over ssh every N seconds.  0 disables the
+  -- automatic refresh; the manual command below still works.
+  tree_refresh_interval = 60,
   config_spec = {
     name = "Remote Projects",
   },
@@ -278,24 +288,48 @@ end
 -- connect: list the remote tree, materialize placeholders, open project
 -- ---------------------------------------------------------------------------
 
-local function materialize(session, listing)
-  -- listing: lines of "type<TAB>relative/path" from the remote find
-  common.mkdirp(session.cache_path)
+---Parses the "d ./path" / "f ./path" listing emitted by the remote find.
+---Returns a list of { type = "d"|"f", rel = "path" } with "./" stripped.
+local function parse_listing(listing)
+  local entries = {}
   for line in listing:gmatch("[^\n]+") do
     local ftype, rel = line:match("^(%a)%s+(.+)$")
     if ftype and rel then
-      local target = session.cache_path .. PATHSEP .. rel
-      if ftype == "d" then
-        common.mkdirp(target)
-      else
-        common.mkdirp(common.dirname(target))
-        if not system.get_file_info(target) then
-          local f = io.open(target, "wb")
-          if f then f:close() end
+      rel = rel:gsub("^%./", "")
+      if rel == "." then rel = "" end
+      if rel ~= "" then
+        entries[#entries + 1] = { type = ftype, rel = rel }
+      end
+    end
+  end
+  return entries
+end
+
+---Creates missing placeholders/directories for the parsed listing.
+---Returns the number of newly created entries.
+local function materialize_entries(session, entries)
+  common.mkdirp(session.cache_path)
+  local created = 0
+  for _, e in ipairs(entries) do
+    local target = session.cache_path .. PATHSEP .. e.rel:gsub("/", PATHSEP)
+    if e.type == "d" then
+      if common.mkdirp(target) then created = created + 1 end
+    else
+      common.mkdirp(common.dirname(target))
+      if not system.get_file_info(target) then
+        local f = io.open(target, "wb")
+        if f then
+          f:close()
+          created = created + 1
         end
       end
     end
   end
+  return created
+end
+
+local function materialize(session, listing)
+  return materialize_entries(session, parse_listing(listing))
 end
 
 ---Makes the treeview (and the find-file index) treat not-yet-pulled files
@@ -375,6 +409,16 @@ local function attach_existing_projects()
   end
 end
 
+---Runs the remote `find` and returns ok, listing-or-error.
+local function list_remote_tree(session)
+  local cmd = ssh_command(session.account, {})
+  table.insert(cmd, string.format(
+    "cd %s 2>/dev/null && find . \\( -type d -o -type f \\) -print | "
+    .. "while read -r p; do if [ -d \"$p\" ]; then echo \"d $p\"; else echo \"f $p\"; fi; done",
+    session.remote_dir))
+  return run_with_password(cmd, session.account)
+end
+
 local function connect(account, remote_dir)
   local profile = profile_name(account, remote_dir)
   local cache_path = CACHE_ROOT .. PATHSEP .. profile
@@ -395,12 +439,7 @@ local function connect(account, remote_dir)
 
   core.add_thread(function()
     -- 1) probe + list the remote tree
-    local cmd = ssh_command(account, {})
-    table.insert(cmd, string.format(
-      "cd %s 2>/dev/null && find . \\( -type d -o -type f \\) -print | "
-      .. "while read -r p; do if [ -d \"$p\" ]; then echo \"d $p\"; else echo \"f $p\"; fi; done",
-      remote_dir))
-    local ok, listing = run_with_password(cmd, account)
+    local ok, listing = list_remote_tree(session)
     if not ok then
       sessions[cache_path] = nil
       common.rm(cache_path .. PATHSEP .. SESSION_FILE)
@@ -419,6 +458,82 @@ local function connect(account, remote_dir)
     refresh_treeview()
     core.log_quiet("[remote] opened %s (cache: %s)", profile, cache_path)
   end)
+end
+
+---Removes cache entries that no longer exist in the remote listing.
+---Only empty unpulled placeholders and empty directories are deleted: pulled
+---files and files with local content are kept (the user may have edits).
+local function prune_cache(session, entries)
+  local keep = {}
+  for _, e in ipairs(entries) do keep[e.rel] = e.type end
+  local removed, kept = 0, 0
+
+  local function walk(rel_dir)
+    local abs_dir = rel_dir == "" and session.cache_path
+      or (session.cache_path .. PATHSEP .. rel_dir:gsub("/", PATHSEP))
+    local names = system.list_dir(abs_dir) or {}
+    for _, name in ipairs(names) do
+      if name ~= STATE_FILE and name ~= SESSION_FILE then
+        local rel = rel_dir == "" and name or (rel_dir .. "/" .. name)
+        local abs = abs_dir .. PATHSEP .. name
+        local info = system.get_file_info(abs)
+        if info and info.type == "dir" then
+          walk(rel)
+          if keep[rel] ~= "d" then
+            local remaining = system.list_dir(abs) or {}
+            if #remaining == 0 and common.rm(abs, false) then
+              removed = removed + 1
+            end
+          end
+        elseif info and info.type == "file" then
+          if keep[rel] ~= "f" then
+            if is_pulled(session, abs) then
+              kept = kept + 1
+            elseif (info.size or 0) > 0 then
+              kept = kept + 1
+            else
+              if os.remove(abs) then removed = removed + 1 end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  walk("")
+  return removed, kept
+end
+
+---Re-lists the remote tree, materializes new placeholders and prunes stale
+---unpulled ones.  Must run in a coroutine (ssh).  Returns true on success.
+local function refresh_session_tree(session)
+  if not session or session.refreshing then return false end
+  if sessions[session.cache_path] ~= session then return false end
+  session.refreshing = true
+  local ok, listing = list_remote_tree(session)
+  if not ok then
+    session.refreshing = false
+    if not session.refresh_error_logged then
+      session.refresh_error_logged = true
+      core.log_quiet("[remote] refresh failed for %s: %s", session.profile, listing)
+    end
+    return false
+  end
+  if sessions[session.cache_path] ~= session then
+    session.refreshing = false
+    return false
+  end
+  local entries = parse_listing(listing)
+  local created = materialize_entries(session, entries)
+  local removed, kept = prune_cache(session, entries)
+  session.refreshing = false
+  session.refresh_error_logged = nil
+  if created > 0 or removed > 0 then refresh_treeview() end
+  if created > 0 or removed > 0 or kept > 0 then
+    core.log_quiet("[remote] refreshed %s (%d new, %d removed, %d kept local)",
+      session.profile, created, removed, kept)
+  end
+  return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -525,6 +640,26 @@ command.add(nil, {
     })
   end,
 
+  ["remote-projects:refresh-tree"] = function()
+    local p = core.root_project and core.root_project()
+    local session = p and session_for_path(p.path)
+    local targets = {}
+    if session then
+      targets[1] = session
+    else
+      for _, s in pairs(sessions) do targets[#targets + 1] = s end
+    end
+    if #targets == 0 then
+      core.log_quiet("[remote] no remote directory is open")
+      return
+    end
+    core.add_thread(function()
+      for _, s in ipairs(targets) do
+        if sessions[s.cache_path] == s then refresh_session_tree(s) end
+      end
+    end)
+  end,
+
   ["remote-projects:forget-cache"] = function()
     local items = {}
     for _, session in pairs(sessions) do
@@ -621,16 +756,19 @@ install_treeview_hooks = function()
     local args = { old_menu(self) }
     local cmds = args[1]
     local item = self.hovered_item or self.selected_item
-    if cmds and item and item.type == "file"
-       and session_for_path(item.abs_filename) then
+    if cmds and item and session_for_path(item.abs_filename) then
       local items = cmds.items
       if items then
-        -- insert after the leading entry + divider (positions 1-2)
-        table.move(items, 3, #items, 5)
-        items[3] = { text = "拉取 (Pull)", icon = "\u{f0ed}",
-          command = "remote-projects:pull-file" }
-        items[4] = { text = "推送 (Push)", icon = "\u{f0ee}",
-          command = "remote-projects:push-file" }
+        if item.type == "file" then
+          -- insert after the leading entry + divider (positions 1-2)
+          table.move(items, 3, #items, 5)
+          items[3] = { text = "拉取 (Pull)", icon = "\u{25BC}",
+            command = "remote-projects:pull-file" }
+          items[4] = { text = "推送 (Push)", icon = "\u{25B2}",
+            command = "remote-projects:push-file" }
+        end
+        items[#items + 1] = { text = "刷新远端目录 (Refresh Remote Tree)",
+          icon = "\u{25CB}", command = "remote-projects:refresh-this-tree" }
       end
     end
     return table.unpack(args)
@@ -667,9 +805,53 @@ end, {
   end,
 })
 
+command.add(function()
+  local treeview = find_treeview()
+  local item = treeview and treeitem(treeview)
+  return item ~= nil and session_for_path(item.abs_filename) ~= nil, item
+end, {
+  ["remote-projects:refresh-this-tree"] = function(item)
+    local session = session_for_path(item.abs_filename)
+    core.add_thread(function() refresh_session_tree(session) end)
+  end,
+})
+
 keymap.add({
   ["ctrl+shift+alt+r"] = "remote-projects:open-dialog",
+  ["ctrl+shift+alt+t"] = "remote-projects:refresh-tree",
 })
+
+-- Sync once shortly after startup (for sessions attached from the previous
+-- run, whose cache may be stale) and then on the periodic schedule.
+core.add_thread(function()
+  coroutine.yield(2)
+  local interval = tonumber(config.plugins.remote_projects.tree_refresh_interval) or 0
+  if interval <= 0 then return end
+  local list = {}
+  for _, s in pairs(sessions) do list[#list + 1] = s end
+  for _, s in ipairs(list) do
+    if sessions[s.cache_path] == s then refresh_session_tree(s) end
+  end
+end)
+
+-- Re-list the remote tree periodically so files created/deleted/renamed on
+-- the remote show up without a reconnect.  The manual command above works
+-- even when this is disabled (set tree_refresh_interval = 0).
+core.add_thread(function()
+  while true do
+    local interval = tonumber(config.plugins.remote_projects.tree_refresh_interval) or 0
+    if interval <= 0 then
+      coroutine.yield(1)
+    else
+      coroutine.yield(interval)
+      local list = {}
+      for _, s in pairs(sessions) do list[#list + 1] = s end
+      for _, s in ipairs(list) do
+        if sessions[s.cache_path] == s then refresh_session_tree(s) end
+      end
+    end
+  end
+end)
 
 -- module surface used by remote_dialog (dropdown sources) and tests
 M = {
@@ -683,15 +865,22 @@ M = {
   end,
   -- exposed for tests
   _internal = {
-    parse_listing = materialize,
+    materialize = materialize,
     sessions = sessions,
     session_for_path = session_for_path,
     pull_file = pull_file,
     push_file = push_file,
+    list_remote_tree = list_remote_tree,
+    parse_listing = parse_listing,
+    materialize_entries = materialize_entries,
+    prune_cache = prune_cache,
+    refresh_session_tree = refresh_session_tree,
     is_pulled = is_pulled,
     profile_name = profile_name,
     upsert_account = upsert_account,
     upsert_dir = upsert_dir,
+    ssh_command = ssh_command,
+    run_with_password = run_with_password,
     Accounts = Accounts,
     Dirs = Dirs,
   },

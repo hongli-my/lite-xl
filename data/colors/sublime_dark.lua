@@ -70,6 +70,12 @@ style.chrome_text = { common.color "#333333" }
 style.sidebar_accent = { common.color "#2979ff" }
 style.sidebar_dim = { common.color "#999999" }
 style.sidebar_line_highlight = { common.color "#d6ebff" } -- light blue for light sidebar
+-- Git status on the light sidebar (see plugins/git_status.lua)
+style.sidebar_git_added = { common.color "#1a7f37" }
+style.sidebar_git_modified = { common.color "#9a6700" }
+style.sidebar_git_deleted = { common.color "#cf222e" }
+style.sidebar_git_renamed = { common.color "#0969da" }
+style.sidebar_git_conflict = { common.color "#8250df" }
 
 -- Syntax highlighting - similar to Sublime Text default
 style.syntax["normal"] = { common.color "#d4d4d4" }
