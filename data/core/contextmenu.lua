@@ -105,6 +105,22 @@ function ContextMenu:show(x, y, items, ...)
     end
   end
 
+  -- Drop orphaned dividers and bail out when no real item survived the
+  -- filter above. Otherwise a right click on the treeview's empty area
+  -- (where every entry's predicate needs a hovered item) leaves a lone
+  -- DIVIDER, which renders a ~28x11 dark blob at the cursor.
+  local cleaned = {}
+  for _, item in ipairs(items_list) do
+    if item ~= DIVIDER then
+      table.insert(cleaned, item)
+    elseif #cleaned > 0 and cleaned[#cleaned] ~= DIVIDER then
+      table.insert(cleaned, item)
+    end
+  end
+  while cleaned[#cleaned] == DIVIDER do table.remove(cleaned) end
+  for i = 1, #cleaned do items_list[i] = cleaned[i] end
+  for i = #items_list, #cleaned + 1, -1 do items_list[i] = nil end
+
   if #items_list > 0 then
     self.items = items_list
     update_items_size(self.items, true)
