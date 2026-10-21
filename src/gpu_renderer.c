@@ -1144,6 +1144,7 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
       return;
     }
     Uint8 *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, s->image_xfer, true);
+    bool uploaded = false;
     if (mapped) {
       int row_bytes = iw * 4;
       if (rgba->pitch == row_bytes) {
@@ -1156,23 +1157,28 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
         }
       }
       SDL_UnmapGPUTransferBuffer(g_ctx.device, s->image_xfer);
-    }
-    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
-    if (cp) {
-      SDL_GPUTextureTransferInfo tsrc = {0};
-      tsrc.transfer_buffer = s->image_xfer;
-      tsrc.offset = 0;
-      tsrc.pixels_per_row = (Uint32)iw;
-      tsrc.rows_per_layer = (Uint32)ih;
-      SDL_GPUTextureRegion tdst = {0};
-      tdst.texture = s->image_tex;
-      tdst.w = (Uint32)iw;
-      tdst.h = (Uint32)ih;
-      tdst.d = 1;
-      SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
-      SDL_EndGPUCopyPass(cp);
+      SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(s->cmd);
+      if (cp) {
+        SDL_GPUTextureTransferInfo tsrc = {0};
+        tsrc.transfer_buffer = s->image_xfer;
+        tsrc.offset = 0;
+        tsrc.pixels_per_row = (Uint32)iw;
+        tsrc.rows_per_layer = (Uint32)ih;
+        SDL_GPUTextureRegion tdst = {0};
+        tdst.texture = s->image_tex;
+        tdst.w = (Uint32)iw;
+        tdst.h = (Uint32)ih;
+        tdst.d = 1;
+        SDL_UploadToGPUTexture(cp, &tsrc, &tdst, false);
+        SDL_EndGPUCopyPass(cp);
+        uploaded = true;
+      }
     }
     SDL_DestroySurface(rgba);
+    /* Only pin the cache key when the upload actually happened: otherwise the
+     * texture holds stale bytes and the "unchanged" test would keep drawing
+     * them on every later frame. */
+    if (!uploaded) return;
     s->last_img = img;
     s->last_img_pixels = img->pixels;
     s->last_img_w = iw;
@@ -1371,7 +1377,9 @@ void gpu_end_frame(RenWindow *ren) {
     info.load_op = SDL_GPU_LOADOP_CLEAR;
     info.clear_color = (SDL_FColor){0, 0, 0, 0};
     info.filter = SDL_GPU_FILTER_NEAREST;
-    info.cycle = true;
+    /* cycle must stay false for a swapchain texture: SDL owns its lifetime
+     * and cycling user-side is not supported. */
+    info.cycle = false;
     SDL_BlitGPUTexture(s->cmd, &info);
   }
 
@@ -1405,75 +1413,6 @@ void gpu_end_frame(RenWindow *ren) {
   s->cmd = NULL;
   s->vbuf_used = 0;
   s->draws_count = 0;
-
-  /* ---- TEMPORARY: dump target_tex (debug only, removed before commit) ---- */
-  if (getenv("LITE_GPU_DUMP")) {
-    static SDL_GPUTexture *dbg_tex = NULL;
-    static SDL_GPUTransferBuffer *dbg_xfer = NULL;
-    static Uint8 *dbg_pixels = NULL;
-    static SDL_GPUFence *dbg_fence = NULL;
-    static int dbg_slot = 0;
-    static unsigned dbg_frame = 0;
-    Uint32 tw = s->target_w, th = s->target_h;
-    if (!dbg_tex) {
-      SDL_GPUTextureCreateInfo tci = {0};
-      tci.type = SDL_GPU_TEXTURETYPE_2D;
-      tci.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
-      tci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
-      tci.width = tw; tci.height = th; tci.layer_count_or_depth = 1; tci.num_levels = 1;
-      tci.sample_count = SDL_GPU_SAMPLECOUNT_1;
-      dbg_tex = SDL_CreateGPUTexture(g_ctx.device, &tci);
-      SDL_GPUTransferBufferCreateInfo bci = {0};
-      bci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
-      bci.size = tw * th * 4;
-      dbg_xfer = SDL_CreateGPUTransferBuffer(g_ctx.device, &bci);
-      dbg_pixels = SDL_malloc(tw * th * 4);
-    }
-    if (dbg_fence) {
-      if (SDL_WaitForGPUFences(g_ctx.device, true, &dbg_fence, 1)) {
-        void *mapped = SDL_MapGPUTransferBuffer(g_ctx.device, dbg_xfer, false);
-        if (mapped) {
-          SDL_memcpy(dbg_pixels, mapped, tw * th * 4);
-          SDL_UnmapGPUTransferBuffer(g_ctx.device, dbg_xfer);
-          char path[512];
-          snprintf(path, sizeof(path), "%s/target_%04u.raw", getenv("LITE_GPU_DUMP"), dbg_frame);
-          FILE *f = fopen(path, "wb");
-          if (f) { fwrite(dbg_pixels, 1, tw * th * 4, f); fclose(f); }
-        }
-      }
-      SDL_ReleaseGPUFence(g_ctx.device, dbg_fence);
-      dbg_fence = NULL;
-    }
-    /* blit target -> download tex, copy to xfer, submit fence */
-    SDL_GPUCommandBuffer *dcmd = SDL_AcquireGPUCommandBuffer(g_ctx.device);
-    if (dcmd) {
-      SDL_GPUBlitInfo binfo = {0};
-      binfo.source.texture = s->target_tex;
-      binfo.source.w = tw; binfo.source.h = th;
-      binfo.destination.texture = dbg_tex;
-      binfo.destination.w = tw; binfo.destination.h = th;
-      binfo.load_op = SDL_GPU_LOADOP_CLEAR;
-      binfo.clear_color = (SDL_FColor){0, 0, 0, 0};
-      binfo.filter = SDL_GPU_FILTER_NEAREST;
-      binfo.cycle = false;
-      SDL_BlitGPUTexture(dcmd, &binfo);
-      SDL_GPUCopyPass *dpass = SDL_BeginGPUCopyPass(dcmd);
-      if (dpass) {
-        SDL_GPUTextureRegion region = {0};
-        region.texture = dbg_tex;
-        region.w = tw; region.h = th; region.d = 1;
-        SDL_GPUTextureTransferInfo xfer = {0};
-        xfer.transfer_buffer = dbg_xfer;
-        xfer.pixels_per_row = tw;
-        xfer.rows_per_layer = th;
-        SDL_DownloadFromGPUTexture(dpass, &region, &xfer);
-        SDL_EndGPUCopyPass(dpass);
-      }
-      dbg_fence = SDL_SubmitGPUCommandBufferAndAcquireFence(dcmd);
-    }
-    dbg_frame++;
-    dbg_slot = 1 - dbg_slot;
-  }
 }
 
 #endif /* LITE_USE_GPU_RENDERER */

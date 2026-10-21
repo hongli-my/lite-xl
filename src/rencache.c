@@ -351,11 +351,11 @@ void rencache_end_frame(RenWindow *window_renderer) {
   }
 
   RenSurface rs = renwin_get_surface(window_renderer);
+  bool gpu_presented = false;
 #ifdef LITE_USE_GPU_RENDERER
-  if (window_renderer->gpu_state) {
+  if (window_renderer->gpu_state && rect_count > 0) {
     /* ---- GPU path: replay commands as GPU draw calls ---- */
-    if (rect_count > 0) {
-      gpu_begin_frame(window_renderer);
+    if (gpu_begin_frame(window_renderer)) {
       for (int i = 0; i < rect_count; i++) {
         RenRect r = rect_buf[i];
         RenRect current_clip = r;
@@ -395,8 +395,15 @@ void rencache_end_frame(RenWindow *window_renderer) {
         }
       }
       gpu_end_frame(window_renderer);
+      gpu_presented = true;
+    } else {
+      /* begin failed (device hiccup): fall through to the CPU replay so the
+         frame still renders instead of freezing on the previous one */
+      fprintf(stderr, "rencache: gpu_begin_frame failed, CPU fallback\n");
     }
-  } else
+  }
+#else
+  (void)gpu_presented;
 #endif
   /* ---- CPU path (fallback) ---- */
   for (int i = 0; i < rect_count; i++) {
@@ -439,10 +446,6 @@ void rencache_end_frame(RenWindow *window_renderer) {
   }
 
   /* update dirty rects (CPU path only; GPU path presents in gpu_end_frame) */
-  bool gpu_presented = false;
-#ifdef LITE_USE_GPU_RENDERER
-  gpu_presented = (window_renderer->gpu_state != NULL);
-#endif
   if (!gpu_presented && rect_count > 0) {
     ren_update_rects(window_renderer, rect_buf, rect_count);
   }
