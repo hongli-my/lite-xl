@@ -39,10 +39,11 @@ syntax.add {
     { pattern = "enum%s+()[%a_][%w_]*",                                     type = { "keyword", "keyword2" } },
     { pattern = "record%s+()[%a_][%w_]*",                                   type = { "keyword", "keyword2" } },
     -- method declarations: <Type> <name>(  — type can be qualified/generic
-    { pattern = "[%a_][%w_]*()%s*()[%a_][%w_]*%s*%f[(]",
-      type = { "literal", "normal", "function" }
-    },
-    { pattern = "[%a_][%w_]*()%s+()[%a_][%w_]*%f[(]",
+    -- The separator MUST be %s+: with %s* the greedy backtrack would split a
+    -- single identifier before "(" into "<all but last letter>" (literal) plus
+    -- "<last letter>" (function), which also defeated the keyword table for
+    -- if(/catch(.
+    { pattern = "[%a_][%w_]*()%s+()[%a_][%w_]*%s*%f[(]",
       type = { "literal", "normal", "function" }
     },
     -- variable declarations: <Type> <name>;
