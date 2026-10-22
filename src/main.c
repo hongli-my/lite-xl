@@ -214,7 +214,15 @@ init_lua:
     fprintf(stderr, "internal error when starting the application\n");
     exit(1);
   }
-  lua_pcall(L, 0, 1, 0);
+  if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+    const char *err = lua_tostring(L, -1);
+    fprintf(stderr, "error when starting the application: %s\n", err ? err : "(unknown)");
+    lua_close(L);
+    rencache_invalidate();
+    ren_free();
+    free_custom_events();
+    exit(1);
+  }
   if (lua_toboolean(L, -1)) {
     lua_close(L);
     rencache_invalidate();

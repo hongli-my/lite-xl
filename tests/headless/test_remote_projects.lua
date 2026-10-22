@@ -62,12 +62,19 @@ if [ $last -eq 0 ]; then
   # single command argument: a remote shell line
   line="${cmd[0]}"
   if [[ "$line" != rsync* ]]; then
-    line="$(printf '%s\n' "$line" | sed "s|/proj/|$REMOTE_ROOT/|g; s|/proj\"|\"$REMOTE_ROOT\"|g; s|/proj |$REMOTE_ROOT |g; s| /proj$| $REMOTE_ROOT|")"
+    line="$(printf '%s\n' "$line" | sed "s|'/proj'|'$REMOTE_ROOT'|g; s|/proj/|$REMOTE_ROOT/|g; s|/proj\"|\"$REMOTE_ROOT\"|g; s|/proj |$REMOTE_ROOT |g; s| /proj$| $REMOTE_ROOT|")"
     exec bash -c "$line"
   fi
 fi
 
 if [ $last -ge 0 ]; then
+  # a real remote shell would strip the quotes around quoted rsync remote
+  # specs; the fake shell execs directly, so strip bare quoted paths here
+  la="${cmd[$last]}"
+  q="'"
+  if [[ "$la" == "$q"*"$q" && "$la" != *" "* ]]; then
+    cmd[$last]="${la//"$q"/}"
+  fi
   case "${cmd[$last]}" in
     /proj*) [ "${cmd[$last]//[^ ]/}" = "" ] && cmd[$last]="${cmd[$last]/\/proj/$REMOTE_ROOT}" ;;
   esac
@@ -494,6 +501,35 @@ ok(not exists(cache_dir .. "/staledir"), "stale empty directory removed")
 ok(not exists(cache_dir .. "/sub/deep.txt"), "deleted unpulled remote file removed")
 ok(exists(cache_dir .. "/hello.txt"), "pulled file kept even if deleted remotely")
 ok(fake_treeview.cache.stale == nil, "treeview cache cleared after refresh")
+
+-- 12) the remote directory itself disappears: refresh must FAIL and mark
+-- the session dir_missing (auto-refresh skips it), with a visible error --
+-- instead of silently keeping the stale tree on screen.
+os.execute("rm -rf " .. ROOT .. "/machine/proj")
+local errors = {}
+local old_error = core.error
+core.error = function(fmt, ...) errors[#errors + 1] = string.format(fmt, ...) end
+local co6 = coroutine.create(function()
+  ok(M2._internal.refresh_session_tree(session2) == false,
+    "refresh fails once the remote directory is gone")
+end)
+while coroutine.status(co6) ~= "dead" do
+  local okr, err = coroutine.resume(co6)
+  if not okr then print("THREAD ERR: " .. tostring(err)); break end
+end
+core.error = old_error
+ok(session2.dir_missing == true, "session marked dir_missing after failure")
+ok(#errors > 0 and errors[#errors]:match("不存在") ~= nil,
+  "user-visible error says the remote directory does not exist")
+
+-- connecting to a remote path that does not exist says so explicitly
+errors = {}
+core.error = function(fmt, ...) errors[#errors + 1] = string.format(fmt, ...) end
+M2.connect_with_form("box", "tester", "", 22, "/gone")
+run_threads()
+core.error = old_error
+ok(#errors > 0 and errors[#errors]:match("不存在") ~= nil,
+  "connect to a missing remote directory reports 远端目录不存在")
 
 print(string.format("checks: %d, fails: %d", checks, fails))
 if fails > 0 then os.exit(1) end

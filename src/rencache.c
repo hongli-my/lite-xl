@@ -265,6 +265,12 @@ void rencache_draw_image(RenWindow *window_renderer, SDL_Surface *surface, doubl
 
 void rencache_invalidate(void) {
   memset(cells_prev, 0xff, sizeof(cells_buf1));
+  /* seed the accumulator with HASH_INITIAL as well: otherwise the frame
+   * after the forced full redraw re-hashes everything from a 0xff seed and
+   * mismatches again, costing a second full redraw */
+  for (unsigned i = 0; i < CELLS_X * CELLS_Y; i++) {
+    cells[i] = HASH_INITIAL;
+  }
 }
 
 
@@ -288,6 +294,14 @@ static void update_overlapping_cells(RenRect r, unsigned h) {
   int x2 = (r.x + r.width) / CELL_SIZE;
   int y2 = (r.y + r.height) / CELL_SIZE;
 
+  /* clamp to the static cell grid: oversized rects (huge monitors, bogus
+   * clip rects from Lua) must not write out of bounds */
+  if (x1 < 0) x1 = 0;
+  if (y1 < 0) y1 = 0;
+  if (x2 >= CELLS_X) x2 = CELLS_X - 1;
+  if (y2 >= CELLS_Y) y2 = CELLS_Y - 1;
+  if (x1 > x2 || y1 > y2) return;
+
   for (int y = y1; y <= y2; y++) {
     for (int x = x1; x <= x2; x++) {
       int idx = cell_idx(x, y);
@@ -296,6 +310,8 @@ static void update_overlapping_cells(RenRect r, unsigned h) {
   }
 }
 
+
+static bool rect_buf_overflow = false;
 
 static void push_rect(RenRect r, int *count) {
   /* try to merge with existing rectangle */
@@ -306,7 +322,11 @@ static void push_rect(RenRect r, int *count) {
       return;
     }
   }
-  /* couldn't merge with previous rectangle: push */
+  /* couldn't merge with previous rectangle: push (bounded) */
+  if (*count >= (int)(sizeof(rect_buf) / sizeof(rect_buf[0]))) {
+    rect_buf_overflow = true;
+    return;
+  }
   rect_buf[(*count)++] = r;
 }
 
@@ -315,6 +335,7 @@ void rencache_end_frame(RenWindow *window_renderer) {
   /* update cells from commands */
   Command *cmd = NULL;
   RenRect cr = screen_rect;
+  rect_buf_overflow = false;
   while (next_command(window_renderer, &cmd)) {
     /* cmd->command[0] should always be the Command rect */
     if (cmd->type == SET_CLIP) { cr = cmd->command[0]; }
@@ -350,8 +371,18 @@ void rencache_end_frame(RenWindow *window_renderer) {
     *r = intersect_rects(*r, screen_rect);
   }
 
+  if (rect_buf_overflow) {
+    /* the cell grid produced more dirty rects than rect_buf can hold:
+     * dropping them silently would leave stale content on screen, so fall
+     * back to one full-screen rect */
+    rect_buf[0] = screen_rect;
+    rect_count = 1;
+    rect_buf_overflow = false;
+  }
+
   RenSurface rs = renwin_get_surface(window_renderer);
   bool gpu_presented = false;
+  bool gpu_begin_failed = false;
 #ifdef LITE_USE_GPU_RENDERER
   if (window_renderer->gpu_state && rect_count > 0) {
     /* ---- GPU path: replay commands as GPU draw calls ---- */
@@ -400,10 +431,12 @@ void rencache_end_frame(RenWindow *window_renderer) {
       /* begin failed (device hiccup): fall through to the CPU replay so the
          frame still renders instead of freezing on the previous one */
       fprintf(stderr, "rencache: gpu_begin_frame failed, CPU fallback\n");
+      gpu_begin_failed = true;
     }
   }
 #else
   (void)gpu_presented;
+  (void)gpu_begin_failed;
 #endif
   /* ---- CPU path (fallback) ---- */
   for (int i = 0; i < rect_count; i++) {
@@ -445,9 +478,21 @@ void rencache_end_frame(RenWindow *window_renderer) {
     }
   }
 
-  /* update dirty rects (CPU path only; GPU path presents in gpu_end_frame) */
-  if (!gpu_presented && rect_count > 0) {
+  /* update dirty rects (CPU path only; GPU path presents in gpu_end_frame).
+   * When a GPU backend owns the window there is no SDL renderer/texture
+   * (see setup_renderer), so a failed gpu_begin_frame can only redraw into
+   * the surface -- presenting it is impossible. Invalidate so the next frame
+   * retries the GPU path instead of crashing on the NULL texture.
+   * NB: only invalidate on an actual begin failure -- idle frames
+   * (rect_count == 0) must not trigger a full redraw loop. */
+  bool gpu_owns_window = false;
+#ifdef LITE_USE_GPU_RENDERER
+  gpu_owns_window = window_renderer->gpu_state != NULL;
+#endif
+  if (!gpu_presented && !gpu_owns_window && rect_count > 0) {
     ren_update_rects(window_renderer, rect_buf, rect_count);
+  } else if (gpu_begin_failed) {
+    rencache_invalidate();
   }
 
   /* swap cell buffer and reset */

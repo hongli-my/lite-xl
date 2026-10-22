@@ -30,9 +30,23 @@ void deinit_dirmonitor(struct dirmonitor_internal* monitor) {
 }
 
 
+void wake_dirmonitor(struct dirmonitor_internal* monitor) {
+  /* wake a check thread blocked in poll() inside get_changes_dirmonitor */
+  ssize_t written = write(monitor->sig[1], "", 1);
+  (void)written;
+}
+
+
 int get_changes_dirmonitor(struct dirmonitor_internal* monitor, char* buffer, int length) {
   struct pollfd fds[2] = { { .fd = monitor->fd, .events = POLLIN | POLLERR, .revents = 0 }, { .fd = monitor->sig[0], .events = POLLIN | POLLERR, .revents = 0 } };
   poll(fds, 2, -1);
+  /* woken by the exit signal: drain it and report "no changes"; reading the
+   * inotify fd here would block forever since it has no events */
+  if (fds[1].revents & POLLIN) {
+    char dummy[1];
+    while (read(monitor->sig[0], dummy, 1) == 1) { /* drain */ }
+    return 0;
+  }
   return read(monitor->fd, buffer, length);
 }
 

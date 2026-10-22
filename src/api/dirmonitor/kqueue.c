@@ -24,6 +24,12 @@ void deinit_dirmonitor(struct dirmonitor_internal* monitor) {
 }
 
 
+void wake_dirmonitor(struct dirmonitor_internal* monitor) {
+  /* kevent uses a 100 ms timeout, polling is enough to notice exit */
+  (void)monitor;
+}
+
+
 int get_changes_dirmonitor(struct dirmonitor_internal* monitor, char* buffer, int buffer_size) {
   struct timespec ts = { 0, 100 * 1000000 }; // 100 ms
 

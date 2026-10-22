@@ -1082,7 +1082,12 @@ local run_threads = coroutine.wrap(function()
     for k, thread in pairs(threads) do
       -- Run thread if it wasn't deleted externally and it's time to resume it
       if core.threads[k] and thread.wake < system.get_time() then
-        local _, wait = assert(coroutine.resume(thread.cr))
+        -- A crashing thread must not take down the whole editor: log the
+        -- error and drop the thread instead of propagating it to the top.
+        local ok, wait = coroutine.resume(thread.cr)
+        if not ok then
+          core.error("Error in scheduled thread: %s", wait)
+        end
         if coroutine.status(thread.cr) == "dead" then
           core.threads[k] = nil
         else

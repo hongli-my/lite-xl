@@ -26,6 +26,7 @@ static int font_get_options(
   int *style
 ) {
   if (lua_gettop(L) > 2 && lua_istable(L, 3)) {
+    int stack_top = lua_gettop(L);
     lua_getfield(L, 3, "antialiasing");
     if (lua_isstring(L, -1)) {
       const char *antialiasing_str = lua_tostring(L, -1);
@@ -59,7 +60,7 @@ static int font_get_options(
           return luaL_error(
             L,
             "error in font options, unknown hinting option: \"%s\"",
-            hinting
+            hinting_str
           );
         }
       }
@@ -81,7 +82,9 @@ static int font_get_options(
     if (lua_toboolean(L, -1))
       style_local |= FONT_STYLE_STRIKETHROUGH;
 
-    lua_pop(L, 5);
+    /* restore the stack depth instead of a hand-counted pop: the number of
+     * pushed fields above must stay in sync with this function's edits */
+    lua_settop(L, stack_top);
 
     if (style_local != 0)
       *style = style_local;

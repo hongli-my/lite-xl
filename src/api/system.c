@@ -219,6 +219,8 @@ top:
     case SDL_EVENT_WINDOW_RESIZED:
       {
         RenWindow* window_renderer = ren_find_window_from_id(e.window.windowID);
+        /* stale event for a window that is already gone */
+        if (!window_renderer) { goto top; }
         ren_resize_window(window_renderer);
         lua_pushstring(L, "resized");
         /* The size below will be in points. */
@@ -323,6 +325,7 @@ top:
       {
         if (e.button.button == 1) { SDL_CaptureMouse(1); }
         RenWindow* window_renderer = ren_find_window_from_id(e.button.windowID);
+        if (!window_renderer) { goto top; }
         lua_pushstring(L, "mousepressed");
         lua_pushstring(L, button_name(e.button.button));
         lua_pushinteger(L, e.button.x * window_renderer->scale_x);
@@ -335,6 +338,7 @@ top:
       {
         if (e.button.button == 1) { SDL_CaptureMouse(0); }
         RenWindow* window_renderer = ren_find_window_from_id(e.button.windowID);
+        if (!window_renderer) { goto top; }
         lua_pushstring(L, "mousereleased");
         lua_pushstring(L, button_name(e.button.button));
         lua_pushinteger(L, e.button.x * window_renderer->scale_x);
@@ -352,6 +356,7 @@ top:
           e.motion.yrel += event_plus.motion.yrel;
         }
         RenWindow* window_renderer = ren_find_window_from_id(e.motion.windowID);
+        if (!window_renderer) { goto top; }
         lua_pushstring(L, "mousemoved");
         lua_pushinteger(L, e.motion.x * window_renderer->scale_x);
         lua_pushinteger(L, e.motion.y * window_renderer->scale_y);
@@ -370,6 +375,7 @@ top:
     case SDL_EVENT_FINGER_DOWN:
       {
         RenWindow* window_renderer = ren_find_window_from_id(e.tfinger.windowID);
+        if (!window_renderer) { goto top; }
         SDL_GetWindowSize(window_renderer->window, &w, &h);
 
         lua_pushstring(L, "touchpressed");
@@ -382,6 +388,7 @@ top:
     case SDL_EVENT_FINGER_UP:
       {
         RenWindow* window_renderer = ren_find_window_from_id(e.tfinger.windowID);
+        if (!window_renderer) { goto top; }
         SDL_GetWindowSize(window_renderer->window, &w, &h);
 
         lua_pushstring(L, "touchreleased");
@@ -401,6 +408,7 @@ top:
           e.tfinger.dy += event_plus.tfinger.dy;
         }
         RenWindow* window_renderer = ren_find_window_from_id(e.tfinger.windowID);
+        if (!window_renderer) { goto top; }
         SDL_GetWindowSize(window_renderer->window, &w, &h);
 
         lua_pushstring(L, "touchmoved");
@@ -440,6 +448,7 @@ top:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
       {
         RenWindow* window_renderer = ren_find_window_from_id(e.window.windowID);
+        if (!window_renderer) { goto top; }
         ren_resize_window(window_renderer);
       }
 

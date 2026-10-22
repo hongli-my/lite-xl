@@ -144,6 +144,10 @@ void renwin_update_rects(RenWindow *ren, RenRect *rects, int count) {
    * reaches this function.  Getting here means the SDL renderer / window
    * surface path owns the frame. */
 #ifdef LITE_USE_SDL_RENDERER
+  if (!ren->texture || !ren->renderer) {
+    /* GPU fallback hiccup: no SDL renderer/texture to present through. */
+    return;
+  }
   const int scale = ren->rensurface.scale;
   for (int i = 0; i < count; i++) {
     const RenRect *r = &rects[i];

@@ -39,6 +39,15 @@ void deinit_dirmonitor(struct dirmonitor_internal* monitor) {
 }
 
 
+void wake_dirmonitor(struct dirmonitor_internal* monitor) {
+  /* the check thread may be blocked in ReadDirectoryChangesW; closing the
+   * handle cancels that IO (CancelIoEx) so the thread can exit.  It is
+   * idempotent: close_monitor_handle NULLs the handle, and deinit calls it
+   * again later with no effect. */
+  close_monitor_handle(monitor);
+}
+
+
 int translate_changes_dirmonitor(struct dirmonitor_internal* monitor, char* buffer, int buffer_size, int (*change_callback)(int, const char*, void*), void* data) {
   for (FILE_NOTIFY_INFORMATION* info = (FILE_NOTIFY_INFORMATION*)buffer; (char*)info < buffer + buffer_size; info = (FILE_NOTIFY_INFORMATION*)(((char*)info) + info->NextEntryOffset)) {
     char transform_buffer[MAX_PATH*4];

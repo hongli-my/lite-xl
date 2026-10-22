@@ -764,7 +764,7 @@ void gpu_draw_rect(RenWindow *ren, RenRect rect, RenColor color,
   }
 
   GpuDrawCmd *d = push_draw(s);
-  if (!d) return;
+  if (!d) { s->vbuf_used = off; return; }
   d->kind = GPU_DRAW_RECT;
   d->vert_offset = off;
   d->vert_count = 6;
@@ -802,7 +802,7 @@ void gpu_draw_rounded_rect(RenWindow *ren, RenRect rect, RenColor color,
   s->vbuf_used += 4;
 
   GpuDrawCmd *d = push_draw(s);
-  if (!d) return;
+  if (!d) { s->vbuf_used = off; return; }
   d->kind = GPU_DRAW_RRECT;
   d->vert_offset = off;
   d->vert_count = 4;
@@ -1074,7 +1074,7 @@ void gpu_draw_text_quads(RenWindow *ren, void *tex,
   }
 
   GpuDrawCmd *d = push_draw(s);
-  if (!d) return;
+  if (!d) { s->vbuf_used = off; return; }
   d->kind = GPU_DRAW_TEXT;
   d->vert_offset = off;
   d->vert_count = (Uint32)vert_count;
@@ -1204,7 +1204,7 @@ void gpu_draw_image(RenWindow *ren, SDL_Surface *img,
   s->vbuf_used += 6;
 
   GpuDrawCmd *d = push_draw(s);
-  if (!d) return;
+  if (!d) { s->vbuf_used = off; return; }
   d->kind = GPU_DRAW_IMAGE;
   d->vert_offset = off;
   d->vert_count = 6;

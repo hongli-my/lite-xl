@@ -8,6 +8,10 @@ struct lxl_arena {
   int ref;
 };
 
+/* NOTE: ref is an absolute stack index captured at init time; it is only
+ * valid within the C function that called lxl_arena_init() (its current
+ * users: api/process.c, api/system.c).  Do NOT let an arena outlive that
+ * frame. */
 lxl_arena *lxl_arena_init(lua_State *L) {
   lua_newtable(L);
   lxl_arena *arena = lua_newuserdata(L, sizeof(lxl_arena));

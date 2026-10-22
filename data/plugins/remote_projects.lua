@@ -97,13 +97,21 @@ end
 
 local function write_lua_table(path, t)
   common.mkdirp(common.dirname(path))
-  local f = io.open(path, "wb")
+  -- atomic write: a crash mid-write must not leave a truncated state file
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "wb")
   if not f then
     core.error("[remote] cannot write %s", path)
     return
   end
   f:write("return " .. common.serialize(t))
   f:close()
+  -- rename(2) atomically replaces the destination on POSIX; removing the
+  -- target first would leave a window where the state file is missing
+  local ok, err = os.rename(tmp, path)
+  if not ok then
+    core.error("[remote] cannot save %s: %s", path, tostring(err))
+  end
 end
 
 function Accounts.path() return REMOTE_DIR .. PATHSEP .. "accounts.lua" end
@@ -197,6 +205,8 @@ end
 ---Runs a command with the account's password (if any) fed through a
 ---temporary SSH_ASKPASS script. Must run inside a coroutine; returns
 ---true, stdout or nil, err.
+local RUN_WITH_PASSWORD_TIMEOUT = 60 -- seconds without progress
+
 local function run_with_password(args, acc)
   local env
   local askpass_path
@@ -204,9 +214,13 @@ local function run_with_password(args, acc)
     askpass_path = core.temp_filename(".sh", REMOTE_DIR)
     local f = io.open(askpass_path, "wb")
     if not f then return nil, "cannot create askpass script" end
-    f:write('#!/bin/sh\necho ' .. string.format("%q", acc.password) .. '\n')
+    -- single-quote shell escaping: passwords may contain $, `, ", etc.
+    local quoted = "'" .. tostring(acc.password):gsub("'", "'\\''") .. "'"
+    f:write('#!/bin/sh\necho ' .. quoted .. '\n')
     f:close()
-    os.execute("chmod +x " .. askpass_path)
+    -- USERDIR may contain spaces ("Application Support"): quote the path.
+    -- 700 keeps the plaintext password readable only by the owner.
+    os.execute("chmod 700 " .. string.format("%q", askpass_path))
     env = {
       SSH_ASKPASS = askpass_path,
       SSH_ASKPASS_REQUIRE = "force",
@@ -214,16 +228,32 @@ local function run_with_password(args, acc)
     }
   end
   local proc = process.start(args, { env = env })
-  if askpass_path then os.remove(askpass_path) end
-  if not proc then return nil, "failed to start " .. args[1] end
+  if not proc then
+    if askpass_path then os.remove(askpass_path) end
+    return nil, "failed to start " .. args[1]
+  end
   local out, err_buf = {}, {}
+  -- monotonic clock (SDL timer): immune to wall-clock jumps (NTP, DST)
+  local start_time = system.get_time()
   while proc.process:running() do
     local chunk = proc.stdout:read(2048)
     if chunk and chunk ~= "" then table.insert(out, chunk) end
     local echunk = proc.stderr:read(2048)
     if echunk and echunk ~= "" then table.insert(err_buf, echunk) end
+    -- guard against ssh hanging forever (dead network, auth prompt, …):
+    -- kill it and report instead of freezing the UI
+    if system.get_time() - start_time > RUN_WITH_PASSWORD_TIMEOUT then
+      proc:kill()
+      proc:wait()
+      if askpass_path then os.remove(askpass_path) end
+      return nil, args[1] .. " timed out after "
+        .. RUN_WITH_PASSWORD_TIMEOUT .. "s"
+    end
     coroutine.yield(1 / config.fps)
   end
+  -- ssh may invoke the askpass script seconds after start: remove it only
+  -- after the process has exited
+  if askpass_path then os.remove(askpass_path) end
   local tail = proc.stdout:read("all")
   if tail and tail ~= "" then table.insert(out, tail) end
   local etail = proc.stderr:read("all")
@@ -232,7 +262,7 @@ local function run_with_password(args, acc)
   if code ~= 0 then
     local err = table.concat(err_buf, ""):gsub("^%s+", ""):gsub("%s+$", "")
     if err == "" then err = args[1] .. " exited with code " .. tostring(code) end
-    return nil, err
+    return nil, err, code
   end
   return true, table.concat(out, "")
 end
@@ -250,6 +280,12 @@ local function rsync_args(acc, src, dst)
     src, dst,
   }
   return args
+end
+
+---Single-quote a path for the remote shell (cd) / rsync remote specs so
+---spaces and special characters cannot split or inject into the command.
+local function shell_quote(s)
+  return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
 -- ---------------------------------------------------------------------------
@@ -409,14 +445,17 @@ local function attach_existing_projects()
   end
 end
 
----Runs the remote `find` and returns ok, listing-or-error.
+---Runs the remote `find` and returns ok, listing-or-error, ssh-exit-code.
+---Exit code 2 means the remote directory does not exist (cd failed).
 local function list_remote_tree(session)
   local cmd = ssh_command(session.account, {})
   table.insert(cmd, string.format(
-    "cd %s 2>/dev/null && find . \\( -type d -o -type f \\) -print | "
+    "cd %s 2>/dev/null || exit 2; find . \\( -type d -o -type f \\) -print | "
     .. "while read -r p; do if [ -d \"$p\" ]; then echo \"d $p\"; else echo \"f $p\"; fi; done",
-    session.remote_dir))
-  return run_with_password(cmd, session.account)
+    shell_quote(session.remote_dir)))
+  local ok, out, code = run_with_password(cmd, session.account)
+  if not ok then return nil, out, code end
+  return true, out
 end
 
 local function connect(account, remote_dir)
@@ -439,11 +478,16 @@ local function connect(account, remote_dir)
 
   core.add_thread(function()
     -- 1) probe + list the remote tree
-    local ok, listing = list_remote_tree(session)
+    local ok, listing, code = list_remote_tree(session)
     if not ok then
       sessions[cache_path] = nil
       common.rm(cache_path .. PATHSEP .. SESSION_FILE)
-      core.error("[remote] cannot connect to %s: %s", profile, listing)
+      if code == 2 then
+        core.error("[remote] 远端目录不存在: %s@%s:%s",
+          account.user or "", account.host, remote_dir)
+      else
+        core.error("[remote] cannot connect to %s: %s", profile, listing)
+      end
       return
     end
     -- 2) materialize the tree locally as placeholders
@@ -466,7 +510,7 @@ end
 local function prune_cache(session, entries)
   local keep = {}
   for _, e in ipairs(entries) do keep[e.rel] = e.type end
-  local removed, kept = 0, 0
+  local removed, kept, stale_dirs = 0, 0, 0
 
   local function walk(rel_dir)
     local abs_dir = rel_dir == "" and session.cache_path
@@ -481,13 +525,19 @@ local function prune_cache(session, entries)
           walk(rel)
           if keep[rel] ~= "d" then
             local remaining = system.list_dir(abs) or {}
-            if #remaining == 0 and common.rm(abs, false) then
-              removed = removed + 1
+            if #remaining == 0 then
+              if common.rm(abs, false) then removed = removed + 1 end
+            else
+              stale_dirs = stale_dirs + 1
             end
           end
         elseif info and info.type == "file" then
           if keep[rel] ~= "f" then
-            if is_pulled(session, abs) then
+            -- Finder metadata must never block the cleanup of a deleted
+            -- remote directory (it would keep the dir alive as stale)
+            if name == ".DS_Store" then
+              os.remove(abs)
+            elseif is_pulled(session, abs) then
               kept = kept + 1
             elseif (info.size or 0) > 0 then
               kept = kept + 1
@@ -501,7 +551,7 @@ local function prune_cache(session, entries)
   end
 
   walk("")
-  return removed, kept
+  return removed, kept, stale_dirs
 end
 
 ---Re-lists the remote tree, materializes new placeholders and prunes stale
@@ -510,10 +560,17 @@ local function refresh_session_tree(session)
   if not session or session.refreshing then return false end
   if sessions[session.cache_path] ~= session then return false end
   session.refreshing = true
-  local ok, listing = list_remote_tree(session)
+  session.dir_missing = nil
+  local ok, listing, code = list_remote_tree(session)
   if not ok then
     session.refreshing = false
-    if not session.refresh_error_logged then
+    if code == 2 then
+      -- the remote directory is gone: tell the user instead of silently
+      -- keeping the stale tree; the auto-refresher skips this session now
+      session.dir_missing = true
+      core.error("[remote] 远端目录不存在或已被删除: %s (本地缓存保留: %s)",
+        session.remote_dir, session.cache_path)
+    elseif not session.refresh_error_logged then
       session.refresh_error_logged = true
       core.log_quiet("[remote] refresh failed for %s: %s", session.profile, listing)
     end
@@ -525,13 +582,18 @@ local function refresh_session_tree(session)
   end
   local entries = parse_listing(listing)
   local created = materialize_entries(session, entries)
-  local removed, kept = prune_cache(session, entries)
+  local removed, kept, stale_dirs = prune_cache(session, entries)
   session.refreshing = false
   session.refresh_error_logged = nil
   if created > 0 or removed > 0 then refresh_treeview() end
   if created > 0 or removed > 0 or kept > 0 then
     core.log_quiet("[remote] refreshed %s (%d new, %d removed, %d kept local)",
       session.profile, created, removed, kept)
+  end
+  if stale_dirs > 0 then
+    core.log_quiet("[remote] %d director(ies) deleted on the remote are kept "
+      .. "locally because they still contain pulled files (%s)",
+      stale_dirs, session.profile)
   end
   return true
 end
@@ -543,7 +605,7 @@ end
 local function pull_file(session, abs_filename)
   local rel = abs_filename:sub(#session.cache_path + 2)
   local remote = session.account.user .. "@" .. session.account.host
-    .. ":" .. session.remote_dir .. "/" .. rel
+    .. ":" .. shell_quote(session.remote_dir .. "/" .. rel)
   local ok, err = run_with_password(
     rsync_args(session.account, remote, abs_filename), session.account)
   if not ok then
@@ -563,7 +625,7 @@ local function push_file(session, abs_filename)
     return false
   end
   local remote = session.account.user .. "@" .. session.account.host
-    .. ":" .. session.remote_dir .. "/" .. rel
+    .. ":" .. shell_quote(session.remote_dir .. "/" .. rel)
   local ok, err = run_with_password(
     rsync_args(session.account, abs_filename, remote), session.account)
   if not ok then
@@ -581,11 +643,13 @@ function Doc:load(filename)
   if session and not is_pulled(session, filename) then
     -- must run in the editor thread: Doc:load is called synchronously from
     -- Doc:new; do a blocking pull of the single small file instead
-    local co = coroutine.running()
-    if co then
+    -- NB: in Lua 5.4 coroutine.running() also returns the main coroutine,
+    -- the second result tells them apart.
+    local _, is_main = coroutine.running()
+    if not is_main then
       pull_file(session, filename)
     else
-      -- called outside a thread (e.g. core.open_doc from a command): spawn
+      -- called from the main coroutine (e.g. a command handler): spawn
       -- a thread that pulls then re-opens the doc
       core.add_thread(function()
         if pull_file(session, filename) then
@@ -759,13 +823,20 @@ install_treeview_hooks = function()
     if cmds and item and session_for_path(item.abs_filename) then
       local items = cmds.items
       if items then
-        if item.type == "file" then
-          -- insert after the leading entry + divider (positions 1-2)
-          table.move(items, 3, #items, 5)
-          items[3] = { text = "拉取 (Pull)", icon = "\u{25BC}",
-            command = "remote-projects:pull-file" }
-          items[4] = { text = "推送 (Push)", icon = "\u{25B2}",
+        local pull, push = { text = "拉取 (Pull)", icon = "\u{25BC}",
+          command = "remote-projects:pull-file" },
+          { text = "推送 (Push)", icon = "\u{25B2}",
             command = "remote-projects:push-file" }
+        if item.type == "file" and #items >= 2 and items[2] == "DIVIDER" then
+          -- insert after the leading entry + divider (positions 1-2);
+          -- guarded so an upstream menu change can never leave a nil hole
+          -- (which would break the menu iteration while drawing)
+          table.move(items, 3, #items, 5)
+          items[3] = pull
+          items[4] = push
+        elseif item.type == "file" then
+          items[#items + 1] = pull
+          items[#items + 1] = push
         end
         items[#items + 1] = { text = "刷新远端目录 (Refresh Remote Tree)",
           icon = "\u{25CB}", command = "remote-projects:refresh-this-tree" }
@@ -830,7 +901,9 @@ core.add_thread(function()
   local list = {}
   for _, s in pairs(sessions) do list[#list + 1] = s end
   for _, s in ipairs(list) do
-    if sessions[s.cache_path] == s then refresh_session_tree(s) end
+    if sessions[s.cache_path] == s and not s.dir_missing then
+      refresh_session_tree(s)
+    end
   end
 end)
 
@@ -847,7 +920,9 @@ core.add_thread(function()
       local list = {}
       for _, s in pairs(sessions) do list[#list + 1] = s end
       for _, s in ipairs(list) do
-        if sessions[s.cache_path] == s then refresh_session_tree(s) end
+        if sessions[s.cache_path] == s and not s.dir_missing then
+          refresh_session_tree(s)
+        end
       end
     end
   end
