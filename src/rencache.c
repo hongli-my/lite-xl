@@ -129,6 +129,12 @@ static RenRect merge_rects(RenRect a, RenRect b) {
   return (RenRect) { x1, y1, x2 - x1, y2 - y1 };
 }
 
+/* true when r would paint at least one pixel inside clip */
+static inline bool rect_visible(RenRect r, RenRect clip) {
+  RenRect x = intersect_rects(r, clip);
+  return x.width > 0 && x.height > 0;
+}
+
 static bool expand_command_buffer(RenWindow *window_renderer) {
   size_t new_size = window_renderer->command_buf_size * CMD_BUF_RESIZE_RATE;
   if (new_size == 0) {
@@ -390,42 +396,57 @@ void rencache_end_frame(RenWindow *window_renderer) {
   if (window_renderer->gpu_state && rect_count > 0) {
     /* ---- GPU path: replay commands as GPU draw calls ---- */
     if (gpu_begin_frame(window_renderer)) {
-      for (int i = 0; i < rect_count; i++) {
-        RenRect r = rect_buf[i];
-        RenRect current_clip = r;
-        cmd = NULL;
-        while (next_command(window_renderer, &cmd)) {
-          SetClipCommand *ccmd = (SetClipCommand*)&cmd->command;
-          DrawRectCommand *rcmd = (DrawRectCommand*)&cmd->command;
-          DrawRoundRectCommand *rrcmd = (DrawRoundRectCommand*)&cmd->command;
-          DrawTextCommand *tcmd = (DrawTextCommand*)&cmd->command;
-          switch (cmd->type) {
-            case SET_CLIP:
-              current_clip = intersect_rects(ccmd->rect, r);
-              break;
-            case DRAW_RECT:
-              gpu_draw_rect(window_renderer, rcmd->rect, rcmd->color, current_clip);
-              break;
-            case DRAW_ROUNDRECT:
+      /* Single replay pass. Every command is issued at most once, clipped to
+       * the union of the dirty rects. Repainting a clean cell inside the
+       * union is harmless (a clean cell's command sequence is unchanged, so
+       * replaying it writes identical pixels), while the rect_visible test
+       * skips commands outside the union outright instead of re-issuing
+       * them -- and re-walking their glyphs -- once per dirty rect. */
+      RenRect dirty = rect_buf[0];
+      for (int i = 1; i < rect_count; i++)
+        dirty = merge_rects(dirty, rect_buf[i]);
+      dirty = intersect_rects(dirty, screen_rect);
+      RenRect clip_base = screen_rect;
+      cmd = NULL;
+      while (next_command(window_renderer, &cmd)) {
+        SetClipCommand *ccmd = (SetClipCommand*)&cmd->command;
+        DrawRectCommand *rcmd = (DrawRectCommand*)&cmd->command;
+        DrawRoundRectCommand *rrcmd = (DrawRoundRectCommand*)&cmd->command;
+        DrawTextCommand *tcmd = (DrawTextCommand*)&cmd->command;
+        RenRect clip = intersect_rects(clip_base, dirty);
+        switch (cmd->type) {
+          case SET_CLIP:
+            clip_base = ccmd->rect;
+            break;
+          case DRAW_RECT:
+            if (rect_visible(rcmd->rect, clip))
+              gpu_draw_rect(window_renderer, rcmd->rect, rcmd->color, clip);
+            break;
+          case DRAW_ROUNDRECT:
+            if (rect_visible(rrcmd->rect, clip))
               gpu_draw_rounded_rect(window_renderer, rrcmd->rect, rrcmd->color,
-                                    rrcmd->radius, current_clip);
-              break;
-            case DRAW_TEXT:
+                                    rrcmd->radius, clip);
+            break;
+          case DRAW_TEXT:
+            if (rect_visible(tcmd->rect, clip)) {
               ren_font_group_set_tab_size(tcmd->fonts, tcmd->tab_size);
               ren_draw_text_gpu(window_renderer, tcmd->fonts, tcmd->text,
                 tcmd->len, tcmd->text_x, tcmd->rect.y, tcmd->color,
-                tcmd->tab, current_clip);
-              break;
-            case DRAW_IMAGE: {
-              DrawImageCommand *icmd = (DrawImageCommand*)&cmd->command;
-              gpu_draw_image(window_renderer, icmd->surface, icmd->rect, current_clip);
-              break;
+                tcmd->tab, clip);
             }
+            break;
+          case DRAW_IMAGE: {
+            DrawImageCommand *icmd = (DrawImageCommand*)&cmd->command;
+            if (rect_visible(icmd->rect, clip))
+              gpu_draw_image(window_renderer, icmd->surface, icmd->rect, clip);
+            break;
           }
         }
-        if (show_debug) {
+      }
+      if (show_debug) {
+        for (int i = 0; i < rect_count; i++) {
           RenColor color = { rand(), rand(), rand(), 50 };
-          gpu_draw_rect(window_renderer, r, color, current_clip);
+          gpu_draw_rect(window_renderer, rect_buf[i], color, screen_rect);
         }
       }
       gpu_end_frame(window_renderer);
