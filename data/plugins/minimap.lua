@@ -111,6 +111,86 @@ local function get_tiny_font()
   return tiny_font or nil
 end
 
+-- Cached strip segments per document line. Rebuilding walks the tokenizer
+-- and measures every token; replaying the segs only issues draw calls, so
+-- scrolling and editing elsewhere no longer retokenize the whole strip.
+-- An entry is keyed by the highlighter's line table, which is replaced
+-- wholesale whenever the line is retokenized -- any edit invalidates
+-- exactly the edited lines.
+local strip_cache = setmetatable({}, { __mode = "k" })
+
+local function strip_cache_for(doc, tiny, m)
+  local budget = m.char_budget or 512
+  local cache = strip_cache[doc]
+  if not cache or cache.tiny ~= tiny or cache.palette ~= blob_cache
+    or cache.width ~= m.w or cache.max_cols ~= m.max_cols
+    or cache.budget ~= budget then
+    cache = { tiny = tiny, palette = blob_cache, width = m.w,
+              max_cols = m.max_cols, budget = budget, lines = {}, count = 0 }
+    strip_cache[doc] = cache
+  end
+  return cache
+end
+
+local function strip_segs(doc, line, tiny, m, cache)
+  local hl = doc.highlighter
+  local lt = hl:get_line(line)
+  local entry = cache.lines[line]
+  if entry and entry.src == lt then return entry.segs end
+  local segs = { }
+  if tiny then
+    -- scaled-down real glyphs: {colour, text, width} triplets, cut to the
+    -- strip budget (a minified line is one giant token; measuring it whole
+    -- every frame is what this cache exists to avoid)
+    local tx = 0
+    for _, type_, tok in hl:each_token(line) do
+      if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
+      if tok ~= "" then
+        if tx >= cache.width then break end
+        if #tok > cache.budget then tok = tok:sub(1, cache.budget) end
+        local w = tiny:get_width(tok)
+        segs[#segs+1] = blob_color(type_)
+        segs[#segs+1] = tok
+        segs[#segs+1] = w
+        tx = tx + w
+      end
+    end
+  else
+    -- word runs as {colour, col_x, col_count} triplets; spaces advance
+    -- without drawing
+    local cx = 0
+    for _, type_, tok in hl:each_token(line) do
+      if cx >= cache.max_cols then break end
+      if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
+      if #tok > cache.budget then tok = tok:sub(1, cache.budget) end
+      local ws = select(2, tok:find("^%s*")) or 0
+      cx = cx + ws
+      local body = tok:sub(ws + 1)
+      local color = blob_color(type_)
+      local p = 1
+      while p <= #body and cx < cache.max_cols do
+        local s, e = body:find("%S+", p)
+        if not s then break end
+        cx = cx + (s - p)
+        local seg_cols = math.min(e - s + 1, cache.max_cols - cx)
+        if seg_cols > 0 then
+          segs[#segs+1] = color
+          segs[#segs+1] = cx
+          segs[#segs+1] = seg_cols
+          cx = cx + seg_cols
+        end
+        p = e + 1
+      end
+    end
+  end
+  cache.lines[line] = { src = lt, segs = segs }
+  cache.count = cache.count + 1
+  -- scrolling through a huge file must not accumulate one entry per line
+  -- forever; dropping the table only costs one rebuild of the visible strip
+  if cache.count > 32768 then cache.lines = { }; cache.count = 0 end
+  return segs
+end
+
 local function draw_minimap(dv)
   local doc = dv.doc
   local m = metrics(dv)
@@ -139,52 +219,28 @@ local function draw_minimap(dv)
   renderer.draw_rect(m.x - 1, m.y, 1, m.h, blend(style.background, style.text, 0.30))
 
   core.push_clip_rect(m.x, m.y, m.w, m.h)
+  local cache = strip_cache_for(doc, tiny, m)
+  -- vertical centering exactly as common.draw_text does it, rounded per
+  -- line: common.round is asymmetric at negative half-integers, so
+  -- precomputing round((lh - th) / 2) once would shift glyphs by 1px
+  local tq = tiny and (m.lh - tiny:get_height()) / 2 or 0
   for line = first_line, last_line do
     local text = doc.lines[line]
     if text and #text > 1 then
       local y = m.y + (line - first_line) * m.lh
+      local segs = strip_segs(doc, line, tiny, m, cache)
       if tiny then
-        -- scaled-down real glyphs, token colours included (Sublime's look)
+        local ty = common.round(y + tq)
         local tx = m.x
-        -- A minified line is a single giant token; drawing it whole makes
-        -- draw_text rasterise the entire line every frame. Cut each token
-        -- to what the minimap strip can actually show first.
-        local budget = m.char_budget or 512
-        for _, type_, tok in doc.highlighter:each_token(line) do
-          if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
-          if tok ~= "" then
-            if #tok > budget then tok = tok:sub(1, budget) end
-            common.draw_text(tiny, blob_color(type_), tok, nil, tx, y, 0, m.lh)
-            tx = tx + tiny:get_width(tok)
-            if tx >= m.x + m.w then break end
-          end
+        for i = 1, #segs, 3 do
+          renderer.draw_text(tiny, segs[i+1], tx, ty, segs[i])
+          tx = tx + segs[i+2]
         end
       else
-      local cx = 0
-      for _, type_, tok in doc.highlighter:each_token(line) do
-        if cx < m.max_cols then
-          if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
-          if #tok > (m.char_budget or 512) then tok = tok:sub(1, m.char_budget or 512) end
-          local ws = select(2, tok:find("^%s*")) or 0
-          cx = cx + ws
-          local body = tok:sub(ws + 1)
-          local color = blob_color(type_)
-          -- draw word runs, spaces advance without drawing
-          local p = 1
-          while p <= #body and cx < m.max_cols do
-            local s, e = body:find("%S+", p)
-            if not s then break end
-            cx = cx + (s - p)
-            local seg_cols = math.min(e - s + 1, m.max_cols - cx)
-            if seg_cols > 0 then
-              renderer.draw_rect(m.x + cx * m.colw, y, seg_cols * m.colw,
-                m.lh - gap, color)
-              cx = cx + seg_cols
-            end
-            p = e + 1
-          end
+        for i = 1, #segs, 3 do
+          renderer.draw_rect(m.x + segs[i+1] * m.colw, y, segs[i+2] * m.colw,
+            m.lh - gap, segs[i])
         end
-      end
       end
     end
   end
