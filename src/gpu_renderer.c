@@ -1332,13 +1332,21 @@ void gpu_end_frame(RenWindow *ren) {
             bound_tex_mode = 1;
           }
         } else {
-          /* Single texture at slot 0 (overflow glyph or image). */
+          /* Single texture at slot 0 (overflow glyph or image). The glyph
+           * pipeline still declares the full GPU_ATLAS_COUNT sampler array,
+           * so every slot must be bound even though non-array draws sample
+           * slot 0 only (tex_index packs 0 for them). Pad with the same
+           * texture; the image pipeline declares a single slot and ignores
+           * the rest. Binding fewer slots trips SDL_gpu's graphics-binding
+           * check ("Missing fragment sampler binding!"). */
           void *tex = d->texture;
           if (bound_tex_mode != 2 || bound_single_tex != tex) {
-            SDL_GPUTextureSamplerBinding tsb = {0};
-            tsb.texture = (SDL_GPUTexture *)tex;
-            tsb.sampler = g_ctx.atlas_sampler;
-            SDL_BindGPUFragmentSamplers(s->pass, 0, &tsb, 1);
+            SDL_GPUTextureSamplerBinding tsb[GPU_ATLAS_COUNT];
+            for (int k = 0; k < GPU_ATLAS_COUNT; k++) {
+              tsb[k].texture = (SDL_GPUTexture *)tex;
+              tsb[k].sampler = g_ctx.atlas_sampler;
+            }
+            SDL_BindGPUFragmentSamplers(s->pass, 0, tsb, GPU_ATLAS_COUNT);
             bound_tex_mode = 2;
             bound_single_tex = tex;
           }
