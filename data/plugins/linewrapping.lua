@@ -83,6 +83,14 @@ end
 -- Computes the breaks for a given line, width and mode. Returns a list of columns
 -- at which the line should be broken.
 function LineWrapping.compute_line_breaks(doc, default_font, line, width, mode)
+  -- Huge lines are drawn unwrapped through DocView's sample-cache path (see
+  -- the draw_line_text override): computing per-character breaks for a
+  -- 684KB minified line costs seconds of font:get_width calls and is never
+  -- used. Report a single unbroken visual line instead.
+  local line_text = doc.lines[line]
+  if line_text and #line_text > (config.huge_line_threshold or 64 * 1024) then
+    return { 1 }, 0
+  end
   local xoffset, last_i, i, last_space, last_width, begin_width = 0, 1, 1, nil, 0, 0
   local splits = { 1 }
   for idx, type, text in get_tokens(doc, line) do
@@ -426,6 +434,11 @@ end
 local old_get_col_x_offset = DocView.get_col_x_offset
 function DocView:get_col_x_offset(line, col, line_end)
   if not self.wrapped_settings then return old_get_col_x_offset(self, line, col) end
+  -- Huge lines are unwrapped and measured through the hline sample cache;
+  -- the per-character loop below is linear in the column.
+  if #self.doc.lines[line] > (config.huge_line_threshold or 64 * 1024) then
+    return old_get_col_x_offset(self, line, col)
+  end
   local idx, ncol, count, scol = get_line_idx_col_count(self, line, col, line_end)
   local xoffset, i = (scol ~= 1 and self.wrapped_line_offsets[line] or 0), 1
   local default_font = self:get_font()
@@ -471,6 +484,14 @@ end
 local old_draw_line_text = DocView.draw_line_text
 function DocView:draw_line_text(line, x, y)
   if not self.wrapped_settings then return old_draw_line_text(self, line, x, y) end
+  -- Huge lines (minified code, data dumps) must not be drawn through the
+  -- wrapping path: a single 684KB JSON line is one giant token, which
+  -- renderer.draw_text would rasterise and turn into millions of vertices
+  -- every frame. Fall back to DocView's sample-cache visible-slice path,
+  -- which renders the viewport slice of the physical line unwrapped.
+  if #self.doc.lines[line] > (config.huge_line_threshold or 64 * 1024) then
+    return old_draw_line_text(self, line, x, y)
+  end
   local default_font = self:get_font()
   local tx, ty, begin_width = x, y + self:get_line_text_y_offset(), self.wrapped_line_offsets[line]
   local lh = self:get_line_height()

@@ -79,7 +79,8 @@ typedef enum {
 typedef enum {
   EGlyphNone = 0,             // glyph is not loaded
   EGlyphXAdvance = (1 << 0L), // xadvance is loaded
-  EGlyphBitmap = (1 << 1L)    // bitmap is loaded
+  EGlyphBitmap = (1 << 1L),    // bitmap is loaded
+  EGlyphBitmapEmpty = (1 << 2L) // bitmap is loaded and empty (whitespace, zero-width); FT_Load_Glyph must not run again
 } ERenGlyphFlags;
 
 // metrics for a loaded glyph
@@ -349,6 +350,7 @@ static SDL_Surface *font_load_glyph_bitmap(RenFont *font, unsigned int glyph_id,
   GlyphMetric *metric = font_load_glyph_metric(font, glyph_id, bitmap_idx);
   if (!metric) return NULL;
   if (metric->flags & EGlyphBitmap) return font->glyphs.atlas[metric->format][metric->atlas_idx].surfaces[metric->surface_idx];
+  if (metric->flags & EGlyphBitmapEmpty) return NULL; // known-empty bitmap: loading it again every frame costs one FT_Load_Glyph per whitespace char
   // render the glyph for a bitmap_idx
   unsigned int load_option = font_set_load_options(font), render_option = font_set_render_options(font);
   FT_GlyphSlot slot = font->face->glyph;
@@ -375,8 +377,10 @@ static SDL_Surface *font_load_glyph_bitmap(RenFont *font, unsigned int glyph_id,
       (slot->bitmap.pixel_mode != FT_PIXEL_MODE_MONO
         && slot->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY
         && slot->bitmap.pixel_mode != FT_PIXEL_MODE_LCD
-        && slot->bitmap.pixel_mode != FT_PIXEL_MODE_BGRA))
+        && slot->bitmap.pixel_mode != FT_PIXEL_MODE_BGRA)) {
+    metric->flags |= EGlyphBitmapEmpty;
     return NULL;
+  }
 
   // For LCD subpixel, FreeType returns bitmap.width as 3x the pixel width (RGB channels laid out
   // horizontally), so we divide by the channel count. But BGRA color bitmaps (Apple Color

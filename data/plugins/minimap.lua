@@ -59,6 +59,9 @@ local function metrics(dv)
     y = dv.position.y,
     h = dv.size.y,
     max_cols = math.floor(width / col_w),
+    -- cap tokens drawn per line: a minified line is one huge token and
+    -- would otherwise be rasterised in full every frame (see draw loop)
+    char_budget = math.floor(width / math.max(1, col_w)) * 4,
   }
 end
 
@@ -143,9 +146,14 @@ local function draw_minimap(dv)
       if tiny then
         -- scaled-down real glyphs, token colours included (Sublime's look)
         local tx = m.x
+        -- A minified line is a single giant token; drawing it whole makes
+        -- draw_text rasterise the entire line every frame. Cut each token
+        -- to what the minimap strip can actually show first.
+        local budget = m.char_budget or 512
         for _, type_, tok in doc.highlighter:each_token(line) do
           if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
           if tok ~= "" then
+            if #tok > budget then tok = tok:sub(1, budget) end
             common.draw_text(tiny, blob_color(type_), tok, nil, tx, y, 0, m.lh)
             tx = tx + tiny:get_width(tok)
             if tx >= m.x + m.w then break end
@@ -156,6 +164,7 @@ local function draw_minimap(dv)
       for _, type_, tok in doc.highlighter:each_token(line) do
         if cx < m.max_cols then
           if tok:byte(-1) == 10 then tok = tok:sub(1, -2) end
+          if #tok > (m.char_budget or 512) then tok = tok:sub(1, m.char_budget or 512) end
           local ws = select(2, tok:find("^%s*")) or 0
           cx = cx + ws
           local body = tok:sub(ws + 1)
