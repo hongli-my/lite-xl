@@ -380,9 +380,12 @@ void rencache_end_frame(RenWindow *window_renderer) {
     rect_buf_overflow = false;
   }
 
-  RenSurface rs = renwin_get_surface(window_renderer);
   bool gpu_presented = false;
   bool gpu_begin_failed = false;
+#ifndef LITE_USE_GPU_RENDERER
+  (void)gpu_presented; (void)gpu_begin_failed;
+  RenSurface rs = renwin_get_surface(window_renderer);
+#endif
 #ifdef LITE_USE_GPU_RENDERER
   if (window_renderer->gpu_state && rect_count > 0) {
     /* ---- GPU path: replay commands as GPU draw calls ---- */
@@ -438,7 +441,8 @@ void rencache_end_frame(RenWindow *window_renderer) {
   (void)gpu_presented;
   (void)gpu_begin_failed;
 #endif
-  /* ---- CPU path (fallback) ---- */
+#ifndef LITE_USE_GPU_RENDERER
+  /* ---- CPU path (only built without the GPU renderer) ---- */
   for (int i = 0; i < rect_count; i++) {
     /* draw */
     RenRect r = rect_buf[i];
@@ -477,23 +481,24 @@ void rencache_end_frame(RenWindow *window_renderer) {
       ren_draw_rect(&rs, r, color);
     }
   }
+#endif /* LITE_USE_GPU_RENDERER */
 
   /* update dirty rects (CPU path only; GPU path presents in gpu_end_frame).
-   * When a GPU backend owns the window there is no SDL renderer/texture
-   * (see setup_renderer), so a failed gpu_begin_frame can only redraw into
-   * the surface -- presenting it is impossible. Invalidate so the next frame
-   * retries the GPU path instead of crashing on the NULL texture.
-   * NB: only invalidate on an actual begin failure -- idle frames
+   * With the GPU renderer the CPU replay is not built: a failed
+   * gpu_begin_frame leaves the previous frame in the render target and
+   * invalidates the cell grid so the next frame redraws everything and
+   * retries. NB: only invalidate on an actual begin failure -- idle frames
    * (rect_count == 0) must not trigger a full redraw loop. */
-  bool gpu_owns_window = false;
-#ifdef LITE_USE_GPU_RENDERER
-  gpu_owns_window = window_renderer->gpu_state != NULL;
-#endif
-  if (!gpu_presented && !gpu_owns_window && rect_count > 0) {
+#ifndef LITE_USE_GPU_RENDERER
+  if (rect_count > 0) {
     ren_update_rects(window_renderer, rect_buf, rect_count);
-  } else if (gpu_begin_failed) {
+  }
+#else
+  (void)gpu_presented;
+  if (gpu_begin_failed) {
     rencache_invalidate();
   }
+#endif
 
   /* swap cell buffer and reset */
   unsigned *tmp = cells;

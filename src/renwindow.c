@@ -51,6 +51,16 @@ static void setup_renderer(RenWindow *ren, int w, int h) {
 void renwin_init_surface(RenWindow *ren) {
   ren->scale_x = ren->scale_y = 1;
 #ifdef LITE_USE_SDL_RENDERER
+#ifdef LITE_USE_GPU_RENDERER
+  /* With the GPU renderer attached there is no CPU presentation path:
+   * do not allocate the backing store. The GPU path reads the scale from
+   * rensurface.scale and the pixel size from SDL_GetWindowSizeInPixels. */
+  if (ren->gpu_state) {
+    ren->rensurface.surface = NULL;
+    ren->rensurface.scale = query_surface_scale(ren);
+    return;
+  }
+#endif
   if (ren->rensurface.surface) {
     SDL_DestroySurface(ren->rensurface.surface);
   }
@@ -79,12 +89,14 @@ static RenRect scaled_rect(const RenRect rect, const int scale) {
 
 
 void renwin_clip_to_surface(RenWindow *ren) {
-  SDL_SetSurfaceClipRect(renwin_get_surface(ren).surface, NULL);
+  SDL_Surface *surf = renwin_get_surface(ren).surface;
+  if (surf) SDL_SetSurfaceClipRect(surf, NULL);
 }
 
 
 void renwin_set_clip_rect(RenWindow *ren, RenRect rect) {
   RenSurface rs = renwin_get_surface(ren);
+  if (!rs.surface) return;
   RenRect sr = scaled_rect(rect, rs.scale);
   SDL_SetSurfaceClipRect(rs.surface, &(SDL_Rect){.x = sr.x, .y = sr.y, .w = sr.width, .h = sr.height});
 }
@@ -105,6 +117,15 @@ RenSurface renwin_get_surface(RenWindow *ren) {
 
 void renwin_resize_surface(RenWindow *ren) {
 #ifdef LITE_USE_SDL_RENDERER
+#ifdef LITE_USE_GPU_RENDERER
+  if (ren->gpu_state) {
+    /* No backing store; just keep the scale current and drop the GPU
+     * render-target-sized resources for rebuild on the next frame. */
+    ren->rensurface.scale = query_surface_scale(ren);
+    gpu_window_resize(ren);
+    return;
+  }
+#endif
   int new_w, new_h, new_scale;
   SDL_GetWindowSizeInPixels(ren->window, &new_w, &new_h);
   new_scale = query_surface_scale(ren);
@@ -118,9 +139,9 @@ void renwin_resize_surface(RenWindow *ren) {
   }
 #endif
 #ifdef LITE_USE_GPU_RENDERER
-  /* The staging texture / transfer buffer are sized to the surface; drop
-   * them so they get recreated on the next present. */
+#ifndef LITE_USE_SDL_RENDERER
   if (ren->gpu_state) gpu_window_resize(ren);
+#endif
 #endif
 }
 

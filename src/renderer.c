@@ -1177,6 +1177,15 @@ void ren_set_clip_rect(RenWindow *window_renderer, RenRect rect) {
 
 
 void ren_get_size(RenWindow *window_renderer, int *x, int *y) {
+#ifdef LITE_USE_GPU_RENDERER
+  /* No CPU backing store with the GPU renderer: size comes from the window. */
+  if (window_renderer->gpu_state) {
+    SDL_GetWindowSizeInPixels(window_renderer->window, x, y);
+    const int scale = renwin_get_surface(window_renderer).scale;
+    if (scale > 0) { *x /= scale; *y /= scale; }
+    return;
+  }
+#endif
   RenSurface rs = renwin_get_surface(window_renderer);
   *x = rs.surface->w;
   *y = rs.surface->h;

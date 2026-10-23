@@ -675,8 +675,8 @@ bool gpu_begin_frame(RenWindow *ren) {
   if (!g_ctx.device || !ren || !ren->gpu_state) return false;
   GpuWindowState *s = ren->gpu_state;
 
-  RenSurface rs = renwin_get_surface(ren);
-  int w = rs.surface->w, h = rs.surface->h;
+  int w, h;
+  SDL_GetWindowSizeInPixels(ren->window, &w, &h);
   if (!ensure_resources(s, w, h)) { fprintf(stderr, "[gpu] begin_frame: ensure_resources FAILED\n"); return false; }
 
   g_frame_count++;

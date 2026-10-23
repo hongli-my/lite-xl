@@ -57,9 +57,13 @@ lite_cargs = [
 if get_option('renderer') or host_machine.system() == 'darwin'
     lite_cargs += '-DLITE_USE_SDL_RENDERER'
 endif
-# Experimental SDL_gpu presentation backend (macOS/Metal). When enabled the
-# software surface is still the drawing target; only the final present step
+# SDL_gpu presentation backend (macOS/Metal). When enabled the software
+# surface is still the drawing target; only the final present step
 # goes through SDL_gpu. See src/gpu_renderer.c.
+# The CPU presentation fallback is not built in this configuration.
+if get_option('gpu_renderer') and host_machine.system() != 'darwin'
+    error('gpu_renderer requires macOS (Metal). Configure with -Dgpu_renderer=false on this platform.')
+endif
 if get_option('gpu_renderer')
     lite_cargs += '-DLITE_USE_GPU_RENDERER'
 endif
