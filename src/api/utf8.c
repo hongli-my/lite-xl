@@ -1311,3 +1311,40 @@ int luaopen_utf8extra (lua_State *L) {
 
   return 1;
 }
+
+/* ------------------------------------------------------------------------ */
+/* Exports for the merged Lua-pattern matcher (src/api/tokenizer_c.c).
+   Kept tiny on purpose: full pattern semantics stay owned by this file. */
+
+const char *lite_utf8_decode(const char *s, const char *e, utfint *ch) {
+  /* Boundary-safe variant of the static utf8_decode above: callers hold
+     (pointer, end) spans that are not NUL-terminated, so continuation-byte
+     reads must be checked against `e`. Semantics otherwise identical
+     (non-strict, same limits table, same return convention). */
+  static const utfint limits[] =
+  {~0u, 0x80u, 0x800u, 0x10000u, 0x200000u, 0x4000000u};
+  if (s >= e) return NULL;
+  unsigned int c = (unsigned char)s[0];
+  utfint res = 0;
+  if (c < 0x80) {
+    res = c;
+  } else {
+    int count = 0;
+    for (; c & 0x40; c <<= 1) {
+      if (s + count + 1 >= e) return NULL;  /* span ends mid-sequence */
+      unsigned int cc = (unsigned char)s[++count];
+      if ((cc & 0xC0) != 0x80) return NULL;
+      res = (res << 6) | (cc & 0x3F);
+    }
+    res |= ((utfint)(c & 0x7F) << (count * 5));
+    if (count > 5 || res > UTF8_MAX || res < limits[count])
+      return NULL;
+    s += count;
+  }
+  if (ch) *ch = res;
+  return s + 1;
+}
+
+int lite_utf8_match_class(utfint ch, utfint cl) {
+  return match_class(ch, cl);
+}

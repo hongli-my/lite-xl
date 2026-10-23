@@ -10,6 +10,15 @@ local config = {}
 ---@type number
 config.fps = 60
 
+---Use the C merged Lua-pattern matcher (Pike VM) in the tokenizer.
+---When a language pattern cannot be compiled by it (backreferences, %b, or
+---patterns that can match empty), the tokenizer automatically falls back to
+---the original Lua pattern path for that pattern.
+---
+---Defaults to true.
+---@type boolean
+config.tokenizer_c = true
+
 ---Maximum number of log items that will be stored.
 ---When the number of log items exceed this value, old items will be discarded.
 ---

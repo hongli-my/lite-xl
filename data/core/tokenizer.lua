@@ -5,6 +5,76 @@ local config = require "core.config"
 local tokenizer = {}
 local bad_patterns = {}
 
+-- Optional C merged Lua-pattern matcher (Pike VM over all patterns of a
+-- syntax at once). Patterns it cannot compile (backreferences, %b, empty
+-- matches) automatically fall back to the original Lua path below.
+local tokenizer_c = nil
+if config.tokenizer_c ~= false then
+  local ok, mod = pcall(require, "tokenizer_c")
+  if ok then tokenizer_c = mod end
+end
+
+-- compiled-program cache, keyed by syntax table (weak so syntaxes can be
+-- replaced by plugins at runtime)
+local tc_compiled = setmetatable({ }, { __mode = "k" })
+
+-- byte position of char position i (1-based); O(i), only used on cold paths
+local function char_to_byte(text, i)
+  return #text:usub(1, i - 1) + 1
+end
+
+-- Byte offsets of the most recent tokenizer_c match, set by the C paths and
+-- consumed immediately by the caller that advances `i`.
+local last_match_sb, last_match_eb
+
+-- Compile a syntax's Lua patterns for the C matcher. Mirrors find_text's
+-- lazy '^' normalization upfront (idempotent), and compiles each table
+-- pattern's close part into a standalone program for delimiter searches.
+local function tc_compile(syn)
+  if not tokenizer_c or config.tokenizer_c == false then return nil end
+  local comp = tc_compiled[syn]
+  if comp then return comp end
+  local opens, pos1 = { }, { }
+  local count = 0
+  for n, p in ipairs(syn.patterns) do
+    local target = p.pattern
+    opens[n], pos1[n] = false, false
+    local okpat = not p.disabled and not p.regex and (
+      type(target) == "string" or
+      (type(target) == "table" and type(target[1]) == "string"
+        and type(target[2]) == "string"))
+    if okpat then
+      p.whole_line = p.whole_line or { }
+      local parts = type(target) == "table"
+        and { target[1], target[2] } or { target }
+      for pi = 1, #parts do
+        local code = parts[pi]
+        if p.whole_line[pi] == nil then
+          p.whole_line[pi] = code:umatch("^%^") and true or false
+          if p.whole_line[pi] then code = code:usub(2) end
+        end
+        parts[pi] = code
+      end
+      if type(target) == "table" then
+        target[1], target[2] = parts[1], parts[2]
+        p._tc = tokenizer_c.compile(parts[2])
+      else
+        p.pattern = parts[1]
+      end
+      opens[n] = parts[1]
+      pos1[n] = p.whole_line[1] and true or false
+      count = count + 1
+    end
+  end
+  local set, supported = nil, { }
+  if count > 0 then
+    set, supported = tokenizer_c.compile_set(opens, pos1)
+  end
+  comp = { set = set, supported = supported }
+  tc_compiled[syn] = comp
+  return comp
+end
+
 local function push_token(t, type, text)
   if not text or #text == 0 then return end
   type = type or "normal"
@@ -20,7 +90,26 @@ local function push_token(t, type, text)
 end
 
 
-local function push_tokens(t, syn, pattern, full_text, find_results)
+-- Advance a byte position by n characters from a known anchor; O(n).
+local function advance_bytes(text, b, n)
+  for _ = 1, n do
+    local c = string.byte(text, b)
+    if not c then break end
+    if c < 0x80 or c < 0xC0 then b = b + 1
+    elseif c < 0xE0 then b = b + 2
+    elseif c < 0xF0 then b = b + 3
+    else b = b + 4 end
+  end
+  return b
+end
+
+-- Convert a char position to a byte position incrementally from a known
+-- (char, byte) anchor; O(char_pos - anchor_char).
+local function char_to_byte_at(text, char_pos, anchor_char, anchor_byte)
+  return advance_bytes(text, anchor_byte, char_pos - anchor_char)
+end
+
+local function push_tokens(t, syn, pattern, full_text, find_results, anchor_char, anchor_byte)
   if #find_results > 2 then
     -- We do some manipulation with find_results so that it's arranged
     -- like this:
@@ -33,20 +122,27 @@ local function push_tokens(t, syn, pattern, full_text, find_results)
     -- Copy the ending index to the end of the table, so that an ending index
     -- always follows a starting index after position 3 in the table.
     table.insert(find_results, find_results[2] + 1)
+    -- Convert char positions to byte positions incrementally from the anchor
+    local byte_pos = { }
+    for i = 3, #find_results do
+      byte_pos[i - 2] = char_to_byte_at(full_text, find_results[i], anchor_char, anchor_byte)
+    end
     -- Then, we just iterate over our modified table.
     for i = 3, #find_results - 1 do
-      local start = find_results[i]
-      local fin = find_results[i + 1] - 1
+      local start = byte_pos[i - 2]
+      local fin = byte_pos[i - 1] - 1
       local type = pattern.type[i - 2]
         -- ↑ (i - 2) to convert from [3; n] to [1; n]
       if fin >= start then
-        local text = full_text:usub(start, fin)
+        local text = full_text:sub(start, fin)
         push_token(t, syn.symbols[text] or type, text)
       end
     end
   else
     local start, fin = find_results[1], find_results[2]
-    local text = full_text:usub(start, fin)
+    local bs = char_to_byte_at(full_text, start, anchor_char, anchor_byte)
+    local be = char_to_byte_at(full_text, fin + 1, anchor_char, anchor_byte) - 1
+    local text = full_text:sub(bs, be)
     push_token(t, syn.symbols[text] or pattern.type, text)
   end
 end
@@ -134,6 +230,7 @@ end
 function tokenizer.tokenize(incoming_syntax, text, state, resume)
   local res
   local i = 1
+  local byte_i = 1
 
   state = state or string.char(0)
 
@@ -150,6 +247,7 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
     end
     i = resume.i
     state = resume.state
+    byte_i = resume.byte_i or char_to_byte(text, i)
   end
 
   res = res or {}
@@ -199,7 +297,7 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
       retrieve_syntax_state(incoming_syntax, state)
   end
 
-  local function find_text(text, p, offset, at_start, close)
+  local function find_text(text, p, offset, at_start, close, byte_offset)
     local target, res = p.pattern or p.regex, { 1, offset - 1 }
     local p_idx = close and 2 or 1
     local code = type(target) == "table" and target[p_idx] or target
@@ -227,6 +325,56 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
       code = p._regex
     end
 
+    -- C merged-matcher path for close-delimiter searches. Mirrors the
+    -- escaped-start check above (bug-compatible: an offset right after an
+    -- odd number of escape characters gives up without searching further)
+    -- and the escaped-match retry of the repeat loop below.
+    if close and p._tc then
+      if type(target) == "table" and target[3] then
+        local count = 0
+        local jb = (byte_offset or char_to_byte(text, offset)) - 1
+        while jb >= 1 do
+          if string.byte(text, jb) ~= target[3]:ubyte(1) then break end
+          count = count + 1
+          jb = jb - 1
+        end
+        if count % 2 == 1 then return end
+      end
+      local esc = type(target) == "table" and target[3] or nil
+      local next_pos = offset
+      local next_byte = byte_offset or char_to_byte(text, offset)
+      while true do
+        if p.whole_line[p_idx] and next_pos > 1 then return end
+        local r = table.pack(tokenizer_c.search(p._tc, text, next_byte, next_pos,
+          at_start or p.whole_line[p_idx] or false))
+        if r[1] == nil then return end
+        last_match_sb, last_match_eb = r[3] + 1, r[4] + 1
+        if not esc then return r[1], r[2], table.unpack(r, 5, r.n) end
+        local count = 0
+        local jb = r[3]
+        while jb >= 1 do
+          if string.byte(text, jb) ~= esc:ubyte(1) then break end
+          count = count + 1
+          jb = jb - 1
+        end
+        if count % 2 == 0 then
+          return r[1], r[2], table.unpack(r, 5, r.n)
+        elseif at_start then
+          return
+        end
+        next_pos = r[2] + 1
+        next_byte = r[4] + 1
+      end
+    end
+
+    -- byte-position anchor for O(1) regex offsets instead of ucharpos/ulen
+    -- rescans from the start of the line (quadratic on long lines)
+    local anchor_byte = byte_offset or char_to_byte(text, offset)
+    -- (search_char, search_byte) track the current search start: the regex
+    -- is searched from a byte offset while char results are derived by
+    -- counting lead bytes incrementally from this anchor.
+    local search_byte, search_char = anchor_byte, offset
+
     repeat
       local next = res[2] + 1
       -- If the pattern contained '^', allow matching only the whole line
@@ -234,24 +382,39 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
         return
       end
       res = p.pattern and { text:ufind((at_start or p.whole_line[p_idx]) and "^" .. code or code, next) }
-        or { regex.find(code, text, text:ucharpos(next), (at_start or p.whole_line[p_idx]) and regex.ANCHORED or 0) }
+        or { regex.find(code, text, search_byte, (at_start or p.whole_line[p_idx]) and regex.ANCHORED or 0) }
       if p.regex and #res > 0 then -- set correct utf8 len for regex result
-        local char_pos_1 = res[1] > next and string.ulen(text:sub(1, res[1])) or next
-        local char_pos_2 = string.ulen(text:sub(1, res[2]))
+        last_match_eb = res[2] + 1 -- byte end (before char conversion below)
+        -- count chars incrementally from the anchor instead of ulen(text:sub(1, x))
+        local function chars_to(byte_pos)
+          local n = 0
+          for b = search_byte, byte_pos - 1 do
+            local c = string.byte(text, b)
+            if c < 0x80 or c >= 0xC0 then n = n + 1 end
+          end
+          return n
+        end
+        local char_pos_1 = res[1] > search_byte and (search_char + chars_to(res[1])) or next
+        local char_pos_2 = search_char + chars_to(res[2])
         for i=3,#res do
-          res[i] = string.ulen(text:sub(1, res[i] - 1)) + 1
+          res[i] = search_char + chars_to(res[i])
         end
         res[1] = char_pos_1
         res[2] = char_pos_2
       end
       if not res[1] then return end
+      if not p.regex then
+        last_match_eb = advance_bytes(text, anchor_byte, res[2] - offset + 1)
+      end
       if res[1] and target[3] then
         -- Check to see if the escaped character is there,
         -- and if it is not itself escaped.
         local count = 0
-        for i = res[1] - 1, 1, -1 do
-          if text:ubyte(i) ~= target[3]:ubyte() then break end
+        local jb = advance_bytes(text, anchor_byte, res[1] - offset) - 1
+        while jb >= 1 do
+          if string.byte(text, jb) ~= target[3]:ubyte(1) then break end
           count = count + 1
+          jb = jb - 1
         end
         if count % 2 == 0 then
           -- The match is not escaped, so confirm it
@@ -259,6 +422,8 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
         else
           -- The match is escaped, so avoid it
           res[1] = false
+          search_byte = last_match_eb
+          search_char = res[2] + 1
         end
       end
     until at_start or not close or not target[3]
@@ -274,19 +439,21 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
       starting_i = i
       if system.get_time() - start_time > 0.5 / config.fps then
         -- We're out of time
-        push_token(res, "incomplete", string.usub(text, i))
+        push_token(res, "incomplete", text:sub(byte_i))
         return res, string.char(0), {
           res = res,
           i = i,
-          state = state
+          state = state,
+          byte_i = byte_i,
         }
       end
     end
     -- continue trying to match the end pattern of a pair if we have a state set
     if current_pattern_idx > 0 then
       local p = current_syntax.patterns[current_pattern_idx]
-      local find_results = { find_text(text, p, i, false, true) }
+      local find_results = { find_text(text, p, i, false, true, byte_i) }
       local s, e = find_results[1], find_results[2]
+      local p_sb, p_eb = last_match_sb, last_match_eb
       -- Use the first token type specified in the type table for the "middle"
       -- part of the subsyntax.
       local token_type = type(p.type) == "table" and p.type[1] or p.type
@@ -296,7 +463,8 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
       -- first, before the found delimeter, as ending the subsyntax takes
       -- precedence over ending the delimiter in the subsyntax.
       if subsyntax_info then
-        local ss, se = find_text(text, subsyntax_info, i, false, true)
+        local ss, se = find_text(text, subsyntax_info, i, false, true, byte_i)
+        local ss_sb, ss_eb = last_match_sb, last_match_eb
         -- If we find that we end the subsyntax before the
         -- delimiter, push the token, and signal we shouldn't
         -- treat the bit after as a token to be normally parsed
@@ -304,6 +472,7 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
         if ss and (s == nil or ss < s) then
           push_token(res, token_type, text:usub(i, ss - 1))
           i = ss
+          byte_i = ss_sb or char_to_byte(text, i)
           cont = false
         end
       end
@@ -316,11 +485,12 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
             push_token(res, token_type, text:usub(i, s - 1))
           end
           -- Push the end delimiter
-          push_tokens(res, current_syntax, p, text, find_results)
+          push_tokens(res, current_syntax, p, text, find_results, i, byte_i)
           set_subsyntax_pattern_idx(0)
           i = e + 1
+          byte_i = p_eb or char_to_byte(text, i)
         else
-          push_token(res, token_type, text:usub(i))
+          push_token(res, token_type, text:sub(byte_i))
           break
         end
       end
@@ -329,13 +499,14 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
     -- we're ending early in the middle of a delimiter, or
     -- just normally, upon finding a token.
     while subsyntax_info do
-      local find_results = { find_text(text, subsyntax_info, i, true, true) }
+      local find_results = { find_text(text, subsyntax_info, i, true, true, byte_i) }
       local s, e = find_results[1], find_results[2]
       if s then
-        push_tokens(res, current_syntax, subsyntax_info, text, find_results)
+        push_tokens(res, current_syntax, subsyntax_info, text, find_results, i, byte_i)
         -- On finding unescaped delimiter, pop it.
         pop_subsyntax()
         i = e + 1
+        byte_i = last_match_eb or char_to_byte(text, i)
       else
         break
       end
@@ -343,54 +514,128 @@ function tokenizer.tokenize(incoming_syntax, text, state, resume)
 
     -- find matching pattern
     local matched = false
-    for n, p in ipairs(current_syntax.patterns) do
-      local find_results = { find_text(text, p, i, true, false) }
-      if find_results[1] then
-        -- Check for patterns successfully matching nothing
-        if find_results[1] > find_results[2] then
-          report_bad_pattern(core.warn, current_syntax, n,
-              "Pattern successfully matched, but nothing was captured.")
-          goto continue
-        end
-
-        -- Check for patterns with mismatching number of `types`
-        local type_is_table = type(p.type) == "table"
-        local n_types = type_is_table and #p.type or 1
-        if #find_results == 2 and type_is_table then
-          report_bad_pattern(core.warn, current_syntax, n,
-            "Token type is a table, but a string was expected.")
-          p.type = p.type[1]
-        elseif #find_results - 1 > n_types then
-          report_bad_pattern(core.error, current_syntax, n,
-            "Not enough token types: got %d needed %d.", n_types, #find_results - 1)
-        elseif #find_results - 1 < n_types then
-          report_bad_pattern(core.warn, current_syntax, n,
-            "Too many token types: got %d needed %d.", n_types, #find_results - 1)
-        end
-
-        -- matched pattern; make and add tokens
-        push_tokens(res, current_syntax, p, text, find_results)
-        -- update state if this was a start|end pattern pair
-        if type(p.pattern or p.regex) == "table" then
-          -- If we have a subsyntax, push that onto the subsyntax stack.
-          if p.syntax then
-            push_subsyntax(p, n)
-          else
-            set_subsyntax_pattern_idx(n)
+    last_match_sb, last_match_eb = nil, nil
+    local find_results, matched_n, matched_p
+    local comp = tc_compile(current_syntax)
+    if comp and comp.set then
+      -- C merged matcher: match_set answers "best supported match from
+      -- `from` onward" in one pass; regex / uncompilable / disabled
+      -- patterns keep their original relative order and run between
+      -- `from` and the C winner exactly as the loop below would.
+      local from, rejected, wlen = 1, false, nil
+      repeat
+        rejected = false
+        find_results = nil
+        local r = table.pack(tokenizer_c.match_set(comp.set, text, byte_i, i, i == 1, from))
+        local widx = r[1]
+        if not widx then wlen = r[2] end
+        for k = from, (widx or #current_syntax.patterns + 1) - 1 do
+          if not comp.supported[k] then
+            local pk = current_syntax.patterns[k]
+            if not pk.disabled then
+              local fr = { find_text(text, pk, i, true, false, byte_i) }
+              if fr[1] then
+                find_results, matched_n, matched_p = fr, k, pk
+                break
+              end
+            end
           end
         end
-        -- move cursor past this token
-        i = find_results[2] + 1
+        if not find_results and widx then
+          local wp = current_syntax.patterns[widx]
+          local target = wp.pattern
+          local esc = type(target) == "table" and target[3] or nil
+          local escaped = false
+          if esc then
+            -- mirror find_text's escaped-open check
+            local count = 0
+            local jb = r[4] -- 1-based byte of the char before r[2]
+            while jb >= 1 do
+              if string.byte(text, jb) ~= esc:ubyte(1) then break end
+              count = count + 1
+              jb = jb - 1
+            end
+            escaped = count % 2 == 1
+          end
+          if wp.disabled or escaped then
+            from, rejected = widx + 1, true
+          else
+            find_results = { r[2], r[3], table.unpack(r, 6, r.n) }
+            matched_n, matched_p = widx, wp
+            last_match_sb, last_match_eb = r[4] + 1, r[5] + 1
+          end
+        end
+        if find_results and find_results[1] > find_results[2] then
+          report_bad_pattern(core.warn, current_syntax, matched_n,
+              "Pattern successfully matched, but nothing was captured.")
+          find_results = nil
+          from, rejected = matched_n + 1, true
+        end
+      until not rejected
+      if not find_results and wlen then
+        -- no pattern matched at this position: consume one character
+        local bw = advance_bytes(text, byte_i, 1) - byte_i
+        push_token(res, "normal", text:sub(byte_i, byte_i + bw - 1))
+        i = i + 1
+        byte_i = byte_i + bw
         matched = true
-        break
-        ::continue::
       end
+    else
+      -- original per-pattern loop (fallback when the C matcher is off or
+      -- compiled nothing for this syntax)
+      for n, p in ipairs(current_syntax.patterns) do
+        local fr = { find_text(text, p, i, true, false, byte_i) }
+        if fr[1] then
+          if fr[1] > fr[2] then
+            report_bad_pattern(core.warn, current_syntax, n,
+              "Pattern successfully matched, but nothing was captured.")
+          else
+            find_results, matched_n, matched_p = fr, n, p
+            break
+          end
+        end
+      end
+    end
+
+    if find_results then
+      local p = matched_p
+      -- Check for patterns with mismatching number of `types`
+      local type_is_table = type(p.type) == "table"
+      local n_types = type_is_table and #p.type or 1
+      if #find_results == 2 and type_is_table then
+        report_bad_pattern(core.warn, current_syntax, matched_n,
+          "Token type is a table, but a string was expected.")
+        p.type = p.type[1]
+      elseif #find_results - 1 > n_types then
+        report_bad_pattern(core.error, current_syntax, matched_n,
+          "Not enough token types: got %d needed %d.", n_types, #find_results - 1)
+      elseif #find_results - 1 < n_types then
+        report_bad_pattern(core.warn, current_syntax, matched_n,
+          "Too many token types: got %d needed %d.", n_types, #find_results - 1)
+      end
+
+      -- matched pattern; make and add tokens
+      push_tokens(res, current_syntax, p, text, find_results, i, byte_i)
+      -- update state if this was a start|end pattern pair
+      if type(p.pattern or p.regex) == "table" then
+        -- If we have a subsyntax, push that onto the subsyntax stack.
+        if p.syntax then
+          push_subsyntax(p, matched_n)
+        else
+          set_subsyntax_pattern_idx(matched_n)
+        end
+      end
+      -- move cursor past this token
+      i = find_results[2] + 1
+      byte_i = last_match_eb or char_to_byte(text, i)
+      matched = true
     end
 
     -- consume character if we didn't match
     if not matched then
       push_token(res, "normal", text:usub(i, i))
       i = i + 1
+      byte_i = char_to_byte(text, i)
     end
   end
 
