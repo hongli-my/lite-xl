@@ -457,12 +457,30 @@ end
 function Node:update_layout()
   if self.type == "leaf" then
     local av = self.active_view
+    -- Target rect of the active view within the node.
+    local tx, ty, tw, th = self.position.x, self.position.y, self.size.x, self.size.y
     if self:should_show_tabs() then
-      local _, _, _, th = self:get_tab_rect(1)
-      av.position.x, av.position.y = self.position.x, self.position.y + th
-      av.size.x, av.size.y = self.size.x, self.size.y - th
+      local _, _, _, tab_h = self:get_tab_rect(1)
+      ty, th = ty + tab_h, th - tab_h
+    end
+    -- Resizing a pane (split added / sibling closed) moves the view to a new
+    -- rect: animate the transition instead of cutting hard, which reads as
+    -- the pane "jumping". Snap (no animation) when the active view itself
+    -- changed (tab switch, new view), when the user is resizing the window
+    -- or dragging a divider (panes must track the pointer exactly), or when
+    -- the view has no rect yet. View:move_towards also snaps when
+    -- transitions are disabled globally or by name.
+    if self.layout_active_view ~= av
+        or core.root_view.layout_snap
+        or av.size.x <= 0 or av.size.y <= 0 then
+      self.layout_active_view = av
+      av.position.x, av.position.y = tx, ty
+      av.size.x, av.size.y = tw, th
     else
-      Node.copy_position_and_size(av, self)
+      av:move_towards(av.position, "x", tx, 0.35, "layout")
+      av:move_towards(av.position, "y", ty, 0.35, "layout")
+      av:move_towards(av.size, "x", tw, 0.35, "layout")
+      av:move_towards(av.size, "y", th, 0.35, "layout")
     end
   else
     local x1, y1 = self.a:get_locked_size()
@@ -679,6 +697,15 @@ function Node:draw()
     if self:should_show_tabs() then
       self:draw_tabs()
     end
+    -- While a pane resize is animating, the view rect lags behind the node
+    -- rect; paint the node area first so the growing pane does not show
+    -- stale pixels from where the closed pane used to be.
+    local nx, ny, nw, nh = self.position.x, self.position.y, self.size.x, self.size.y
+    if self:should_show_tabs() then
+      local _, _, _, tab_h = self:get_tab_rect(1)
+      ny, nh = ny + tab_h, nh - tab_h
+    end
+    renderer.draw_rect(nx, ny, nw, nh, style.background)
     local pos, size = self.active_view.position, self.active_view.size
     core.push_clip_rect(pos.x, pos.y, size.x, size.y)
     self.active_view:draw()

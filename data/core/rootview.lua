@@ -531,6 +531,16 @@ end
 
 function RootView:update()
   Node.copy_position_and_size(self.root_node, self)
+  -- Snap the pane layout (skip the resize animation) while the window is
+  -- being resized or a divider is being dragged, so the panes track the
+  -- pointer exactly instead of easing behind it.
+  local snap = self.dragged_divider ~= nil
+  if self.root_node.size.x ~= (self._layout_w or -1)
+      or self.root_node.size.y ~= (self._layout_h or -1) then
+    snap = true
+  end
+  self._layout_w, self._layout_h = self.root_node.size.x, self.root_node.size.y
+  self.layout_snap = snap
   self.root_node:update()
   self.root_node:update_layout()
 
