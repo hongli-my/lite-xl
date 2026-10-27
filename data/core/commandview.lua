@@ -388,8 +388,7 @@ end
 ---Draws `text` with the bytes marked in `hits` bright and the rest dim,
 ---sublime-style match highlighting.  Groups consecutive same-style runs so a
 ---filename costs a handful of draw calls.
-local function draw_text_with_hits(font, text, hits, x, y)
-  local base, hit_col = style.dim, style.chrome_text or style.text
+local function draw_text_with_hits(font, text, hits, x, y, base_color, hit_color)
   local run_start, run_hit, cx = 1, nil, x
   local pos, len = 1, #text
   while pos <= len do
@@ -401,14 +400,14 @@ local function draw_text_with_hits(font, text, hits, x, y)
     if run_hit == nil then run_hit = char_hit end
     if char_hit ~= run_hit then
       local run = text:sub(run_start, pos - 1)
-      common.draw_text(font, run_hit and hit_col or base, run, nil, cx, y, 0, 0)
+      common.draw_text(font, run_hit and hit_color or base_color, run, nil, cx, y, 0, 0)
       cx = cx + font:get_width(run)
       run_start, run_hit = pos, char_hit
     end
     pos = pos + n
   end
   if run_start <= len then
-    common.draw_text(font, run_hit and hit_col or base, text:sub(run_start), nil, cx, y, 0, 0)
+    common.draw_text(font, run_hit and hit_color or base_color, text:sub(run_start), nil, cx, y, 0, 0)
   end
 end
 
@@ -423,6 +422,47 @@ local function blend(a, b, t)
   }
 end
 
+---Relative luminance of an {r,g,b,a} colour (0-255), for WCAG contrast math.
+local function rel_luminance(color)
+  local function channel(v)
+    v = v / 255
+    if v <= 0.04045 then return v / 12.92 end
+    return ((v + 0.055) / 1.055) ^ 2.4
+  end
+  return 0.2126 * channel(color[1]) + 0.7152 * channel(color[2]) + 0.0722 * channel(color[3])
+end
+
+---WCAG contrast ratio between two colours.
+local function contrast_ratio(a, b)
+  local la, lb = rel_luminance(a), rel_luminance(b)
+  if la < lb then la, lb = lb, la end
+  return (la + 0.05) / (lb + 0.05)
+end
+
+---Returns `color` shifted toward white/black until it reaches at least
+---`target`:1 contrast on `bg` (best effort if the surface itself is extreme).
+---Theme roles like style.text and style.dim are tuned against the editor
+---background, not the command palette surface, so borrowed roles can land
+---below readable contrast on the palette (style.dim on background3 is ~2:1 in
+---the default theme); this keeps the palette legible in every theme.
+local function ensure_contrast(color, bg, target)
+  if contrast_ratio(color, bg) >= target then
+    return color
+  end
+  local white, black = { 255, 255, 255, 255 }, { 0, 0, 0, 255 }
+  -- shift away from the surface luminance first; on mid-grey surfaces only
+  -- one direction can reach the target (white and black cap out at ~2.6:1
+  -- there), so fall back to the other direction when the first one fails
+  local function clamp_toward(goal)
+    for i = 1, 32 do
+      local clamped = blend(color, goal, i / 32)
+      if contrast_ratio(clamped, bg) >= target then return clamped end
+    end
+  end
+  local goal = rel_luminance(color) >= rel_luminance(bg) and white or black
+  return clamp_toward(goal) or clamp_toward(goal == white and black or white) or color
+end
+
 local function draw_suggestions_box(self)
   local lh = self:get_suggestion_line_height()
   local dh = style.divider_size
@@ -431,42 +471,61 @@ local function draw_suggestions_box(self)
   local rx, ry, rw, rh = self.position.x, self.position.y - h - dh, self.size.x, h
 
   core.push_clip_rect(rx, ry, rw, rh)
+
+  -- Palette text colours.  Unselected rows use the regular chrome text colour
+  -- instead of style.accent: accent is an emphasis role whose value ranges
+  -- from near-white to lime across themes, which rendered whole suggestion
+  -- lists unreadable (1.4:1 on the light slate palette).  The accent is now
+  -- reserved for the selection band, like in the tab bar.  Both row colours
+  -- are clamped to readable contrast on background3, since themes tune
+  -- style.text/style.dim against the editor background, not the palette.
+  local content = ensure_contrast(style.chrome_text or style.text, style.background3, 4.5)
+  local secondary = ensure_contrast(style.dim, style.background3, 4.5)
+  -- the selected row follows the accent colour instead of style.line_highlight,
+  -- which is tuned for the editor background and turns into a dark band on a
+  -- light command palette
+  local band = blend(style.background3, style.accent, 0.3)
+  -- the band shifts the surface, so re-clamp the row colours against it; in
+  -- dark themes this brightens the selected row, marking it beyond the band
+  local sel_content = ensure_contrast(content, band, 4.5)
+  local sel_secondary = ensure_contrast(secondary, band, 4.5)
+
   -- draw suggestions background
   if #self.suggestions > 0 then
     renderer.draw_rect(rx, ry, rw, rh, style.background3)
     renderer.draw_rect(rx, ry - dh, rw, dh, style.divider)
-    -- the selected row follows the accent colour instead of style.line_highlight,
-    -- which is tuned for the editor background and turns into a dark band on a
-    -- light command palette
     local y = self.position.y - self.selection_offset - dh
-    renderer.draw_rect(rx, y, rw, lh, blend(style.background3, style.accent, 0.25))
+    renderer.draw_rect(rx, y, rw, lh, band)
   end
 
   -- draw suggestion text
   local first = math.max(self.suggestions_offset, 1)
   local last = math.min(self.suggestions_offset + config.max_visible_commands, #self.suggestions)
-  for i=first, last do
+  for i = first, last do
     local item = self.suggestions[i]
-    local color = style.accent
+    local selected = i == self.suggestion_idx
+    local text_color = selected and sel_content or content
+    local dim_color = selected and sel_secondary or secondary
     local y = self.position.y - (i - first + 1) * lh - dh
     -- optional leading file-type icon (Nerd Font glyph supplied by the
     -- suggestion source, e.g. the quick-open palette)
     local text_x = x
     if item.icon and style.nerd_font then
       local iw = style.nerd_font:get_width(item.icon)
-      common.draw_text(style.nerd_font, item.icon_color or style.dim,
+      common.draw_text(style.nerd_font, item.icon_color or dim_color,
         item.icon, nil, text_x, y, 0, lh)
       text_x = text_x + iw + style.padding.x / 2
     end
     if item.hits and next(item.hits) then
-      draw_text_with_hits(self:get_font(), item.text, item.hits, text_x, y)
+      draw_text_with_hits(self:get_font(), item.text, item.hits, text_x, y,
+        dim_color, text_color)
     else
-      common.draw_text(self:get_font(), color, item.text, nil, text_x, y, 0, lh)
+      common.draw_text(self:get_font(), text_color, item.text, nil, text_x, y, 0, lh)
     end
 
     if item.info then
       local w = self.size.x - x - style.padding.x
-      common.draw_text(self:get_font(), style.dim, item.info, "right", x, y, w, lh)
+      common.draw_text(self:get_font(), dim_color, item.info, "right", x, y, w, lh)
     end
   end
   core.pop_clip_rect()
