@@ -18,6 +18,8 @@
 --     toggles left of the field, right-aligned button groups, no labels):
 --     [Aa .* \b] [field ▾]      [Find] [Find Prev] [Find All]  ×
 --     [Aa .* \b] [field ▾]      [Replace] [Replace All]
+--     the row's primary action (Find / Replace All) is accent-filled so the
+--     eye lands on it first; the sibling buttons stay quiet until hovered;
 --     one at a time with Enter or the Replace button, the whole file with
 --     cmd+alt+Enter, and Find All selects every match as a multi-cursor
 --     selection so one edit rewrites all of them;
@@ -141,15 +143,24 @@ local function ensure_contrast(color, bg, target)
   return clamp_toward(goal) or clamp_toward(goal == white and black or white) or color
 end
 
--- Corner radius for the fields and buttons, in logical units (SCALE multiplies
--- it up to device pixels).  Sublime's fields are only slightly rounded.
-local RADIUS = math.max(2, math.floor(2.5 * SCALE))
+-- Corner radius scale: a two-tier system so the input field (the primary
+-- text surface) reads as slightly softer than the smaller controls inside it.
+-- Sublime uses a similar subtle distinction.  Both are SCALE-aware.
+local RADIUS_CTRL  = math.max(2, math.floor(4 * SCALE))   -- chips, buttons, mask
+local RADIUS_FIELD = math.max(3, math.floor(6 * SCALE))   -- input field + its ring
 
----Vertical padding of a row.  Must match the editor padding the core draws
----the query line with (style.padding.y), otherwise the text sits below the
----input box instead of centred in it.
+---Vertical padding of a row.  The bar is a compact toolbar, not an editor:
+---a generous 8px above and below the control band gives breathing room without
+---making the two-row stack tall.
 local function pad_v()
-  return style.padding.y
+  return math.max(6, math.floor(style.padding.y * 0.9))
+end
+
+---The unified height of every control (input field, toggle chips, buttons).
+---Comfortably taller than the raw line height so the controls don't look
+---cramped, and identical everywhere so the row reads as one coherent set.
+local function control_height(self)
+  return math.max(math.floor(24 * SCALE), self:get_line_height() + math.floor(8 * SCALE))
 end
 
 ---Fills a rectangle with rounded corners.  The renderer exposes the native
@@ -157,7 +168,7 @@ end
 ---in the fragment shader (analytically antialiased), on the CPU path it is
 ---the same quarter-circle staircase this helper used to draw in Lua.
 local function rounded_rect(x, y, w, h, color, r)
-  r = r or RADIUS
+  r = r or RADIUS_CTRL
   if not r or r < 1 or w <= 0 or h <= 0 then
     if w > 0 and h > 0 then renderer.draw_rect(x, y, w, h, color) end
     return
@@ -165,54 +176,50 @@ local function rounded_rect(x, y, w, h, color, r)
   r = math.min(r, w / 2, h / 2)
   renderer.draw_rounded_rect(x, y, w, h, r, color)
 end
--- Panel colours, in the spirit of Sublime's adaptive skin: the panel is one
--- small step away from the editor background, the query field is a second,
--- slightly larger step in the same direction and carries a hairline frame.
--- Both steps go *towards* the text colour, so the bar reads as a panel in a
--- dark theme and in a light one without hardcoding a colour -- and not as a
--- near-white stripe across the bottom of a dark editor.
--- Toggle icons are borderless and half-transparent, and a selected one gets a
--- chip behind it.
+-- Panel colours: the bar follows the *editor* surface, not the chrome.  In a
+-- dark theme the panel is one small step lighter than the editor background,
+-- the query field is a second, larger step in the same direction and carries
+-- a hairline frame — the dark, raised-input look of Sublime's find panel on a
+-- dark colour scheme.  Every step goes *towards* the text colour, so a light
+-- theme automatically inverts to a slightly-darkened panel with a step-down
+-- field, and no colour is ever hardcoded.
 local colors = {}
 local function refresh_colors()
-  -- The panel follows the *chrome* palette (background2, like the status bar
-  -- and the treeview) instead of the editor background, matching Sublime where
-  -- the find panel is light chrome even over a dark editor.  Fields are a
-  -- clear step away from the panel (white-ish on a light theme, lighter on a
-  -- dark one), and the accent is reserved for state: the focused field's ring,
-  -- the active toggle chip and the hovered button.
-  --
   -- All text colours are clamped to WCAG AA (>= 4.5:1) on every surface they
   -- are actually drawn over — the field (inner), the in-field selection band,
   -- the hovered button, and the panel/hover (inactive toggle icons).  Theme
   -- roles like style.text and style.dim are tuned against the editor
   -- background, not these surfaces, so borrowed roles can land below readable
-  -- contrast; ensure_contrast keeps every state legible.  Non-text borders and
-  -- the focus ring are clamped to >= 3:1 (WCAG 1.4.11).
-  local bg2 = style.background2 or style.background
-  local ctext = style.chrome_text or style.text
+  -- contrast; ensure_contrast keeps every state legible.  Non-text borders
+  -- and the focus ring are clamped to >= 3:1 (WCAG 1.4.11).
+  local bg = style.background
+  local ctext = style.text
   local white = { 255, 255, 255, 255 }
   local black = { 0, 0, 0, 255 }
-  local light = rel_luminance(bg2) > 0.5
+  -- Stepping toward the text colour raises the surface on a dark editor and
+  -- deepens it on a light one; the field takes a bigger step than the panel.
+  local light = rel_luminance(bg) > 0.5
 
-  colors.panel = bg2
-  -- Field surface: pure white on light chrome (Sublime's stark-white fields);
-  -- a clear step toward the text colour on dark chrome (a raised input box).
-  colors.inner = light and white or blend(bg2, ctext, 0.20)
+  colors.panel = blend(bg, ctext, light and 0.04 or 0.08)
+  colors.inner = blend(bg, ctext, light and 0.10 or 0.16)
   -- Field frame: strong enough to read as a boundary (>= 3:1 on panel).
-  colors.frame = ensure_contrast(blend(bg2, light and black or ctext, 0.40), bg2, 3.0)
+  colors.frame = ensure_contrast(blend(bg, ctext, light and 0.35 or 0.30), colors.panel, 3.0)
   -- Hover wash for inactive toggle chips.
-  colors.hover = light and blend(bg2, black, 0.08) or blend(bg2, ctext, 0.20)
-  -- Selection band inside the field: a step toward BLACK (darker than inner)
-  -- in both light and dark themes.  Light theme: a grey band on white, dark
-  -- text still readable.  Dark theme: a darker band on the raised field, light
-  -- text still readable.  (Stepping toward the text colour, as the previous
-  -- version did, made the band approach the text's luminance in dark themes
-  -- and killed the contrast.)
-  colors.selection = blend(colors.inner, black, light and 0.18 or 0.30)
-  -- Buttons share the field surface; hover picks up a subtle accent wash.
+  colors.hover = blend(bg, ctext, light and 0.10 or 0.22)
+  -- Selection band inside the field: a clear step toward the accent so it
+  -- reads as a selection, but kept faint enough that the query text still
+  -- clears AA on top of it.
+  colors.selection = blend(colors.inner, style.accent, 0.28)
+  -- Buttons share the field surface; hover picks up an accent wash.
   colors.btn = colors.inner
-  colors.btn_hover = blend(colors.btn, style.accent, light and 0.15 or 0.25)
+  colors.btn_hover = blend(colors.btn, style.accent, 0.22)
+  -- Primary action buttons ("Find", "Replace All"): the theme accent, so the
+  -- row's main action anchors the row and ties into the syntax palette.  The
+  -- label is clamped to AA over both the resting and the hovered fill.
+  colors.primary = ensure_contrast(style.accent, colors.panel, 3.0)
+  colors.primary_hover = blend(colors.primary, light and black or white, 0.15)
+  colors.primary_label = ensure_contrast(colors.inner, colors.primary, 4.5)
+  colors.primary_label = ensure_contrast(colors.primary_label, colors.primary_hover, 4.5)
   -- Main text: clamped to AA on every surface it is drawn over (field,
   -- in-field selection, and hovered button).
   colors.text = ensure_contrast(ctext, colors.inner, 4.5)
@@ -226,12 +233,17 @@ local function refresh_colors()
   colors.dim = ensure_contrast(style.dim, colors.inner, 4.5)
   colors.dim = ensure_contrast(colors.dim, colors.panel, 4.5)
   colors.dim = ensure_contrast(colors.dim, colors.hover, 4.5)
-  -- Selected toggle chip: an accent tint; the label is the field colour
-  -- clamped to AA so it reads on both dark and light accent chips.
-  colors.chip = blend(bg2, style.accent, light and 0.45 or 0.40)
+  -- Counter badge: a subdued pill behind the match count, a faint tint of
+  -- the field surface toward the frame so it reads as a distinct chip without
+  -- competing with the query text.  The dim text (normal count) is clamped
+  -- against it too.
+  colors.badge = blend(colors.inner, colors.frame, 0.22)
+  colors.dim = ensure_contrast(colors.dim, colors.badge, 4.5)
+  -- Selected toggle chip: an accent tint; the label is clamped to AA on it.
+  colors.chip = blend(colors.panel, style.accent, 0.32)
   colors.chip_label = ensure_contrast(colors.inner, colors.chip, 4.5)
   -- Focused input: the accent ring marks where the typing goes (>= 3:1).
-  colors.focus = ensure_contrast(style.accent, bg2, 3.0)
+  colors.focus = ensure_contrast(style.accent, colors.panel, 3.0)
   -- The palette the core's tokenizer draws the query with: the field holds
   -- plain text, so every token has to resolve to the field's own colour.
   colors.syntax = setmetatable({}, { __index = function() return colors.text end })
@@ -461,6 +473,15 @@ function FindField:new(kind)
   self.hovered_control = nil
   -- no scrollbars: the row is one line high and scrolls horizontally only
   self.scrollable = false
+  self:disable_wrapping()
+end
+
+---The linewrapping plugin turns wrapping on for every DocView (the fork
+---enables it by default).  A one-line field must scroll horizontally instead,
+---and a wrapped field also gets the wrap guide painted through the bar.
+function FindField:disable_wrapping()
+  self.wrapping_enabled = false
+  self.wrapped_settings = nil
 end
 
 function FindField:get_name()
@@ -499,8 +520,10 @@ function FindField:set_text(text, select)
 end
 
 ---The height of one row; the locked node holding this view reads `size.y`.
+---Derived from the unified control height plus vertical padding, so both rows
+---are the same height and the stack stays compact.
 function FindField:row_height()
-  return self:get_line_height() + pad_v() * 2
+  return control_height(self) + pad_v() * 2
 end
 
 ---Keeps the caret inside the field.  Same maths as DocView, minus the
@@ -510,8 +533,9 @@ function FindField:scroll_to_make_visible(line, col)
   local gw = self:get_gutter_width()
   local margin = 3 * self:get_font():get_width(" ")
   local xsup, xinf = xoffset + gw + margin, xoffset - margin
-  if xsup > self.scroll.x + self.size.x then
-    self.scroll.to.x = xsup - self.size.x
+  local visible_w = self.size.x - self:get_right_inset()
+  if xsup > self.scroll.x + visible_w then
+    self.scroll.to.x = xsup - visible_w
   elseif xinf < self.scroll.x then
     self.scroll.to.x = math.max(0, xinf)
   end
@@ -519,6 +543,7 @@ function FindField:scroll_to_make_visible(line, col)
 end
 
 function FindField:update()
+  if self.wrapping_enabled or self.wrapped_settings then self:disable_wrapping() end
   self:move_towards(self.size, "y", self.visible and self:row_height() or 0, 0.35)
   if not self.visible and self.size.y < 1 then
     self.scroll.x, self.scroll.to.x = 0, 0
@@ -557,36 +582,42 @@ function FindField:draw()
   local ix, iy, iw, ih, pad = self:field_geometry()
   -- Sublime brightens the border of the field that has the focus
   local ring = (core.active_view == self) and colors.focus or colors.frame
-  rounded_rect(ix - 1, iy - 1, iw + 2, ih + 2, ring, RADIUS + 1)
-  rounded_rect(ix, iy, iw, ih, colors.inner, RADIUS)
+  rounded_rect(ix - 1, iy - 1, iw + 2, ih + 2, ring, RADIUS_FIELD + 1)
+  rounded_rect(ix, iy, iw, ih, colors.inner, RADIUS_FIELD)
   self.input_box = { x = ix, y = iy, w = iw, h = ih }
   DocView.draw(self)
   -- right-aligned button group, outside the text clip (see draw_buttons)
   self:draw_buttons()
-  -- field overlay: history chevron + match counter at the right edge (Sublime
-  -- shows both inside the field); masked by a patch of the field colour so
-  -- scrolled text does not run underneath them
+  -- field overlay at the right end of the box: a hairline separator, the
+  -- history chevron and (find row only) the match counter badge.  The text
+  -- clip (get_right_inset) already stops the query before this area.
   local font = self:get_font()
   local lh = self:get_line_height()
   local ty = iy + (ih - lh) / 2
   local chev = self.field_controls and self.field_controls[1]
-  if chev and chev.x > ix + pad then
-    local counter_w = control_width(font, "00/000")
-    local mask_w = ix + iw - pad - chev.x
+  if chev and self.overlay_x and self.overlay_x > ix + pad then
     core.push_clip_rect(ix, iy, iw, ih)
-    renderer.draw_rect(chev.x + 1, iy + 1, mask_w, ih - 2, colors.inner)
-    renderer.draw_rect(chev.x + 1, iy + 1, 1, ih - 2, colors.frame)
+    local sep_inset = math.floor(ih * 0.25)
+    renderer.draw_rect(self.overlay_x, iy + sep_inset, math.max(1, math.floor(SCALE)),
+      ih - sep_inset * 2, colors.frame)
     common.draw_text(font,
       self.hovered_control == chev and colors.text or colors.dim,
       chev.text, "center", chev.x, ty, chev.w, lh)
+    local slot = self.counter_rect
     local btext, bcolor = count_badge()
-    if btext and btext ~= "" then
-      common.draw_text(font, bcolor, btext, "right",
-        chev.x + chev.w, ty, counter_w - pad, lh)
+    if self.kind == "find" and slot and btext and btext ~= "" then
+      local bpad = math.floor(style.padding.x / 2)
+      local pill_w = math.min(font:get_width(btext) + bpad * 2, slot.w)
+      local pill_h = math.min(lh, ih - 4)
+      local pill_x = slot.x + slot.w - pill_w
+      local pill_y = iy + (ih - pill_h) / 2
+      rounded_rect(pill_x, pill_y, pill_w, pill_h, colors.badge, RADIUS_CTRL)
+      common.draw_text(font, bcolor, btext, "center", pill_x, pill_y, pill_w, pill_h)
     end
     core.pop_clip_rect()
   end
-  -- hairline on top of the row, like the status bar has
+  -- hairline on top of the row: a clean edge that separates the bar from the
+  -- editor content (find row) or divides the two rows (replace row).
   renderer.draw_rect(self.position.x, self.position.y, self.size.x, style.divider_size, colors.frame)
 end
 
@@ -630,20 +661,65 @@ end
 ---same numbers and the fields get identical insets.
 local layout_cache
 local function shared_layout(font)
-  if layout_cache and layout_cache.font == font then return layout_cache end
-  local gap = math.max(4, math.floor(style.padding.x * 0.75))
+  -- cache key carries the padding too: control_width derives every width
+  -- from it, and a theme/zoom change that moves padding must not leave the
+  -- button groups measured against stale numbers
+  if layout_cache and layout_cache.font == font
+      and layout_cache.pad_x == style.padding.x then
+    return layout_cache
+  end
+  -- Spacing on a consistent 4px grid (SCALE-aware) so the three functional
+  -- groups (toggles | field | buttons) have even internal rhythm.
+  local gap = math.max(4, math.floor(4 * SCALE))
+  -- toggle chips: compact, roughly square, separated by the same gap as the
+  -- buttons (they used to touch each other, which read as one ragged strip)
   local icon_w = math.max(
-    control_width(font, "Aa"), control_width(font, ".*"),
-    control_width(font, "\\b"))
+    font:get_width("Aa"), font:get_width(".*"), font:get_width("\\b"))
+    + style.padding.x
+  icon_w = math.max(icon_w, math.floor(30 * SCALE))
   -- Sublime's panel: no text labels, the toggles sit left of the field and
-  -- each row carries its own right-aligned button group
+  -- each row carries its own right-aligned button group.  The second element
+  -- marks the row's primary action, drawn as an accent-filled button.
+  local rows = {
+    find    = { { "Find", true }, { "Find Prev" }, { "Find All" }, { "×" } },
+    replace = { { "Replace" }, { "Replace All", true } },
+  }
+  -- Equal min-width for sibling text buttons so "Find", "Find Prev",
+  -- "Replace", etc. read as a family of equal chips.
+  local max_btn_w = 0
+  for _, labels in pairs(rows) do
+    for _, pair in ipairs(labels) do
+      if pair[1] ~= "×" then
+        local w = control_width(font, pair[1])
+        if w > max_btn_w then max_btn_w = w end
+      end
+    end
+  end
+  -- The close × button is a compact square-ish chip, as wide as the toggle
+  -- icons, so the left and right chip columns read the same.
+  -- Both rows' button groups are measured here so the two input boxes can
+  -- share a single right edge (the wider group's width).  Without this each
+  -- row reserved only its own group's width, so the find and replace fields
+  -- had different right edges — the most visible misalignment.
+  local row_widths = {}
+  local max_buttons_w = 0
+  for kind, labels in pairs(rows) do
+    local w = 0
+    for _, pair in ipairs(labels) do
+      local bw = (pair[1] ~= "×") and max_btn_w or icon_w
+      w = w + bw + gap
+    end
+    w = w - gap
+    row_widths[kind] = w
+    if w > max_buttons_w then max_buttons_w = w end
+  end
   layout_cache = {
-    font = font, gap = gap, icon_w = icon_w,
-    icons_w = icon_w * 3,
-    rows = {
-      find    = { "Find", "Find Prev", "Find All", "×" },
-      replace = { "Replace", "Replace All" },
-    },
+    font = font, pad_x = style.padding.x,
+    gap = gap, icon_w = icon_w,
+    icons_w = icon_w * 3 + gap * 2,
+    rows = rows, row_widths = row_widths,
+    max_buttons_w = max_buttons_w,
+    max_btn_w = max_btn_w,
   }
   return layout_cache
 end
@@ -666,26 +742,54 @@ local button_tooltips = {
   ["Replace All"] = "Replace every match in the file",
 }
 
----Total width of this row's right-aligned button group.
+---Total width of this row's right-aligned button group.  Used for laying out
+---the buttons themselves; the field's right edge uses the shared maximum (see
+---`shared_layout.max_buttons_w`) so both rows' fields align.
 function FindField:row_buttons_width()
   local font = self:get_font()
   local L = shared_layout(font)
-  local total = 0
-  for _, text in ipairs(L.rows[self.kind]) do
-    total = total + control_width(font, text) + L.gap
-  end
-  return total - L.gap
+  return L.row_widths[self.kind] or 0
+end
+
+---The shared right-edge reservation: the wider of the two rows' button groups,
+---so the find and replace input boxes have identical right edges and widths.
+function FindField:buttons_column_width()
+  local L = shared_layout(self:get_font())
+  return L.max_buttons_w
+end
+
+---Width reserved on the right of the row: the button column plus the gap
+---that separates it from the input box.
+function FindField:buttons_reserved()
+  return style.padding.x / 2 + self:buttons_column_width() + style.padding.x / 2
+end
+
+---Width of the in-field overlay at the right end of the box: the match
+---counter (find row only) and the history chevron.
+function FindField:overlay_metrics()
+  local font = self:get_font()
+  local chev_w = font:get_width("▾") + style.padding.x
+  local counter_w = self.kind == "find" and font:get_width("0000/0000") + style.padding.x or 0
+  local inner = math.max(2, math.floor(3 * SCALE))
+  return chev_w, counter_w, inner, chev_w + counter_w + inner * 2
 end
 
 ---Position and size of the input box, shared by `draw` (which paints it) and
 ---`layout_controls` (which pins the field overlay to its right edge), so the
 ---chevron and the counter always sit exactly on the box.
+---
+---The box starts half a padding *before* the text column (the gutter edge),
+---so the query sits inside it with breathing room, and ends half a padding
+---before the button column.  It is centred in the row, exactly like the
+---text line (CommandView:get_line_screen_position centres the line too), so
+---the query is vertically centred in the box at every animation step.
 function FindField:field_geometry()
   local pad = style.padding.x / 2
   local gw = self:get_gutter_width()
-  local ix = self.position.x + gw + pad
-  local iw = self.size.x - gw - (self:row_buttons_width() + pad) - pad
-  local ih = math.max(self.size.y - pad_v() * 2, self:get_line_height())
+  local ix = self.position.x + gw - pad
+  local iw = self.size.x - gw + pad - self:buttons_reserved()
+  iw = math.max(iw, math.floor(40 * SCALE))
+  local ih = control_height(self)
   local iy = self.position.y + (self.size.y - ih) / 2
   return ix, iy, iw, ih, pad
 end
@@ -703,75 +807,92 @@ function FindField:layout_controls()
   local controls = {}
 
   -- left: the toggles in fixed icon columns, directly left of the field
-  -- like Sublime's icon column
-  local x = 0
-  local function push_icon(text, command_name, tooltip, active)
-    controls[#controls + 1] = {
-      text = text, side = "left", command = command_name, tooltip = tooltip,
-      active = active, x = x, w = L.icon_w,
-    }
-    x = x + L.icon_w
+  -- like Sublime's icon column.  Only the find row carries toggles — the
+  -- replace row reserves the same gutter width (via get_gutter_width, which
+  -- uses the shared layout) so its field aligns with the find row's, but
+  -- shows no toggle chips.  This mirrors Sublime, where the toggles live on
+  -- the find row only.
+  if self.kind == "find" then
+    local x = 0
+    local function push_icon(text, command_name, tooltip, active)
+      controls[#controls + 1] = {
+        text = text, side = "left", command = command_name, tooltip = tooltip,
+        active = active, x = x, w = L.icon_w,
+      }
+      x = x + L.icon_w + L.gap
+    end
+    push_icon("Aa", "findbar:toggle-case", "Case sensitive", cfg.case_sensitive)
+    push_icon(".*", "findbar:toggle-regex", "Regular expression", cfg.regex)
+    push_icon("\\b", "findbar:toggle-word", "Whole word", cfg.whole_word)
   end
-  push_icon("Aa", "findbar:toggle-case", "Case sensitive", cfg.case_sensitive)
-  push_icon(".*", "findbar:toggle-regex", "Regular expression", cfg.regex)
-  push_icon("\\b", "findbar:toggle-word", "Whole word", cfg.whole_word)
 
-  -- right: this row's buttons, right-aligned as a group (Sublime's panel
-  -- does not align the two rows' buttons into shared columns)
+  -- right: this row's buttons, right-aligned within the shared button column
+  -- (whose width is the max of both rows' groups).  Each row's group sits at
+  -- the right edge of that column so the two rows' right-most buttons line up.
+  -- Sibling text buttons share an equal min-width (the widest label) so they
+  -- read as a family of uniform chips; the close × button stays compact.
   local labels = L.rows[self.kind]
   local widths, total = {}, 0
-  for _, text in ipairs(labels) do
-    local w = control_width(font, text)
-    widths[#widths + 1] = w
+  for i, pair in ipairs(labels) do
+    local w = (pair[1] ~= "×") and L.max_btn_w or L.icon_w
+    widths[i] = w
     total = total + w + L.gap
   end
   total = total - L.gap
-  x = 0
-  for i, text in ipairs(labels) do
+  local x = 0
+  for i, pair in ipairs(labels) do
     controls[#controls + 1] = {
-      text = text, side = "right", command = button_commands[text],
-      tooltip = button_tooltips[text], button = true, x = x, w = widths[i],
+      text = pair[1], side = "right", command = button_commands[pair[1]],
+      tooltip = button_tooltips[pair[1]], button = true,
+      primary = not not pair[2], x = x, w = widths[i],
     }
     x = x + widths[i] + L.gap
   end
 
   -- offsets to absolute coordinates: left ones from the left edge, right ones
-  -- from the strip's right edge
-  local base = self.size.x - style.padding.x / 2 - total
+  -- from the shared button column's right edge (both rows use the same
+  -- column width, so the right-most button of every row sits on the same x).
+  local base = self.size.x - style.padding.x / 2 - L.max_buttons_w
+  -- right-align this row's group within the column
+  local group_offset = L.max_buttons_w - total
   for _, c in ipairs(controls) do
     if c.side == "left" then
       c.x = c.x + style.padding.x / 2
     else
-      c.x = base + c.x
+      c.x = base + group_offset + c.x
     end
   end
   self.controls = controls
 
-  -- field overlay, pinned to the input box's right edge like Sublime's: the
-  -- history chevron (clickable) and a fixed slot for the match counter
+  -- field overlay, pinned to the input box's right edge like Sublime's:
+  -- [ query text … | 3/27 ▾ ]  -- the counter, then the chevron (clickable)
   local ix, iy, iw, ih = self:field_geometry()
-  local counter_w = control_width(font, "00/000")
-  local chev_x = ix + iw - style.padding.x / 2 - counter_w - L.icon_w
+  local chev_w, counter_w, inner = self:overlay_metrics()
+  local right = ix + iw - inner
+  self.counter_rect = { x = right - chev_w - counter_w, y = iy, w = counter_w, h = ih }
+  self.overlay_x = right - chev_w - counter_w
   self.field_controls = {
     { text = "▾", side = "field", command = "findbar:history-next",
       tooltip = "Search history (option+up/down)",
-      x = chev_x, y = iy, w = L.icon_w, h = ih },
+      x = right - chev_w, y = iy, w = chev_w, h = ih },
   }
 end
 
----The buttons live on the right of the row; the text is clipped just before
----them (see the fork's DocView:get_right_inset).  Each row reserves its own
----button group's width, like Sublime's panel.
+---The buttons live on the right of the row, and the chevron/counter overlay
+---at the right end of the input box; the text is clipped before both (see
+---the fork's DocView:get_right_inset), so it never runs underneath them.
 function FindField:get_right_inset()
   if self.size.y < 1 then return 0 end
-  return self:row_buttons_width() + style.padding.x / 2
+  local _, _, _, overlay = self:overlay_metrics()
+  return self:buttons_reserved() + overlay
 end
 
----The left area: the icon column (Aa / .* / \b), or the document's
+---The left area: the toggle chips (Aa / .* / \b), or the document's
 ---line-number width when that is wider, so the query lines up with the code.
+---The input box starts half a padding before this edge (field_geometry).
 function FindField:get_gutter_width()
   local L = shared_layout(self:get_font())
-  local w = style.padding.x / 2 + L.icons_w + style.padding.x
+  local w = style.padding.x / 2 + L.icons_w + style.padding.x * 1.5
   if (self.left_inset or 0) > w then w = self.left_inset end
   return w, 0
 end
@@ -826,26 +947,29 @@ function FindField:draw_line_gutter(line, x, y, width)
     local font = self:get_font()
     local lh = self:get_line_height()
     local ty = y + self:get_line_text_y_offset()
-    local ch = math.min(lh, self.size.y - pad_v() * 2)
-    local cy = self.position.y + (self.size.y - ch) / 2
+    -- Chips share the input box's exact height and centre (via field_geometry's
+    -- iy), so every chip's top/bottom edges line up with the field's ring.
+    local _, iy, _, ih = self:field_geometry()
+    local ch = ih
+    local cy = iy
     local gw = self:get_gutter_width()
     core.push_clip_rect(self.position.x, self.position.y, gw, self.size.y)
     for _, c in ipairs(self.controls) do
       if c.side == "left" then
         local cx = self.position.x + c.x
         local hovered = self.hovered_control == c
-        -- every toggle is a bordered chip, like Sublime's icon buttons: the
-        -- active one fills with the accent, the rest are outlined
-        if c.active then
-          rounded_rect(cx, cy, c.w, ch, colors.chip, RADIUS)
-          common.draw_text(font, colors.chip_label, c.text, "center", cx, ty, c.w, lh)
-        else
-          -- outlined chip: a ring one unit larger reads as a 1px border
-          rounded_rect(cx - 1, cy - 1, c.w + 2, ch + 2, colors.frame, RADIUS + 1)
-          rounded_rect(cx, cy, c.w, ch, hovered and colors.hover or colors.panel, RADIUS)
-          common.draw_text(font, hovered and colors.text or colors.dim,
-            c.text, "center", cx, ty, c.w, lh)
-        end
+        -- Every toggle uses the same outlined-chip geometry (ring + fill),
+        -- active or not, so the row reads as a consistent set.  Active uses
+        -- the accent ring + chip fill, inactive uses the frame ring + panel
+        -- (or hover) fill.
+        local ring_col = c.active and colors.focus or colors.frame
+        local fill_col = c.active and colors.chip
+          or (hovered and colors.hover or colors.panel)
+        local label_col = c.active and colors.chip_label
+          or (hovered and colors.text or colors.dim)
+        rounded_rect(cx - 1, cy - 1, c.w + 2, ch + 2, ring_col, RADIUS_CTRL + 1)
+        rounded_rect(cx, cy, c.w, ch, fill_col, RADIUS_CTRL)
+        common.draw_text(font, label_col, c.text, "center", cx, ty, c.w, lh)
       end
     end
     if self.label ~= "" then
@@ -865,20 +989,32 @@ function FindField:draw_buttons()
   if self.size.y < 1 then return end
   local font = self:get_font()
   local lh = self:get_line_height()
-  local ty = self.position.y + style.padding.y + self:get_line_text_y_offset()
-  -- one chip size shared by every control, so the row reads as a toolbar
-  local ch = math.min(lh, self.size.y - pad_v() * 2)
-  local cy = self.position.y + (self.size.y - ch) / 2
+  -- Buttons share the input box's exact height and centre (via
+  -- field_geometry's iy), same as the toggle chips.
+  local _, iy, _, ih = self:field_geometry()
+  local ch = ih
+  local cy = iy
+  local ty = cy + (ch - lh) / 2 + self:get_line_text_y_offset()
   for _, c in ipairs(self.controls) do
     if c.side == "right" and c.button then
       local cx = self.position.x + c.x
-      -- a labelled button ("Find", "Replace All", ...): Sublime frames these
-      -- and keeps the label at full strength; hover picks up the accent
       local hovered = self.hovered_control == c
-      local border = hovered and colors.focus or colors.frame
-      rounded_rect(cx - 1, cy, c.w + 2, ch, border, RADIUS + 1)
-      rounded_rect(cx, cy + 1, c.w, ch - 2, hovered and colors.btn_hover or colors.btn, RADIUS)
-      common.draw_text(font, colors.text, c.text, "center", cx, ty, c.w, lh)
+      -- Two tiers: the row's primary action ("Find" / "Replace All") is an
+      -- accent-filled button that anchors the row; the siblings are quiet
+      -- field-surface chips whose ring and label light up on hover.
+      local ring_col, fill_col, label_col
+      if c.primary then
+        ring_col = hovered and colors.focus or colors.primary
+        fill_col = hovered and colors.primary_hover or colors.primary
+        label_col = colors.primary_label
+      else
+        ring_col = hovered and colors.focus or colors.frame
+        fill_col = hovered and colors.btn_hover or colors.btn
+        label_col = hovered and colors.text or colors.dim
+      end
+      rounded_rect(cx - 1, cy - 1, c.w + 2, ch + 2, ring_col, RADIUS_CTRL + 1)
+      rounded_rect(cx, cy, c.w, ch, fill_col, RADIUS_CTRL)
+      common.draw_text(font, label_col, c.text, "center", cx, ty, c.w, lh)
     end
   end
 end

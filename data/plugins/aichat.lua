@@ -2809,6 +2809,13 @@ local function fab_rect()
     or rv.size.x
   local editor_bottom = (core.status_view and core.status_view.position
     and core.status_view.position.y) or rv.size.y
+  -- the find bar docks at the bottom of the editor area: sit above it instead
+  -- of covering its right-most buttons (× / Replace All)
+  local findbar = package.loaded["plugins.findbar"]
+  local field = type(findbar) == "table" and findbar.state and findbar.state.field
+  if field and field.size and field.size.y >= 1 then
+    editor_bottom = math.min(editor_bottom, field.position.y)
+  end
   return editor_right - btn_size - btn_margin,
          editor_bottom - btn_size - btn_margin,
          btn_size, btn_size
