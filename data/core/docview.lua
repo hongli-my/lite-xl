@@ -508,6 +508,61 @@ function DocView:scroll_to_make_visible(line, col)
   end
 end
 
+---On macOS the command key plays the role control has on other platforms
+---for the drag-selection shortcuts (column selection).
+local macos = PLATFORM == "Mac OS X" or PLATFORM == "macOS"
+local function column_selecting()
+  return keymap.modkeys["ctrl"] or (macos and keymap.modkeys["cmd"])
+end
+
+
+---Updates an in-progress drag selection to the given position, which may
+---lie outside the view. Split out of on_mouse_moved so the edge auto-scroll
+---can keep extending the selection while the pointer is held still.
+function DocView:update_mouse_selection(x, y)
+  local l1, c1 = self:resolve_screen_position(x, y)
+  local l2, c2, snap_type = table.unpack(self.mouse_selecting)
+  if column_selecting() then
+    if l1 > l2 then l1, l2 = l2, l1 end
+    self.doc.selections = { }
+    for i = l1, l2 do
+      self.doc:set_selections(i - l1 + 1, i, math.min(c1, #self.doc.lines[i]), i, math.min(c2, #self.doc.lines[i]))
+    end
+  else
+    if snap_type then
+      l1, c1, l2, c2 = self:mouse_selection(self.doc, snap_type, l1, c1, l2, c2)
+    end
+    self.doc:set_selection(l1, c1, l2, c2)
+  end
+end
+
+
+---While a drag selection is held past the edge of the view, computes the
+---scroll speed factor per axis: 0 within a 3px margin, ramping up to 1
+---over the following 40px, so the selection keeps extending smoothly.
+function DocView:update_selection_edge_scroll(x, y)
+  local gw = self:get_gutter_width()
+  local x1, y1 = self.position.x + gw, self.position.y
+  local x2, y2 = self.position.x + self.size.x, self.position.y + self.size.y
+  local margin, ramp = 3, 40
+  local function axis(p, lo, hi)
+    if p < lo - ramp then return -1 end
+    if p < lo - margin then return -(lo - margin - p) / (ramp - margin) end
+    if p > hi + ramp then return 1 end
+    if p > hi + margin then return (p - hi - margin) / (ramp - margin) end
+    return 0
+  end
+  local dx = axis(x, x1, x2)
+  local dy = axis(y, y1, y2)
+  if self.wrapped_settings then dx = 0 end
+  if dx == 0 and dy == 0 then
+    self.select_edge_scroll = nil
+  else
+    self.select_edge_scroll = { dx, dy }
+  end
+end
+
+
 function DocView:on_mouse_moved(x, y, ...)
   DocView.super.on_mouse_moved(self, x, y, ...)
 
@@ -524,20 +579,8 @@ function DocView:on_mouse_moved(x, y, ...)
   end
 
   if self.mouse_selecting then
-    local l1, c1 = self:resolve_screen_position(x, y)
-    local l2, c2, snap_type = table.unpack(self.mouse_selecting)
-    if keymap.modkeys["ctrl"] then
-      if l1 > l2 then l1, l2 = l2, l1 end
-      self.doc.selections = { }
-      for i = l1, l2 do
-        self.doc:set_selections(i - l1 + 1, i, math.min(c1, #self.doc.lines[i]), i, math.min(c2, #self.doc.lines[i]))
-      end
-    else
-      if snap_type then
-        l1, c1, l2, c2 = self:mouse_selection(self.doc, snap_type, l1, c1, l2, c2)
-      end
-      self.doc:set_selection(l1, c1, l2, c2)
-    end
+    self:update_mouse_selection(x, y)
+    self:update_selection_edge_scroll(x, y)
   end
 end
 
@@ -586,6 +629,7 @@ end
 function DocView:on_mouse_released(...)
   DocView.super.on_mouse_released(self, ...)
   self.mouse_selecting = nil
+  self.select_edge_scroll = nil
 end
 
 
@@ -655,6 +699,25 @@ function DocView:update()
       core.redraw = true
     end
     core.blink_timer = tb
+  end
+
+  -- auto-scroll while a drag selection is held past the view edge: the
+  -- scroll is applied here (update has no dt argument) and the selection is
+  -- re-extended to the pointer position, which stays outside the view
+  if self.mouse_selecting and self.select_edge_scroll then
+    local dx, dy = table.unpack(self.select_edge_scroll)
+    local t = system.get_time()
+    local dt = math.min(self.select_edge_t and (t - self.select_edge_t) or 0, 0.1)
+    self.select_edge_t = t
+    self.scroll.to.y = self.scroll.to.y + dy * 1000 * dt
+    if not self.wrapped_settings then
+      self.scroll.to.x = self.scroll.to.x + dx * 1000 * dt
+    end
+    self:clamp_scroll_position()
+    self:update_mouse_selection(core.root_view.mouse.x, core.root_view.mouse.y)
+    core.redraw = true
+  else
+    self.select_edge_t = nil
   end
 
   self:update_ime_location()
@@ -773,6 +836,11 @@ function DocView:draw_line_body(line, x, y)
       if line2 ~= line then col2 = #text + 1 end
       local x1 = x + self:get_col_x_offset(line, col1)
       local x2 = x + self:get_col_x_offset(line, col2)
+      -- continuation lines extend to the right edge of the view, like
+      -- Sublime Text, instead of stopping at the last character
+      if line2 ~= line then
+        x2 = math.max(x2, self.position.x + self.size.x - self:get_right_inset())
+      end
       if x1 ~= x2 then
         renderer.draw_rect(x1, y, x2 - x1, lh, style.selection)
       end
@@ -885,7 +953,10 @@ function DocView:on_context_menu()
     { text = "Paste",   icon = "\u{f0ea}", command = "doc:paste" },
     ContextMenu.DIVIDER,
     { text = "Find",    icon = "\u{f002}", command = "find-replace:find"    },
-    { text = "Replace", icon = "\u{f363}", command = "find-replace:replace" }
+    { text = "Replace", icon = "\u{f363}", command = "find-replace:replace" },
+    ContextMenu.DIVIDER,
+    { text = "上下分屏", command = "root:split-down" },
+    { text = "左右分屏", command = "root:split-right" }
   } }, self
 end
 

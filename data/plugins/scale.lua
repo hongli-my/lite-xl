@@ -186,10 +186,11 @@ local old_DocView_on_context_menu = DocView.on_context_menu
 function DocView:on_context_menu()
   local args = { old_DocView_on_context_menu(self) }
   local cmds = args[1]
-  table.move(cmds.items, 4, 6, 7)
-  cmds.items[4] = { text = "Font +",     command = "scale:increase" }
-  cmds.items[5] = { text = "Font -",     command = "scale:decrease" }
-  cmds.items[6] = { text = "Font Reset", command = "scale:reset"    }
+  -- insert right after Paste without touching whatever the wrapped menu
+  -- already contains past that point, so other contributions survive
+  table.insert(cmds.items, 4, { text = "Font Reset", command = "scale:reset"    })
+  table.insert(cmds.items, 4, { text = "Font -",     command = "scale:decrease" })
+  table.insert(cmds.items, 4, { text = "Font +",     command = "scale:increase" })
   return table.unpack(args)
 end
 

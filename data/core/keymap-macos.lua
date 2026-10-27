@@ -106,6 +106,7 @@ local function keymap_macos(keymap)
 
     ["shift+1lclick"] = "doc:select-to-cursor",
     ["ctrl+1lclick"] = "doc:split-cursor",
+    ["cmd+1lclick"] = "doc:split-cursor",
     ["1lclick"] = { "context-menu:select", "context-menu:hide", "doc:set-cursor" },
     ["2lclick"] = { "doc:set-cursor-word", "emptyview:new-doc", "tabbar:new-doc" },
     ["3lclick"] = "doc:set-cursor-line",
