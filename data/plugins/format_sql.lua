@@ -98,6 +98,19 @@ local function tokenize(sql)
       table.insert(tokens, { "PLACEHOLDER", "?" })
       i = i + 1
 
+    elseif sql:sub(i, i + 2) == "->>" then
+      table.insert(tokens, { "OP", "->>" })
+      i = i + 3
+
+    elseif sql:sub(i, i + 1) == "::" or sql:sub(i, i + 1) == ":=" or
+           sql:sub(i, i + 1) == "=>" or sql:sub(i, i + 1) == "->" or
+           sql:sub(i, i + 1) == "@>" or sql:sub(i, i + 1) == "<@" or
+           sql:sub(i, i + 1) == ">=" or sql:sub(i, i + 1) == "<=" or
+           sql:sub(i, i + 1) == "!=" or sql:sub(i, i + 1) == "<>" or
+           sql:sub(i, i + 1) == "||" or sql:sub(i, i + 1) == "&&" then
+      table.insert(tokens, { "OP", sql:sub(i, i + 1) })
+      i = i + 2
+
     elseif ch == ":" then
       local j = i + 1
       while j <= len and sql:sub(j, j):match("[%w_]") do j = j + 1 end
@@ -120,12 +133,6 @@ local function tokenize(sql)
         i = i + 1
       end
 
-    elseif sql:sub(i, i + 1) == ">=" or sql:sub(i, i + 1) == "<=" or
-           sql:sub(i, i + 1) == "!=" or sql:sub(i, i + 1) == "<>" or
-           sql:sub(i, i + 1) == "||" or sql:sub(i, i + 1) == "&&" then
-      table.insert(tokens, { "OP", sql:sub(i, i + 1) })
-      i = i + 2
-
     elseif ch == "=" or ch == ">" or ch == "<" or ch == "!" or
            ch == "+" or ch == "-" or ch == "/" or ch == "%" or
            ch == "~" or ch == "|" or ch == "&" then
@@ -137,6 +144,18 @@ local function tokenize(sql)
       while j <= len and sql:sub(j, j):match("[%w_]") do j = j + 1 end
       table.insert(tokens, { "WORD", sql:sub(i, j - 1) })
       i = j
+
+    elseif ch == "$" then
+      -- PostgreSQL-style positional parameters: $1, $2, ...
+      local j = i + 1
+      while j <= len and sql:sub(j, j):match("%d") do j = j + 1 end
+      if j > i + 1 then
+        table.insert(tokens, { "PLACEHOLDER", sql:sub(i, j - 1) })
+        i = j
+      else
+        table.insert(tokens, { "OTHER", ch })
+        i = i + 1
+      end
 
     else
       table.insert(tokens, { "OTHER", ch })
@@ -264,6 +283,23 @@ do
   for _, w in ipairs(words) do UPPERCASE[w] = true end
 end
 
+-- Operators that must stay glued to their operands: putting spaces around
+-- them changes them into two operators and breaks the statement
+-- (id :: text, a - > 'b', js @ > '...').
+local DENSE_OP = {
+  ["::"] = true, [":="] = true, ["=>"] = true,
+  ["->"] = true, ["->>"] = true, ["@>"] = true, ["<@"] = true,
+}
+
+-- Words that are not function names: they keep a (purely cosmetic) space
+-- before a "(" that follows them. Every other word glues to "(" — a space
+-- there is a syntax error for function calls on PostgreSQL and friends
+-- (date_trunc ('day', x)).
+local SPACE_BEFORE_PAREN = {
+  AS = true, IN = true, VALUES = true, USING = true, ANY = true,
+  ALL = true, SOME = true, EXISTS = true, DO = true,
+}
+
 --------------------------------------------------------------------------------
 -- Formatter
 --------------------------------------------------------------------------------
@@ -346,11 +382,20 @@ local function format_sql(sql)
       newline()
 
     elseif tp == "BLOCK_COMMENT" then
+      -- keep the comment's internal lines verbatim: re-indenting them would
+      -- accumulate indentation on every re-format (roundtrip instability)
       newline()
-      for line in val:gmatch("[^\n]*") do
-        emit(line)
-        newline()
+      local first = true
+      for line in val:gmatch("[^\n]+") do
+        if first then
+          emit(line)
+          first = false
+        else
+          w("\n")
+          w(line)
+        end
       end
+      newline()
 
     elseif tp == "SEMICOLON" then
       emit(";")
@@ -503,7 +548,7 @@ local function format_sql(sql)
 
     elseif tp == "OP" then
       -- Dense operators (no spaces)
-      if val == "::" or val == ":=" then
+      if DENSE_OP[val] then
         w(val)
       else
         w(" " .. val .. " ")
@@ -550,8 +595,10 @@ local function format_sql(sql)
            or next_tp == "CLOSE_PAREN" or next_tp == "OP" then
           -- no space
         elseif next_tp == "OPEN_PAREN" then
-          -- Function call: CAST(...) no space; Table name: users (...) with space
-          if not UPPERCASE[upper] then w(" ") end
+          -- Function call: date_trunc(...) must glue to "(", a space there is
+          -- a syntax error on PostgreSQL. Multi-word keywords (NOT IN) and
+          -- non-function keywords (AS, VALUES, ...) keep the space.
+          if val:find(" ", 1, true) or SPACE_BEFORE_PAREN[upper] then w(" ") end
         else
           w(" ")
         end
