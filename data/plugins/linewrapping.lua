@@ -613,6 +613,12 @@ end
 command.add(nil, {
   ["line-wrapping:enable"] = function()
     if core.active_view and core.active_view.doc then
+      -- folding remaps the rows of a view as well, so it cannot stay active
+      -- across the remap: clear its folds before wrapping takes over
+      local doc = core.active_view.doc
+      if doc.folds and next(doc.folds) then
+        command.perform("folding:unfold-all")
+      end
       core.active_view.wrapping_enabled = true
       LineWrapping.update_docview_breaks(core.active_view)
     end
