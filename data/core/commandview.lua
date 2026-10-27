@@ -463,6 +463,54 @@ local function ensure_contrast(color, bg, target)
   return clamp_toward(goal) or clamp_toward(goal == white and black or white) or color
 end
 
+---An elevated "floating card" surface derived from a theme's panel background
+---(style.background3).  Dark chrome is lifted toward white (a raised panel
+---catching light) and light chrome toward white (a bright sheet above the grey
+---chrome), so the suggestion list never merges with the sidebar/status bar it
+---sits above.  This is what makes the palette read as a distinct layer rather
+---than flat editor chrome.
+local function elevated_surface(bg)
+  local lift = rel_luminance(bg) < 0.5 and 0.12 or 0.80
+  return blend(bg, { 255, 255, 255, 255 }, lift)
+end
+
+---Selected-row band: the theme accent laid over the panel, auto-adapted for
+---clear visibility.  Dark panels get a higher contrast target (band clearly
+---lighter, >= 2.6:1) and a higher minimum strength so the accent hue reads;
+---light panels get a lower target (>= 1.8:1, band clearly darker but not
+---jarringly dark).  When the accent itself can't reach the target by blending
+---alone — e.g. slate's high-luminance lime on a white panel — the band is
+---forced toward the opposite luminance pole (darkened on light surfaces),
+---preserving accent hue while guaranteeing the separation.
+local function selection_band(panel, accent)
+  local panel_lum = rel_luminance(panel)
+  local target = panel_lum < 0.5 and 2.6 or 1.8
+  local lo = panel_lum < 0.5 and 0.42 or 0.30
+  -- Phase 1: increase accent strength until the band separates from the panel.
+  local band = blend(panel, accent, lo)
+  for i = 0, 40 do
+    local s = lo + (0.85 - lo) * (i / 40)
+    band = blend(panel, accent, s)
+    if contrast_ratio(band, panel) >= target then return band end
+  end
+  -- Phase 2: accent alone can't reach the target (luminance too close to the
+  -- panel).  Force luminance away from the panel: lighten on dark, darken on
+  -- light, keeping as much accent hue as possible.
+  local pole = panel_lum < 0.5 and { 255, 255, 255, 255 } or { 0, 0, 0, 255 }
+  for i = 1, 32 do
+    local c = blend(band, pole, i / 32)
+    if contrast_ratio(c, panel) >= target then return c end
+  end
+  return blend(band, pole, 1.0)
+end
+
+---Left accent-bar colour for the selected row: the theme accent, luminance-
+---adjusted (>= 3:1, WCAG 1.4.11 for non-text UI components) against the band
+---so the bar is always visible even when the accent hue is close to the band.
+local function accent_bar_color(accent, band)
+  return ensure_contrast(accent, band, 3.0)
+end
+
 local function draw_suggestions_box(self)
   local lh = self:get_suggestion_line_height()
   local dh = style.divider_size
@@ -470,32 +518,47 @@ local function draw_suggestions_box(self)
   local h = math.ceil(self.suggestions_height)
   local rx, ry, rw, rh = self.position.x, self.position.y - h - dh, self.size.x, h
 
-  core.push_clip_rect(rx, ry, rw, rh)
+  -- The suggestion list reads as a floating card layered above the editor:
+  -- an elevated surface (distinct from the surrounding chrome so it does not
+  -- merge with the sidebar/status bar) framed by a hairline top edge, using
+  -- the codebase's blend-toward-foreground depth idiom (same as the context
+  -- menu's frame).  Themes may override either role via style.lua; the
+  -- computed defaults degrade gracefully for any theme.
+  local fg    = style.chrome_text or style.text
+  local panel = style.command_view_background or elevated_surface(style.background3)
+  local edge  = blend(panel, fg, 0.30)
+  local band  = style.command_view_selection or selection_band(panel, style.accent)
 
-  -- Palette text colours.  Unselected rows use the regular chrome text colour
-  -- instead of style.accent: accent is an emphasis role whose value ranges
-  -- from near-white to lime across themes, which rendered whole suggestion
-  -- lists unreadable (1.4:1 on the light slate palette).  The accent is now
-  -- reserved for the selection band, like in the tab bar.  Both row colours
-  -- are clamped to readable contrast on background3, since themes tune
-  -- style.text/style.dim against the editor background, not the palette.
-  local content = ensure_contrast(style.chrome_text or style.text, style.background3, 4.5)
-  local secondary = ensure_contrast(style.dim, style.background3, 4.5)
-  -- the selected row follows the accent colour instead of style.line_highlight,
-  -- which is tuned for the editor background and turns into a dark band on a
-  -- light command palette
-  local band = blend(style.background3, style.accent, 0.3)
-  -- the band shifts the surface, so re-clamp the row colours against it; in
-  -- dark themes this brightens the selected row, marking it beyond the band
-  local sel_content = ensure_contrast(content, band, 4.5)
+  -- Palette text colours, clamped to WCAG AA (>= 4.5:1) on the surface they
+  -- actually sit on.  Roles like style.text/style.dim are tuned against the
+  -- editor background, not this elevated surface, so borrowed roles can land
+  -- below readable contrast; ensure_contrast keeps every state legible.  The
+  -- selected row sits on the accent band, so its colours are re-clamped
+  -- against the band.
+  local content       = ensure_contrast(fg, panel, 4.5)
+  local secondary     = ensure_contrast(style.dim, panel, 4.5)
+  local sel_content   = ensure_contrast(content, band, 4.5)
   local sel_secondary = ensure_contrast(secondary, band, 4.5)
+
+  -- Extend the clip up by one divider row so the panel's top edge -- drawn in
+  -- that gap, just above the list -- is actually visible.  push_clip_rect
+  -- intersects with the parent clip, so clipping only to the panel area would
+  -- hide the edge (the previous divider line was clipped out entirely).
+  core.push_clip_rect(rx, ry - dh, rw, rh + dh)
 
   -- draw suggestions background
   if #self.suggestions > 0 then
-    renderer.draw_rect(rx, ry, rw, rh, style.background3)
-    renderer.draw_rect(rx, ry - dh, rw, dh, style.divider)
+    renderer.draw_rect(rx, ry - dh, rw, dh, edge)   -- top edge (card frame)
+    renderer.draw_rect(rx, ry, rw, rh, panel)       -- panel surface
+    -- selected-row band (accent-tinted, auto-adapted for clear visibility)
     local y = self.position.y - self.selection_offset - dh
     renderer.draw_rect(rx, y, rw, lh, band)
+    -- left accent bar: a solid strip at the left edge of the selected row,
+    -- like the active-tab accent line.  Provides a second, hue-based
+    -- selection cue that is unmistakable even when the band's luminance
+    -- shift is subtle (e.g. grey-on-grey in the default theme).
+    local bar_w = math.max(2, common.round(3 * SCALE))
+    renderer.draw_rect(rx, y, bar_w, lh, accent_bar_color(style.accent, band))
   end
 
   -- draw suggestion text

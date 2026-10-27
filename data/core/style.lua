@@ -63,4 +63,12 @@ style.git_conflict = { common.color "#c792ea" }
 
 style.log = {}
 
+-- Command palette (the CommandView suggestion list).  These are optional:
+-- nil means core.commandview derives them from the loaded theme's
+-- background3 / accent (an elevated "floating card" surface plus an
+-- accent-tinted selected-row band), so every bundled theme and any custom
+-- theme degrades gracefully.  Set them per-theme to hand-tune the palette.
+style.command_view_background = nil -- suggestion-list panel surface
+style.command_view_selection  = nil -- selected-row band
+
 return style
