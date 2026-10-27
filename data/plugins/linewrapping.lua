@@ -642,4 +642,9 @@ keymap.add {
   ["f10"] = "line-wrapping:toggle",
 }
 
+-- expose read-only visual-line helpers for other plugins (indentguide)
+LineWrapping.get_line_idx_col_count = get_line_idx_col_count
+LineWrapping.get_idx_line_col = get_idx_line_col
+LineWrapping.get_idx_line_length = get_idx_line_length
+
 return LineWrapping
