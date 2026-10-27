@@ -121,16 +121,23 @@ function DocView:draw_colormarks(marks)
         if wrapped then
           local idx0 = LineWrapping.get_line_idx_col_count(self, line)
           local idx1 = LineWrapping.get_line_idx_col_count(self, line, c1)
-          local idx2 = LineWrapping.get_line_idx_col_count(self, line, c2)
-          local start = 0
+          -- line_end: a mark ending exactly at a wrap boundary extends the
+          -- previous visual row to its right edge
+          local idx2 = LineWrapping.get_line_idx_col_count(self, line, c2, true)
           for i = idx1, idx2 do
-            local x1 = x + (idx1 == i and self:get_col_x_offset(line, c1) or 0)
+            local x1
+            if i == idx1 then
+              x1 = x + self:get_col_x_offset(line, c1)
+            else
+              local _, scol = LineWrapping.get_idx_line_col(self, i)
+              x1 = x + self:get_col_x_offset(line, scol)
+            end
             local x2
             if idx2 == i then
-              x2 = x + self:get_col_x_offset(line, c2)
+              x2 = x + self:get_col_x_offset(line, c2, true)
             else
-              start = start + LineWrapping.get_idx_line_length(self, i, line)
-              x2 = x + self:get_col_x_offset(line, start + 1, true)
+              local _, next_col = LineWrapping.get_idx_line_col(self, i + 1)
+              x2 = x + self:get_col_x_offset(line, next_col, true)
             end
             if x2 > x1 then
               renderer.draw_rect(x1, y + (i - idx0) * lh, x2 - x1, lh, color)

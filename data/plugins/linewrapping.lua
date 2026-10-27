@@ -531,17 +531,23 @@ function DocView:draw_line_body(line, x, y)
       if line2 ~= line then col2 = #self.doc.lines[line] + 1 end
       if col1 ~= col2 then
         local idx1, ncol1 = get_line_idx_col_count(self, line, col1)
-        local idx2, ncol2 = get_line_idx_col_count(self, line, col2)
-        local start = 0
+        -- line_end: a selection ending exactly at a wrap boundary extends the
+        -- previous visual row to its right edge instead of a sliver on the next
+        local idx2, ncol2 = get_line_idx_col_count(self, line, col2, true)
         for i = idx1, idx2 do
           local x1, x2 = x + (idx1 == i and self:get_col_x_offset(line1, col1) or 0)
           if idx2 == i then
-            x2 = x + self:get_col_x_offset(line, col2)
+            x2 = x + self:get_col_x_offset(line, col2, true)
           else
-            start = start + get_idx_line_length(self, i, line)
-            x2 = x + self:get_col_x_offset(line, start + 1, true)
+            -- end of an intermediate visual row: the column where the next
+            -- segment starts, resolved with line_end so the walk covers the
+            -- full width of this segment regardless of where col1 fell
+            local _, next_col = get_idx_line_col(self, i + 1)
+            x2 = x + self:get_col_x_offset(line, next_col, true)
           end
-          renderer.draw_rect(x1, y + (i - idx0) * lh, x2 - x1, lh, style.selection)
+          if x2 > x1 then
+            renderer.draw_rect(x1, y + (i - idx0) * lh, x2 - x1, lh, style.selection)
+          end
         end
       end
     end
