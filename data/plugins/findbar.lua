@@ -105,6 +105,42 @@ local function blend(a, b, t)
            a[3] + (b[3] - a[3]) * t, 255 }
 end
 
+---Relative luminance of an {r,g,b,a} colour (0-255), for WCAG contrast math.
+local function rel_luminance(color)
+  local function channel(v)
+    v = v / 255
+    if v <= 0.04045 then return v / 12.92 end
+    return ((v + 0.055) / 1.055) ^ 2.4
+  end
+  return 0.2126 * channel(color[1]) + 0.7152 * channel(color[2]) + 0.0722 * channel(color[3])
+end
+
+---WCAG contrast ratio between two colours.
+local function contrast_ratio(a, b)
+  local la, lb = rel_luminance(a), rel_luminance(b)
+  if la < lb then la, lb = lb, la end
+  return (la + 0.05) / (lb + 0.05)
+end
+
+---Returns `color` shifted toward white/black until it reaches at least
+---`target`:1 contrast on `bg` (best effort).  Theme roles are tuned against
+---the editor background, not the find bar's field surface, so borrowed roles
+---can land below readable contrast; this keeps every state legible.
+local function ensure_contrast(color, bg, target)
+  if contrast_ratio(color, bg) >= target then
+    return color
+  end
+  local white, black = { 255, 255, 255, 255 }, { 0, 0, 0, 255 }
+  local function clamp_toward(goal)
+    for i = 1, 32 do
+      local clamped = blend(color, goal, i / 32)
+      if contrast_ratio(clamped, bg) >= target then return clamped end
+    end
+  end
+  local goal = rel_luminance(color) >= rel_luminance(bg) and white or black
+  return clamp_toward(goal) or clamp_toward(goal == white and black or white) or color
+end
+
 -- Corner radius for the fields and buttons, in logical units (SCALE multiplies
 -- it up to device pixels).  Sublime's fields are only slightly rounded.
 local RADIUS = math.max(2, math.floor(2.5 * SCALE))
@@ -145,36 +181,60 @@ local function refresh_colors()
   -- clear step away from the panel (white-ish on a light theme, lighter on a
   -- dark one), and the accent is reserved for state: the focused field's ring,
   -- the active toggle chip and the hovered button.
+  --
+  -- All text colours are clamped to WCAG AA (>= 4.5:1) on every surface they
+  -- are actually drawn over — the field (inner), the in-field selection band,
+  -- the hovered button, and the panel/hover (inactive toggle icons).  Theme
+  -- roles like style.text and style.dim are tuned against the editor
+  -- background, not these surfaces, so borrowed roles can land below readable
+  -- contrast; ensure_contrast keeps every state legible.  Non-text borders and
+  -- the focus ring are clamped to >= 3:1 (WCAG 1.4.11).
   local bg2 = style.background2 or style.background
   local ctext = style.chrome_text or style.text
   local white = { 255, 255, 255, 255 }
   local black = { 0, 0, 0, 255 }
-  local light = (0.299 * bg2[1] + 0.587 * bg2[2] + 0.114 * bg2[3]) > 128
+  local light = rel_luminance(bg2) > 0.5
 
-  colors.panel  = bg2
-  -- fields: pure white on the light chrome (Sublime's fields are stark white
-  -- on grey), a clear step away from the panel
-  colors.inner  = light and white or blend(bg2, ctext, 0.16)
-  colors.frame  = light and blend(bg2, black, 0.30) or blend(bg2, ctext, 0.32)
-  colors.hover  = light and blend(bg2, black, 0.10) or blend(bg2, ctext, 0.24)
-  colors.text   = light and blend(bg2, black, 0.85) or style.text
-  colors.caret  = light and colors.text or style.caret
-  colors.dim    = light and blend(bg2, black, 0.45) or blend(bg2, ctext, 0.55)
-  -- selected toggle chip: an accent tint instead of another grey step
-  colors.chip   = blend(bg2, style.accent, light and 0.40 or 0.32)
-  -- focused input: the accent ring marks where the typing goes
-  colors.focus  = style.accent
-  -- buttons: white like the fields, framed; hovered picks up accent
-  colors.btn       = light and white or blend(bg2, ctext, 0.15)
-  colors.btn_hover = blend(bg2, style.accent, light and 0.30 or 0.28)
+  colors.panel = bg2
+  -- Field surface: pure white on light chrome (Sublime's stark-white fields);
+  -- a clear step toward the text colour on dark chrome (a raised input box).
+  colors.inner = light and white or blend(bg2, ctext, 0.20)
+  -- Field frame: strong enough to read as a boundary (>= 3:1 on panel).
+  colors.frame = ensure_contrast(blend(bg2, light and black or ctext, 0.40), bg2, 3.0)
+  -- Hover wash for inactive toggle chips.
+  colors.hover = light and blend(bg2, black, 0.08) or blend(bg2, ctext, 0.20)
+  -- Selection band inside the field: a step toward BLACK (darker than inner)
+  -- in both light and dark themes.  Light theme: a grey band on white, dark
+  -- text still readable.  Dark theme: a darker band on the raised field, light
+  -- text still readable.  (Stepping toward the text colour, as the previous
+  -- version did, made the band approach the text's luminance in dark themes
+  -- and killed the contrast.)
+  colors.selection = blend(colors.inner, black, light and 0.18 or 0.30)
+  -- Buttons share the field surface; hover picks up a subtle accent wash.
+  colors.btn = colors.inner
+  colors.btn_hover = blend(colors.btn, style.accent, light and 0.15 or 0.25)
+  -- Main text: clamped to AA on every surface it is drawn over (field,
+  -- in-field selection, and hovered button).
+  colors.text = ensure_contrast(ctext, colors.inner, 4.5)
+  colors.text = ensure_contrast(colors.text, colors.selection, 4.5)
+  colors.text = ensure_contrast(colors.text, colors.btn_hover, 4.5)
+  -- Caret: >= 3:1 on the field (non-text UI component, WCAG 1.4.11).
+  colors.caret = ensure_contrast(style.caret, colors.inner, 3.0)
+  -- Secondary text (counter, chevron, inactive toggle icons): appears on the
+  -- field surface and on the panel/hover (inactive toggle chips), so clamp
+  -- against all three.
+  colors.dim = ensure_contrast(style.dim, colors.inner, 4.5)
+  colors.dim = ensure_contrast(colors.dim, colors.panel, 4.5)
+  colors.dim = ensure_contrast(colors.dim, colors.hover, 4.5)
+  -- Selected toggle chip: an accent tint; the label is the field colour
+  -- clamped to AA so it reads on both dark and light accent chips.
+  colors.chip = blend(bg2, style.accent, light and 0.45 or 0.40)
+  colors.chip_label = ensure_contrast(colors.inner, colors.chip, 4.5)
+  -- Focused input: the accent ring marks where the typing goes (>= 3:1).
+  colors.focus = ensure_contrast(style.accent, bg2, 3.0)
   -- The palette the core's tokenizer draws the query with: the field holds
-  -- plain text, so every token has to resolve to the field's own colour.  Built
-  -- once per colour refresh rather than once per drawn line.
+  -- plain text, so every token has to resolve to the field's own colour.
   colors.syntax = setmetatable({}, { __index = function() return colors.text end })
-  -- The selection band inside the field: a step away from the field colour, so
-  -- it stays visible in a dark and in a light field alike.
-  colors.selection = light and blend(colors.inner, black, 0.22)
-    or blend(colors.inner, ctext, 0.25)
 end
 
 local STATE_KEY = "state"
@@ -475,6 +535,14 @@ function FindField:try_close()
   close_bar()
 end
 
+---DocView:draw paints style.background over the whole view, which would
+---erase the panel and the input box painted below and leave the query text
+---sitting on the editor colour (dark-on-dark in a light-chrome theme such
+---as slate). The bar is not an editor surface: skip that fill entirely, the
+---panel drawn in FindField:draw is the field's real background.
+function FindField:draw_background()
+end
+
 function FindField:draw()
   if self.size.y < 1 then return end
   refresh_colors()
@@ -770,7 +838,7 @@ function FindField:draw_line_gutter(line, x, y, width)
         -- active one fills with the accent, the rest are outlined
         if c.active then
           rounded_rect(cx, cy, c.w, ch, colors.chip, RADIUS)
-          common.draw_text(font, style.background, c.text, "center", cx, ty, c.w, lh)
+          common.draw_text(font, colors.chip_label, c.text, "center", cx, ty, c.w, lh)
         else
           -- outlined chip: a ring one unit larger reads as a 1px border
           rounded_rect(cx - 1, cy - 1, c.w + 2, ch + 2, colors.frame, RADIUS + 1)
@@ -807,8 +875,7 @@ function FindField:draw_buttons()
       -- a labelled button ("Find", "Replace All", ...): Sublime frames these
       -- and keeps the label at full strength; hover picks up the accent
       local hovered = self.hovered_control == c
-      local border = hovered and blend(style.background2 or style.background, style.accent, 0.55)
-        or colors.frame
+      local border = hovered and colors.focus or colors.frame
       rounded_rect(cx - 1, cy, c.w + 2, ch, border, RADIUS + 1)
       rounded_rect(cx, cy + 1, c.w, ch - 2, hovered and colors.btn_hover or colors.btn, RADIUS)
       common.draw_text(font, colors.text, c.text, "center", cx, ty, c.w, lh)
@@ -1333,6 +1400,7 @@ local function draw_highlights(dv)
   current_fill[4] = cfg.current_fill_alpha
   current_edge[4] = 230
   local current_border = border + math.max(1, common.round(0.5 * SCALE))
+  local LW = dv.wrapped_settings and require "plugins.linewrapping"
 
   for line = minline, maxline do
     local text = dv.doc.lines[line]
@@ -1344,18 +1412,51 @@ local function draw_highlights(dv)
         local s, e = find_in_line(m, content, hay, col)
         if not s then break end
         if cfg.highlight_all or (current and current.line == line and current.col == s) then
-          local x, y = dv:get_line_screen_position(line, s)
-          local x2 = dv:get_line_screen_position(line, e + 1)
-          local w = x2 - x
-          if w > 0 then
-            local is_current = current and current.line == line and current.col == s
-            renderer.draw_rect(x, y, w, lh, is_current and current_fill or fill)
+          local is_current = current and current.line == line and current.col == s
+          -- a match crossing a wrap boundary needs one rect per visual row
+          local rects = {}
+          if LW then
+            local x, y = dv:get_line_screen_position(line)
+            local idx0 = LW.get_line_idx_col_count(dv, line)
+            local idx1 = LW.get_line_idx_col_count(dv, line, s)
+            -- line_end: a match ending exactly at a wrap boundary extends the
+            -- previous visual row to its right edge
+            local idx2 = LW.get_line_idx_col_count(dv, line, e + 1, true)
+            for i = idx1, idx2 do
+              local x1
+              if i == idx1 then
+                x1 = x + dv:get_col_x_offset(line, s)
+              else
+                local _, scol = LW.get_idx_line_col(dv, i)
+                x1 = x + dv:get_col_x_offset(line, scol)
+              end
+              local x2
+              if i == idx2 then
+                x2 = x + dv:get_col_x_offset(line, e + 1, true)
+              else
+                local _, next_col = LW.get_idx_line_col(dv, i + 1)
+                x2 = x + dv:get_col_x_offset(line, next_col, true)
+              end
+              if x2 > x1 then
+                rects[#rects + 1] = { x1, y + (i - idx0) * lh, x2 - x1 }
+              end
+            end
+          else
+            local x, y = dv:get_line_screen_position(line, s)
+            local x2 = dv:get_line_screen_position(line, e + 1)
+            if x2 > x then
+              rects[#rects + 1] = { x, y, x2 - x }
+            end
+          end
+          for _, r in ipairs(rects) do
+            local rx, ry, rw = r[1], r[2], r[3]
+            renderer.draw_rect(rx, ry, rw, lh, is_current and current_fill or fill)
             local bcol, bw = is_current and current_edge or edge,
                              is_current and current_border or border
-            renderer.draw_rect(x, y, w, bw, bcol)
-            renderer.draw_rect(x, y + lh - bw, w, bw, bcol)
-            renderer.draw_rect(x, y, bw, lh, bcol)
-            renderer.draw_rect(x + w - bw, y, bw, lh, bcol)
+            renderer.draw_rect(rx, ry, rw, bw, bcol)
+            renderer.draw_rect(rx, ry + lh - bw, rw, bw, bcol)
+            renderer.draw_rect(rx, ry, bw, lh, bcol)
+            renderer.draw_rect(rx + rw - bw, ry, bw, lh, bcol)
           end
         end
         col = e + 1
